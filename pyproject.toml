@@ -3,6 +3,7 @@ name = "futures-fund"
 version = "0.2.0"
 description = "Market-neutral crypto trading desk — Binance USD-M perpetual futures (paper)"
 requires-python = ">=3.11"
+license = "Apache-2.0"
 dependencies = [
     "pydantic>=2.6",
     "numpy>=1.26",

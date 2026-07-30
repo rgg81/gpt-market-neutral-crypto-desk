@@ -258,6 +258,10 @@ place orders or call a live LLM.
 For research and educational use only. Nothing in this repository is investment, legal, or tax
 advice. Crypto derivatives are high risk. Do not connect this project to real capital.
 
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). See [`NOTICE`](NOTICE) for attribution.
+
 ---
 
 Built with Codex, GPT agents, Python, and an unreasonable affection for audit trails.
