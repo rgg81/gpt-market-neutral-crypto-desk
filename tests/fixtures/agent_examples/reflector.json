@@ -1,0 +1,22 @@
+{
+  "lessons": [
+    {
+      "text": "Grade the relative-value pair on ALPHA vs BTC-beta, not raw return: the BTC-long/ETH-short pair was up in dollars only because BTC-beta carried it - the spread (alpha) actually decayed against us. When the pair's beta-residual drifts off zero, attribute the PnL to beta and do NOT credit the thesis.",
+      "regime": "low_vol_trend",
+      "polarity": "restrictive",
+      "tags": ["relative_value", "alpha_vs_beta", "neutrality"],
+      "importance": 7,
+      "provenance": ["dec-2026-06-04-btc-eth-pair"],
+      "ts": "2026-06-11T00:00:00Z"
+    },
+    {
+      "text": "The winning shorts all entered crowded-long flushes (L/S>~1.15 + elevated funding into a stalling tape, on a confirmed 4h breakdown) - DO take that setup as the co-equal mirror of the squeeze long, so the desk does not drift long-only by only ever recording long edges.",
+      "regime": null,
+      "polarity": "enabling",
+      "tags": ["short", "crowded_long_flush", "funding"],
+      "importance": 8,
+      "provenance": ["dec-2026-06-04-eth-short"],
+      "ts": "2026-06-11T00:00:00Z"
+    }
+  ]
+}

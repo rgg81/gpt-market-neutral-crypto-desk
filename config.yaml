@@ -1,0 +1,26 @@
+# LLM Market-Neutral Desk — runtime config.
+# Trading DECISIONS are made by gpt-5.6-sol agents at xhigh effort; this only parameterizes the
+# deterministic plumbing.
+# PAPER ONLY: `live` MUST stay false forever.
+
+account_size_usdt: 20000
+live: false
+agent_model: "gpt-5.6-sol"         # exact model on root; every subagent inherits it
+universe_top_n: 40                 # rank the top-40 by 24h quote volume (widened 2026-07-15:
+                                   # a 5-6 name post-gate universe left the carry book with no
+                                   # earning-long seat for 6 straight positive-funding cycles)
+cadence_tf_minutes: 480            # 8h decision cadence (00/08/16 UTC, funding-aligned)
+btc_symbol: "BTC/USDT:USDT"        # beta/hedge reference
+
+# --- universe quality floors (top-N by 24h volume, crypto-only) ---
+universe:
+  symbol_count: 20                 # post-gate universe cap (widened from an effective ~6 on
+                                   # 2026-07-15 so the carry book can find a negative-funding
+                                   # long; 20 balances coverage against per-cycle web-search cost)
+  min_adv_usd: 20000000
+  crypto_only: true
+
+# --- beta estimation ---
+beta:
+  lookback_days: 45
+  btc_symbol: "BTC/USDT:USDT"

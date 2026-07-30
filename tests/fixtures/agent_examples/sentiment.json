@@ -1,0 +1,35 @@
+{
+  "reports": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "as_of_ts": "2026-06-11T00:00:00Z",
+      "level": "positive",
+      "confidence": 0.62,
+      "rationale": "ETF inflows + constructive funding; no fresh negative catalysts.",
+      "sources": [
+        {"url": "https://example-cryptonews/feed/btc-etf", "title": "BTC ETF net inflow $210M", "published_ts": "2026-06-10T18:30:00Z"},
+        {"url": "https://reddit.com/r/CryptoCurrency/c1", "title": "Funding stays mildly positive", "published_ts": "2026-06-10T21:05:00Z"}
+      ]
+    },
+    {
+      "symbol": "ETH/USDT:USDT",
+      "as_of_ts": "2026-06-11T00:00:00Z",
+      "level": "neutral",
+      "confidence": 0.40,
+      "rationale": "Mixed signals; no decisive catalyst before decision time.",
+      "sources": [
+        {"url": "https://example-cryptonews/feed/eth", "title": "ETH range-bound ahead of upgrade", "published_ts": "2026-06-10T12:00:00Z"}
+      ]
+    },
+    {
+      "symbol": "MARKET",
+      "as_of_ts": "2026-06-11T00:00:00Z",
+      "level": "neutral",
+      "confidence": 0.55,
+      "rationale": "Fear & Greed = 52 (neutral); broad tape balanced.",
+      "sources": [
+        {"url": "https://api.alternative.me/fng/", "title": "Fear & Greed 52", "published_ts": "2026-06-10T23:00:00Z"}
+      ]
+    }
+  ]
+}

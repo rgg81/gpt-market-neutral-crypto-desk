@@ -1,0 +1,12 @@
+{
+  "reports": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "stance": "bullish",
+      "conviction": 0.66,
+      "thesis": "Strongest honest long case for the BTC leg, rebutting the Bear directly: price holds above rising 20/50 EMAs on rising OI (new long money, not short-covering) and funding is only mildly positive so the move is not crowded. The Bear leans on neutral sentiment, but mid-tape balance in a low-vol uptrend has not historically capped a relative-value long that already clears carry; that concern is mispriced against confluent carry+factor signals.",
+      "signals": {"trend": "higher_highs_above_rising_emas", "oi_change": 0.04, "signed_funding": 0.0002, "rebuts_bear": "neutral sentiment is not a flip; long still clears funding+fees"},
+      "horizon": "weekly"
+    }
+  ]
+}

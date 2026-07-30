@@ -1,0 +1,8 @@
+{
+  "candidates": [
+    {"symbol": "SOL/USDT:USDT", "lean": "short", "rationale": "rejected at resistance twice; funding rich + lopsided-long OI = flush fuel", "score": 0.82, "correlation_group": "alt-l1"},
+    {"symbol": "BTC/USDT:USDT", "lean": "long", "rationale": "leading the move; clean uptrend, crowded-short squeeze", "score": 0.78, "correlation_group": "majors"},
+    {"symbol": "DOGE/USDT:USDT", "lean": "short", "rationale": "distribution after a parabolic run; OI rising into a failing high", "score": 0.70, "correlation_group": "meme"},
+    {"symbol": "HYPE/USDT:USDT", "lean": "long", "rationale": "crowded-short squeeze; negative funding pays the long", "score": 0.66, "correlation_group": "defi"}
+  ]
+}

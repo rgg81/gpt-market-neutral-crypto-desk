@@ -1,0 +1,16 @@
+{
+  "proposals": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "direction": "long",
+      "entry": 68500.0,
+      "stop": 69000.0,
+      "take_profit": 73200.0,
+      "rationale": "MALFORMED: long with stop above entry must be rejected by the stop-side invariant.",
+      "trigger_type": "market"
+    }
+  ],
+  "management": [],
+  "triggers": [],
+  "cancel_triggers": []
+}

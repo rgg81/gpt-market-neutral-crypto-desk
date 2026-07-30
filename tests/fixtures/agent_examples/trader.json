@@ -1,0 +1,25 @@
+{
+  "proposals": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "direction": "long",
+      "entry": 68500.0,
+      "stop": 66100.0,
+      "take_profit": 73200.0,
+      "rationale": "Carry+factor long leg; entry at mark, stop = 2.5x liq-distance floor.",
+      "trigger_type": "market"
+    },
+    {
+      "symbol": "ETH/USDT:USDT",
+      "direction": "short",
+      "entry": 3580.0,
+      "stop": 3720.0,
+      "take_profit": 3300.0,
+      "rationale": "Relative-value short vs BTC; sentiment neutral, no flip.",
+      "trigger_type": "market"
+    }
+  ],
+  "management": [],
+  "triggers": [],
+  "cancel_triggers": []
+}

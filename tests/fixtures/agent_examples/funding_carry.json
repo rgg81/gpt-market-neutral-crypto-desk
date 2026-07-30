@@ -1,0 +1,20 @@
+{
+  "reports": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "stance": "bearish",
+      "conviction": 0.66,
+      "thesis": "Funding +0.05%/8h (~55% annualized) - crowded longs paying richly; L/S 1.31 confirms; 4h structure stalling below resistance so the carry short isn't fighting a trend.",
+      "signals": {"signed_funding": 0.0005, "funding_interval_h": 8.0, "funding_apr": 0.55, "long_short_ratio": 1.31, "basis_bps": 18.0},
+      "horizon": "weekly"
+    },
+    {
+      "symbol": "HYPE/USDT:USDT",
+      "stance": "bullish",
+      "conviction": 0.58,
+      "thesis": "Funding -0.03%/8h (~-33% annualized) - crowded shorts paying the long; basing structure with squeeze upside.",
+      "signals": {"signed_funding": -0.0003, "funding_interval_h": 8.0, "funding_apr": -0.33, "long_short_ratio": 0.74, "basis_bps": -9.0},
+      "horizon": "weekly"
+    }
+  ]
+}

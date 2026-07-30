@@ -1,0 +1,18 @@
+{
+  "plans": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "rating": "long",
+      "confidence": 0.70,
+      "thesis": "The Bull engaged the Bear's strongest point and survived: carry+factor confluence backs the long, funding is mild (not crowded), and the Bear's neutral-sentiment objection is not a flip. As the STRONG leg of the relative-value pair, BTC earns the long side.",
+      "falsifiable_prediction": "BTC holds above its rising 20EMA and makes a higher high vs ETH within 2 cycles; invalidated by a 4h close below the prior swing low or by BTC underperforming ETH by >3% over the week."
+    },
+    {
+      "symbol": "ETH/USDT:USDT",
+      "rating": "short",
+      "confidence": 0.65,
+      "thesis": "The Bear named the liquidation the Bull ignored: crowded longs (L/S 1.31) paying elevated funding into a twice-rejected level is flush fuel. As the WEAK leg of the same-sector relative-value pair, ETH earns the co-equal short — two legs the Trader sends as two gate-approved orders, kept neutral by the optimizer.",
+      "falsifiable_prediction": "ETH makes a lower high vs BTC and loses the shelf within 2 cycles; invalidated by a 4h reclaim of the shelf or ETH outperforming BTC by >3% over the week."
+    }
+  ]
+}

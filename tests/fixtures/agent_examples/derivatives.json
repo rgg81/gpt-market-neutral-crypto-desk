@@ -1,0 +1,20 @@
+{
+  "reports": [
+    {
+      "symbol": "SOL/USDT:USDT",
+      "stance": "bearish",
+      "conviction": 0.68,
+      "thesis": "long/short ratio 3.1 = longs heavily crowded; funding +0.04% = longs paying dearly = flush risk; OI +9% into a failing high = late longs stacked above a thin shelf (liquidation fuel).",
+      "signals": {"funding_rate": 0.0004, "oi_change_pct": 0.09, "long_short_ratio": 3.1},
+      "horizon": "weekly"
+    },
+    {
+      "symbol": "HYPE/USDT:USDT",
+      "stance": "bullish",
+      "conviction": 0.55,
+      "thesis": "long/short ratio 0.72 = crowd short; funding -0.03% pays the long; OI +6% as price holds = new shorts trapped, squeeze fuel.",
+      "signals": {"funding_rate": -0.0003, "oi_change_pct": 0.06, "long_short_ratio": 0.72},
+      "horizon": "weekly"
+    }
+  ]
+}

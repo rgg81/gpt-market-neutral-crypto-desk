@@ -1,0 +1,20 @@
+{
+  "reports": [
+    {
+      "symbol": "BTCUSDT__ETHUSDT",
+      "stance": "bearish",
+      "conviction": 0.71,
+      "thesis": "Spread z = +2.4 (rich) on a clean cointegration: ADF p_adj 0.012, OU half-life 4.1 cycles, rolling re-test still cointegrated. Lean SHORT the spread (short y / long x) back toward mu.",
+      "signals": {"hedge_ratio": 18.6, "adf_pvalue": 0.008, "adf_pvalue_adj": 0.012, "half_life": 4.1, "zscore": 2.4, "method": "engle_granger"},
+      "horizon": "weekly"
+    },
+    {
+      "symbol": "SOLUSDT__AVAXUSDT",
+      "stance": "bullish",
+      "conviction": 0.6,
+      "thesis": "Spread z = -2.1 (cheap); ADF p_adj 0.031, half-life 6.3 cycles, cointegration holding on the re-test. Lean LONG the spread back toward mu.",
+      "signals": {"hedge_ratio": 2.4, "adf_pvalue": 0.019, "adf_pvalue_adj": 0.031, "half_life": 6.3, "zscore": -2.1, "method": "engle_granger"},
+      "horizon": "weekly"
+    }
+  ]
+}

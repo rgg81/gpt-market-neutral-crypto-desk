@@ -1,0 +1,20 @@
+{
+  "reports": [
+    {
+      "symbol": "SOL/USDT:USDT",
+      "stance": "bearish",
+      "conviction": 0.7,
+      "thesis": "ema20_slope -0.011 + ema50_slope < 0 = price below falling EMAs; adx 27 (-DI > +DI) = strong DOWN trend, do not fade; rejected the swing_high and breaking the support shelf (dist_to_swing_low_pct 0.02); rsi 38 falling, no bullish divergence.",
+      "signals": {"rsi": 38.0, "adx": 27.0, "plus_di": 16.0, "minus_di": 31.0, "ema20_slope": -0.011, "ema50_slope": -0.006, "atr": 2.4},
+      "horizon": "weekly"
+    },
+    {
+      "symbol": "BTC/USDT:USDT",
+      "stance": "bullish",
+      "conviction": 0.68,
+      "thesis": "Price above rising EMAs (ema20_slope +0.009); adx 24 with +DI leading = building up-trend; holding above the swing_low; rsi 58 with room.",
+      "signals": {"rsi": 58.0, "adx": 24.0, "plus_di": 28.0, "minus_di": 15.0, "ema20_slope": 0.009, "ema50_slope": 0.004, "atr": 850.0},
+      "horizon": "weekly"
+    }
+  ]
+}

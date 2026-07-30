@@ -1,0 +1,16 @@
+{
+  "equity": 20110.0,
+  "total_fees": 4.0,
+  "total_slippage": 2.0,
+  "total_funding_received": 6.0,
+  "total_funding_paid": 0.0,
+  "last_rebalance_cost": 6.0,
+  "last_rebalance_turnover_usd": 4000.0,
+  "by_symbol": {
+    "ETH/USDT:USDT": {
+      "unrealized": 100.0,
+      "realized_funding": 6.0,
+      "accrued_fees": 2.0
+    }
+  }
+}

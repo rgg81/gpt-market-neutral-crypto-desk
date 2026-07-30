@@ -1,0 +1,12 @@
+{
+  "reports": [
+    {
+      "symbol": "ETH/USDT:USDT",
+      "stance": "bearish",
+      "conviction": 0.63,
+      "thesis": "Strongest honest short case for the ETH leg, rebutting the Bull's 'new long money' read directly: the same longs stacking into a twice-rejected resistance are the fuel for a flush, not proof of strength. Long/short ratio 1.31 (crowded longs) plus elevated funding (longs paying to hold) into a stalling tape is the crowded-long flush — the co-equal mirror of a squeeze long. I want the relative-value short vs BTC on a confirmed 4h breakdown, invalidated by a reclaim of the shelf.",
+      "signals": {"long_short_ratio": 1.31, "signed_funding": 0.0004, "structure": "lower_high_twice_rejected", "rebuts_bull": "rising OI into the failing high is trapped longs = liquidation fuel"},
+      "horizon": "weekly"
+    }
+  ]
+}
