@@ -167,4 +167,5 @@ revising — if you changed legs, the residuals changed.** Make the smallest suf
 preserve every unaffected leg and address every `demanded_change` explicitly in `notes`.
 
 <!-- REFLECTOR:BEGIN (auto-managed calibration — evidence-backed, reversible; do not hand-edit) -->
+- [c9] The book's alpha net of beta was negative in 3 of the last 6 scored cycles (c4 alpha_frac=-0.0000, c6=-0.0003, c7=-0.0019). Rank each non-BTC candidate by side-aligned cross-specialist corroboration and conviction, and do not size a weaker-ranked name above a stronger same-side candidate without an explicit leg-level reason; preserve the >=90% deployment and dollar/beta-neutrality mandates. retire_if: alpha_frac > 0 over 3 consecutive scored cycles by c17.
 <!-- REFLECTOR:END -->
