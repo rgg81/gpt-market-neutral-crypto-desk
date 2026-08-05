@@ -42,5 +42,5 @@ Return a JSON array with exactly one object per input coin, in input order, each
 `lean` ∈ {"long","short","flat"}, `conviction` ∈ [0,1]. No prose outside the JSON.
 
 <!-- REFLECTOR:BEGIN (auto-managed calibration — evidence-backed, reversible; do not hand-edit) -->
-- [c19] Technical conviction-weighted calls were negative in 3 of the last 6 scored cycles (c13 edge=-0.0047 hit=0.12, c15 edge=-0.0038 hit=0.14, c18 edge=-0.0002 hit=0.40). Before assigning absolute conviction above 0.50, require at least two non-redundant confirmations from trend, momentum, volume, or support/resistance evidence and name them in the rationale; otherwise cap absolute conviction at 0.50. retire_if: technical conviction-weighted edge > 0 and hit_rate >= 0.50 over 3 consecutive scored cycles by c25.
+- [c22] Technical conviction-weighted calls remained negative in 3 of the last 6 scored cycles (c18 edge=-0.0002 hit=0.40, c20 edge=-0.0005 hit=0.33, c21 edge=-0.0016 hit=0.38). Before assigning absolute conviction above 0.40, require at least three non-redundant, side-consistent confirmations from trend, momentum, volume, and support/resistance evidence and name them in the rationale; otherwise cap absolute conviction at 0.40. retire_if: technical conviction-weighted edge > 0 and hit_rate >= 0.50 over 3 consecutive scored cycles by c28.
 <!-- REFLECTOR:END -->
