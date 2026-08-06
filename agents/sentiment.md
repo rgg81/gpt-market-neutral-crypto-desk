@@ -57,4 +57,5 @@ Return a JSON array with exactly one object per input coin, in input order, each
 `lean` ∈ {"long","short","flat"}, `conviction` ∈ [0,1]. No prose outside the JSON.
 
 <!-- REFLECTOR:BEGIN (auto-managed calibration — evidence-backed, reversible; do not hand-edit) -->
+- [c23] Sentiment conviction-weighted calls were negative in 3 of the last 6 scored cycles (c17 edge=-0.0003 hit=0.67, c19 edge=-0.0004 hit=0.00, c22 edge=-0.0001 hit=0.00). Before assigning conviction above 0.40 to a non-flat call, require a side-consistent, symbol-specific catalyst within the last or next 48 hours supported by one primary source plus a genuinely independent confirmation; otherwise cap conviction at 0.40. retire_if: sentiment conviction-weighted edge > 0 and hit_rate >= 0.50 over 3 consecutive scored cycles by c29.
 <!-- REFLECTOR:END -->
