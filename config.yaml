@@ -9,8 +9,24 @@ agent_model: "gpt-5.6-sol"         # exact model on root; every subagent inherit
 universe_top_n: 40                 # rank the top-40 by 24h quote volume (widened 2026-07-15:
                                    # a 5-6 name post-gate universe left the carry book with no
                                    # earning-long seat for 6 straight positive-funding cycles)
-cadence_tf_minutes: 480            # 8h decision cadence (00/08/16 UTC, funding-aligned)
+cadence_tf_minutes: 1440           # 24h full-GPT decision cadence (00:07 UTC)
 btc_symbol: "BTC/USDT:USDT"        # beta/hedge reference
+
+# Mandatory candle source. No direct-Binance or stale-data fallback is allowed for klines.
+data:
+  binance_klines_proxy_url: "http://127.0.0.1:8000"
+  candle_proxy_timeout_seconds: 15
+  binance_proxy_project_dir: "~/binance-proxy"
+  binance_proxy_start_timeout_seconds: 15
+
+# Conservative PAPER market-order mechanics. These parameters affect simulated achieved fills
+# and are recorded in execution provenance; they never select a symbol, side, or size.
+execution:
+  latency_ms: 500
+  displayed_depth_fraction: 0.50
+  adverse_selection_bps: 1.0
+  legging_bps_per_second: 0.25
+  allow_partial_fills: true
 
 # --- universe quality floors (top-N by 24h volume, crypto-only) ---
 universe:
@@ -19,6 +35,7 @@ universe:
                                    # long; 20 balances coverage against per-cycle web-search cost)
   min_adv_usd: 20000000
   crypto_only: true
+  min_age_days: 60                  # guarantees the required 60-row daily beta range exists
 
 # --- beta estimation ---
 beta:

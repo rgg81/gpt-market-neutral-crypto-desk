@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pandas as pd
-
 from futures_fund.market_data import quality_filter
 
 _NOW = datetime(2026, 6, 12, tzinfo=UTC)
@@ -23,11 +21,7 @@ class _FakeDepthExchange:
         return self._THIN if symbol.startswith("VELVET") else self._DEEP
 
     def ohlcv(self, symbol, timeframe="4h", limit=500):
-        # default fallback frame: earliest candle is OLD (>= min_age_days) for any name that
-        # reaches the kline fallback. Tests needing a YOUNG fallback subclass and override this.
-        ts = pd.date_range("2025-01-01", periods=200, freq="4h", tz="UTC")
-        return pd.DataFrame({"timestamp": ts, "open": 1.0, "high": 1.0,
-                             "low": 1.0, "close": 1.0, "volume": 1.0})
+        raise AssertionError("quality_filter must not issue an undeclared candle request")
 
 
 def _rows():
@@ -73,37 +67,29 @@ def test_drop_counts_are_explicit_no_silent_truncation():
     assert len(kept) == 3
 
 
-def test_age_falls_back_to_klines_when_onboard_date_missing_and_keeps_old():
-    # OLD via the kline fallback: earliest candle 2025-01-01 is >> min_age_days(30) -> KEPT.
-    rows = [{"symbol": "OLDISH/USDT:USDT", "last": 1.0, "chg_24h_pct": 0.0,
+def test_missing_onboard_date_is_explicit_and_never_fetches_unbound_candles():
+    rows = [{"symbol": "UNKNOWN/USDT:USDT", "last": 1.0, "chg_24h_pct": 0.0,
              "vol_24h_usd": 1e9, "onboard_date": None}]
     kept, drops = quality_filter(
         rows, now=_NOW, exchange=_FakeDepthExchange(), min_adv_usd=1e8,
         min_age_days=30, max_abs_chg_24h_pct=25.0, min_depth_usd=250_000.0,
         depth_ref_usd=100_000.0, symbol_count=30,
     )
-    assert [r["symbol"] for r in kept] == ["OLDISH/USDT:USDT"]
+    assert [r["symbol"] for r in kept] == ["UNKNOWN/USDT:USDT"]
     assert drops["age"] == 0
+    assert drops["age_unknown"] == 1
 
 
-def test_age_falls_back_to_klines_and_drops_a_genuinely_young_name():
-    # The fallback's JOB: a name whose earliest candle is only ~5 days old must be DROPPED as
-    # too young. This pins the young-rejection path the old fixture never exercised.
-    class _YoungKlines(_FakeDepthExchange):
-        def ohlcv(self, symbol, timeframe="4h", limit=500):
-            ts = pd.date_range(_NOW - timedelta(days=5), periods=30, freq="4h", tz="UTC")
-            return pd.DataFrame({"timestamp": ts, "open": 1.0, "high": 1.0,
-                                 "low": 1.0, "close": 1.0, "volume": 1.0})
-
+def test_invalid_onboard_date_is_explicit_age_unknown_without_candle_probe():
     rows = [{"symbol": "YOUNG/USDT:USDT", "last": 1.0, "chg_24h_pct": 0.0,
-             "vol_24h_usd": 1e9, "onboard_date": None}]
+             "vol_24h_usd": 1e9, "onboard_date": float("nan")}]
     kept, drops = quality_filter(
-        rows, now=_NOW, exchange=_YoungKlines(), min_adv_usd=1e8,
+        rows, now=_NOW, exchange=_FakeDepthExchange(), min_adv_usd=1e8,
         min_age_days=30, max_abs_chg_24h_pct=25.0, min_depth_usd=250_000.0,
         depth_ref_usd=100_000.0, symbol_count=30,
     )
-    assert kept == []
-    assert drops["age"] == 1
+    assert [r["symbol"] for r in kept] == ["YOUNG/USDT:USDT"]
+    assert drops["age_unknown"] == 1
 
 
 def test_depth_floor_excludes_thin_book():

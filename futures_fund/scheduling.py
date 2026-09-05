@@ -26,6 +26,7 @@ Returns (mode, n, reason):
   mode == 'RETRY'  -> re-run/overwrite the crashed dir <cycle_root>/<n>/ (n = highest_dir)
   mode == 'SKIP'   -> this candle is already served; do nothing (n = the serving cycle)
 """
+
 from __future__ import annotations
 
 import json
@@ -92,7 +93,9 @@ def _parse_utc(raw) -> datetime | None:
 
 def _served_candle(report_path: Path, now_utc: datetime, tf_minutes: int) -> datetime | None:
     """Resolve which candle a completed cycle served, from its report.json. Priority:
-    report['candle'] -> floor_tf(report['ran_at']) -> floor_tf(file mtime). All tz-aware UTC.
+    report['candle'] -> floor_tf(report['decision_ts']) -> floor_tf(report['ran_at']) -> file
+    mtime. `decision_ts` is the gate-start/evidence instant and therefore the correct served-candle
+    provenance when present. All timestamps are tz-aware UTC.
     A ran_at in the future (clock skew) is discarded so it cannot drive the candle. Returns None
     if the report cannot be read/parsed (caller treats that dir as not-completed)."""
     try:
@@ -105,6 +108,9 @@ def _served_candle(report_path: Path, now_utc: datetime, tf_minutes: int) -> dat
     if ran_at is not None and ran_at > now_utc:
         ran_at = None  # future-stamp guard: never let a skewed ran_at wedge the loop
     cand = _parse_utc(rep.get("candle"))
+    decision_ts = _parse_utc(rep.get("decision_ts"))
+    if cand is None and decision_ts is not None:
+        cand = floor_tf(decision_ts, tf_minutes)
     if cand is None and ran_at is not None:
         cand = floor_tf(ran_at, tf_minutes)
     if cand is None:
@@ -115,8 +121,9 @@ def _served_candle(report_path: Path, now_utc: datetime, tf_minutes: int) -> dat
     return cand
 
 
-def cycle_due(state_dir, now_utc: datetime, *, tf_minutes: int = 240,
-              loop: str | None = None) -> tuple[str, int, str]:
+def cycle_due(
+    state_dir, now_utc: datetime, *, tf_minutes: int = 240, loop: str | None = None
+) -> tuple[str, int, str]:
     """Decide whether the candle containing `now_utc` still needs a cycle. Never raises.
 
     `tf_minutes` is the loop's candle width; `loop` selects the per-loop cycle root
@@ -125,15 +132,20 @@ def cycle_due(state_dir, now_utc: datetime, *, tf_minutes: int = 240,
     candle = timedelta(minutes=tf_minutes)
     future_tol = candle
     try:
-        assert now_utc.tzinfo is not None and now_utc.utcoffset() == timedelta(0), \
+        assert now_utc.tzinfo is not None and now_utc.utcoffset() == timedelta(0), (
             "now_utc must be tz-aware UTC"
+        )
         boundary = floor_tf(now_utc, tf_minutes)
         root = Path(state_dir) / loop / "cycle" if loop else Path(state_dir) / "cycle"
 
-        dirs = sorted(
-            (int(p.name) for p in root.glob("*") if p.is_dir() and p.name.isdigit()),
-            reverse=True,
-        ) if root.exists() else []
+        dirs = (
+            sorted(
+                (int(p.name) for p in root.glob("*") if p.is_dir() and p.name.isdigit()),
+                reverse=True,
+            )
+            if root.exists()
+            else []
+        )
         if not dirs:
             return ("FRESH", 1, "cold-start: no cycle dirs")
         highest_dir = dirs[0]
@@ -159,18 +171,27 @@ def cycle_due(state_dir, now_utc: datetime, *, tf_minutes: int = 240,
 
         if served >= boundary:
             nxt = (boundary + candle).isoformat()
-            return ("SKIP", completed_n,
-                    f"cycle {completed_n} already served candle {served.isoformat()} "
-                    f"(>= boundary {boundary.isoformat()}); next boundary {nxt}")
+            return (
+                "SKIP",
+                completed_n,
+                f"cycle {completed_n} already served candle {served.isoformat()} "
+                f"(>= boundary {boundary.isoformat()}); next boundary {nxt}",
+            )
 
         # This candle is unserved -> DUE. If a higher dir exists with no trustworthy report, it is
         # a crashed current-candle attempt -> RETRY/overwrite it; otherwise a FRESH next cycle.
         if highest_dir > completed_n:
-            return ("RETRY", highest_dir,
-                    f"cycle {highest_dir} crashed before gate; last completed {completed_n} "
-                    f"served {served.isoformat()}")
-        return ("FRESH", highest_dir + 1,
-                f"new candle {boundary.isoformat()}; last completed {completed_n} "
-                f"served {served.isoformat()}")
+            return (
+                "RETRY",
+                highest_dir,
+                f"cycle {highest_dir} crashed before gate; last completed {completed_n} "
+                f"served {served.isoformat()}",
+            )
+        return (
+            "FRESH",
+            highest_dir + 1,
+            f"new candle {boundary.isoformat()}; last completed {completed_n} "
+            f"served {served.isoformat()}",
+        )
     except Exception as e:  # noqa: BLE001 — fail SAFE: never swallow a candle on an internal error
         return ("FRESH", 1, f"fail-safe DUE after internal error: {e!r}")

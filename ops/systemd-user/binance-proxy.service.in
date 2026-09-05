@@ -1,0 +1,17 @@
+[Unit]
+Description=Exact local Binance candle proxy for the GPT PAPER desk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@BINANCE_PROXY_ROOT@
+ExecStart=@BINANCE_PROXY_ROOT@/.venv/bin/uvicorn binance_proxy.app:app --host 127.0.0.1 --port 8000 --app-dir @BINANCE_PROXY_ROOT@/src
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

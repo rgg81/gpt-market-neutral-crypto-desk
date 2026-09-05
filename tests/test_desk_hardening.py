@@ -109,7 +109,8 @@ def test_reconcile_settles_funding_across_boundary():
     reconcile_book(acct, _neutral_book(), marks=marks, costs=costs, betas={},
                    now=t0, cycle=1, cadence="rebal",
                    funding_by_symbol={"A/USDT:USDT": 0.0001, "B/USDT:USDT": 0.0001},
-                   funding_intervals={"A/USDT:USDT": 8, "B/USDT:USDT": 8})
+                   funding_intervals={"A/USDT:USDT": 8, "B/USDT:USDT": 8},
+                   enforce_achieved_safety=False)
     assert acct.last_funding_ts == t0
     # next cycle crosses the 08:00 UTC boundary: short B RECEIVES, long A PAYS (same rate,
     # same notional -> net 0); use asymmetric rates to get a measurable net credit.
@@ -117,7 +118,8 @@ def test_reconcile_settles_funding_across_boundary():
     rep = reconcile_book(acct, _neutral_book(), marks=marks, costs=costs, betas={},
                          now=t1, cycle=2, cadence="rebal",
                          funding_by_symbol={"A/USDT:USDT": -0.0001, "B/USDT:USDT": 0.0003},
-                         funding_intervals={"A/USDT:USDT": 8, "B/USDT:USDT": 8})
+                         funding_intervals={"A/USDT:USDT": 8, "B/USDT:USDT": 8},
+                         enforce_achieved_safety=False)
     # long A at negative funding RECEIVES 9000*0.0001; short B at positive RECEIVES 9000*0.0003
     assert rep.funding_settled_cycle == pytest.approx(9000 * 0.0001 + 9000 * 0.0003, rel=1e-6)
     assert acct.funding_received > 0 and acct.last_funding_ts == t1
@@ -129,7 +131,7 @@ def test_held_symbol_without_mark_halts_instead_of_fabricating():
     acct = PaperAccount(cash=20000.0)
     acct.positions["GONE/USDT:USDT"] = Position(
         symbol="GONE/USDT:USDT", direction="long", qty=100.0, entry_price=50.0, opened_ts=NOW)
-    with pytest.raises(ValueError, match="no mark"):
+    with pytest.raises(ValueError, match="no finite positive mark"):
         acct.apply_fills([], marks={}, costs={})
 
 
@@ -140,14 +142,14 @@ def test_cycle_report_frictions_tie_to_account_deltas():
     marks = {"A/USDT:USDT": 100.0, "B/USDT:USDT": 10.0}
     costs = {s: CostInputs(adv_usd=1e9, half_spread_bps=1.0) for s in marks}
     rep = reconcile_book(acct, _neutral_book(), marks=marks, costs=costs, betas={},
-                         now=NOW, cycle=1, cadence="rebal")
+                         now=NOW, cycle=1, cadence="rebal", enforce_achieved_safety=False)
     assert rep.turnover_usd == pytest.approx(18000.0)
     assert rep.fees_paid_cycle == pytest.approx(acct.fees_paid)
     assert rep.slippage_paid_cycle == pytest.approx(acct.slippage_paid)
     assert rep.ran_at and rep.decision_ts == NOW.isoformat()
     # resend the identical book -> zero new frictions, zero turnover
     rep2 = reconcile_book(acct, _neutral_book(), marks=marks, costs=costs, betas={},
-                          now=NOW, cycle=2, cadence="rebal")
+                          now=NOW, cycle=2, cadence="rebal", enforce_achieved_safety=False)
     assert rep2.turnover_usd == pytest.approx(0.0)
     assert rep2.fees_paid_cycle == pytest.approx(0.0)
     assert rep2.slippage_paid_cycle == pytest.approx(0.0)
@@ -180,8 +182,10 @@ def test_equity_log_rejects_non_monotonic_ts(tmp_path):
     record_equity(tmp_path, NOW, 20000.0, 1)
     with pytest.raises(ValueError, match="non-monotonic"):
         record_equity(tmp_path, NOW - timedelta(hours=1), 19000.0, 2)
-    # same-cycle RETRY replaces its own point and stays legal
-    record_equity(tmp_path, NOW + timedelta(minutes=1), 20001.0, 1)
+    # Durable recovery may replay only the exact immutable same-cycle close.
+    record_equity(tmp_path, NOW, 20000.0, 1)
+    with pytest.raises(ValueError, match="conflicting equity replay"):
+        record_equity(tmp_path, NOW + timedelta(minutes=1), 20001.0, 1)
 
 
 # ---------- reflector evidence guard ----------
@@ -220,9 +224,9 @@ def test_watchdog_classification():
         "desk_watchdog", Path(__file__).resolve().parents[1] / "scripts" / "desk_watchdog.py")
     wd = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(wd)
-    assert wd.classify(0.5) == "EARLY"
-    assert wd.classify(8.0) == "ON_TIME"
-    assert wd.classify(9.5) == "ON_TIME"
-    assert wd.classify(11.0) == "LATE"
-    assert wd.classify(17.0) == "MISSED_2"
-    assert wd.classify(25.0) == "MISSED_3"
+    assert wd.classify(8.0) == "EARLY"
+    assert wd.classify(24.0) == "ON_TIME"
+    assert wd.classify(29.5) == "ON_TIME"
+    assert wd.classify(35.0) == "LATE"
+    assert wd.classify(49.0) == "MISSED_2"
+    assert wd.classify(73.0) == "MISSED_3"

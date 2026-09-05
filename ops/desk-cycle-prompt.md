@@ -1,56 +1,59 @@
-[GPT DESK 8h CYCLE — autonomous scheduled firing]
+[GPT DESK 24h CYCLE — autonomous scheduled firing]
 
-Run exactly ONE full paper-desk cycle in this repository. Do not ask questions. Read and obey
-`AGENTS.md`, `MISSION.md`, and `docs/desk-cycle-runbook.md`; the runbook is the source of truth.
+Run exactly one PAPER desk cycle in this repository without asking questions. Read `AGENTS.md`,
+`MISSION.md`, and the **complete** `docs/desk-cycle-runbook.md`; execute that runbook exactly. It
+is the source of truth for command order, artifacts, validation, retry limits, decision authority,
+and failure handling. Read any `ops/next-cycle-directive.md` in full and preserve its one-shot
+binding/archive semantics.
 
-Before the watchdog, check whether `ops/next-cycle-directive.md` exists. If it does, read it in
-full and treat it as a binding one-shot user directive. Pass its full text verbatim to the PM and
-Adversary dispatches as `binding_user_directive`; do not merely summarize it.
+Runtime identity is fixed: root and every real Reflector, specialist, PM, and Adversary subagent
+are `gpt-5.6-sol` at `xhigh`, authenticated by Codex login. Do not set a subagent model override,
+use a raw API key, impersonate a role, or substitute another model. Spawn sentiment, technical,
+and futures concurrently; wait for all three final notifications before dispatching the PM.
 
-This firing explicitly requires the Codex multi-agent workflow:
+The mandatory sequence is:
 
-- The root orchestrator is `gpt-5.6-sol` at `xhigh` reasoning.
-- Spawn the Reflector (only when due), all three specialists, the PM, and the Adversary as GPT
-  subagents. Every subagent must inherit the root `gpt-5.6-sol` model and `xhigh` effort. Never
-  select, mention, or fall back to Claude/Opus or a cheaper/faster GPT model.
-- Spawn sentiment, technical, and futures concurrently, then wait for all three before the PM.
-- The agents make decisions. Deterministic scripts only collect evidence, compute the documented
-  precheck, validate provenance, and record paper fills.
+```text
+proxy ensure/freshness → managed-prompt provenance → durable recovery → watchdog
+→ evidence → scheduled scoring → performance → optional real Reflector
+→ repeat managed-prompt provenance check
+→ seal post-reflection decision-start runtime provenance
+→ three real specialists in parallel → immutable read digest
+→ real PM → deterministic precheck → real Adversary
+→ at most one receipt-bound PM revision and fresh precheck
+→ decision-chain validation → PAPER reconcile → heartbeat
+```
 
-Execute the runbook sequence exactly:
+Enforce these release-critical checks from the runbook:
 
-0a. Before the watchdog, run the managed-region provenance check from the runbook. Any failure
-    HALTS before evidence; do not let copied or unjournaled calibration text reach an agent.
-0. Watchdog. If it reports EARLY, stand down immediately without opening a cycle.
-1. Evidence.
-1b. Score the prior cycle, fail-soft.
-1c. Reflect only when recurrences are non-empty, fail-soft.
-2. Three GPT specialists in parallel, with the documented validation/retry rules.
-3. GPT portfolio manager.
-3b. Deterministic precheck.
-4. GPT adversary; at most one PM revision, followed by a fresh precheck.
-   The verdict's citation_checks must cover every non-flat sentiment symbol and every URL exactly;
-   an accepted selected leg cannot rely on a claim the Adversary marked unsupported.
-4a. When a binding directive exists, validate the FINAL precheck against it after any revision.
-    An Adversary `accept=true` on a plainly noncompliant original is a failed output and gets the
-    one documented output retry. A noncompliant final revision HALTs before reconcile.
-5. Reconcile only a directive-compliant final book, then print the complete heartbeat.
-5a. If a pending one-shot directive exists, archive it only after a successful reconcile that
-    satisfies its stated completion condition. On stand-down, HALT, or noncompliance, leave it
-    pending.
+- An EARLY watchdog stands down. A proxy, candle-freshness, recovery, provenance, all-specialist,
+  malformed-after-allowed-retry, or decision-chain failure HALTS with the prior book untouched.
+- Current-forming proxy candles prove freshness but never enter completed-candle statistics.
+  Direct-Binance OHLCV, stale/empty fallback, fabricated evidence, and invented outputs are
+  forbidden.
+- After reflection and its repeated provenance check, run `scripts/desk_decision_start.py` before
+  spawning specialists. Never create or mutate a specialist/decision artifact before that seal,
+  and never run reflection after it.
+- Deterministic code supplies and binds evidence, performance, risk, precheck, execution and
+  accounting facts. GPT agents alone rank, construct, size, accept, reject, and revise trades.
+- All roles read the exact current `performance_snapshot.json`. The PM and Adversary use the
+  complete immutable specialist digest, current descriptive risk packet, current managed entry
+  policy, exact directive when present, and all incumbent-thesis provenance required by the
+  runbook.
+- Price-relative alpha is the anchor. Carry may lead only in verified chop. Every incumbent is
+  compared with cash and the best replacement; a broken non-hedge price thesis with no positive
+  forward edge exits. Loss-control drops/decreases never consume the aggressive-action cap.
+- PM forecasts use only 24/72/168h, carry calibration/invalidation evidence, and are one-time
+  horizon outcomes. Candidate reviews cover every current non-flat technical candidate and every
+  selected alpha leg so rejected opportunity cost can be scored without code creating a trade.
+- The Adversary opens every cited non-flat sentiment URL and is the sole veto. It may reject once;
+  the single PM revision stays within immutable receipts and typed constraints. Never run a second
+  adversarial pass or silently repair an agent decision in code.
+- Reconcile uses decision-mark quantities, exchange-valid PAPER quantities, fresh two-sided books,
+  raw published settlement funding, truthful fees/slippage, and the durable manifest contract.
+  It never calls an order-placement API.
+- `live` remains exactly `false`. Work only in this v2 state/memory. Do not edit scheduler or
+  crontab inside the cycle.
 
-Hard boundaries:
-
-- PAPER ONLY. `live` remains exactly `false`; never add or call an order-placement path.
-- Work only inside this v2 repository and its `live_state/` and `live_memory/`. Do not inspect,
-  migrate, or mutate the original sibling desk.
-- Never fabricate an agent output, evidence item, source, decision, report, or successful cycle.
-- Directive compliance is part of decision-chain validation, not an optional preference. Never
-  reconcile or archive a book that misses a pending directive's numeric completion condition.
-- On a safety/provenance failure, HALT and leave the prior paper book standing.
-- Do not edit the scheduler or user crontab during a cycle.
-
-Finish with a concise heartbeat containing the cycle number, schedule status, legs, deployment,
-dollar and beta residuals, equity, turnover, fees, slippage, funding, decision-to-execution age,
-adversary result, and whether a revision occurred. If the cycle stood down or halted, say so and
-give the exact reason.
+Finish with the runbook heartbeat fields. On stand-down or HALT, report the exact reason and never
+claim success.

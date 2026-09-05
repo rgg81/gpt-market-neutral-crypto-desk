@@ -1,0 +1,10 @@
+[Unit]
+Description=GPT market-neutral PAPER desk local health alert
+
+[Service]
+Type=oneshot
+WorkingDirectory=@DESK_ROOT@
+ExecStart=@DESK_ROOT@/.venv/bin/python @DESK_ROOT@/scripts/desk_health_alert.py
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

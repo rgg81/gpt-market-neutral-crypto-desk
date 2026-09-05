@@ -4,10 +4,13 @@ The Reflector may only change text INSIDE the fenced managed region; everything 
 hard rules, neutrality mandate) is out-of-region and therefore un-weakenable. The guarantee is
 structural: an edit is applied by splicing the proposed region between the unchanged prefix/suffix,
 and `assert_only_region_changed` re-verifies nothing outside moved."""
+
 from __future__ import annotations
 
-BEGIN = ("<!-- REFLECTOR:BEGIN (auto-managed calibration — evidence-backed, reversible; "
-         "do not hand-edit) -->")
+BEGIN = (
+    "<!-- REFLECTOR:BEGIN (auto-managed calibration — evidence-backed, reversible; "
+    "do not hand-edit) -->"
+)
 END = "<!-- REFLECTOR:END -->"
 MAX_REGION_CHARS = 4000
 
@@ -24,7 +27,7 @@ def split_managed(text: str) -> tuple[str, str, str]:
     j = text.index(END)
     if j < i + len(BEGIN):
         raise PromptGuardError("managed markers out of order")
-    return text[:i], text[i + len(BEGIN):j], text[j + len(END):]
+    return text[:i], text[i + len(BEGIN) : j], text[j + len(END) :]
 
 
 def assert_valid_region(region: str) -> None:

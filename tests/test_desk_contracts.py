@@ -1,7 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
-from futures_fund.desk_contracts import AdversaryVerdict, Book, BookLeg, SpecialistRead
+from futures_fund.desk_contracts import (
+    AdversaryVerdict,
+    Book,
+    BookLeg,
+    CandidateReview,
+    SpecialistRead,
+    SpecialistSupportEcho,
+)
 
 
 def test_specialist_read_bounds_conviction():
@@ -21,6 +28,216 @@ def test_book_requires_positive_notional_legs():
         BookLeg(symbol="X", side="long", target_notional=0.0, rationale="r")
     with pytest.raises(ValidationError):
         BookLeg(symbol="X", side="long", target_notional=float("inf"), rationale="r")
+
+
+def test_only_btc_can_be_labeled_as_a_hedge_seat():
+    btc = BookLeg(
+        symbol="BTC/USDT:USDT", side="short", target_notional=1000.0, seat_role="hedge"
+    )
+    assert btc.seat_role == "hedge"
+    with pytest.raises(ValidationError, match="reserved for BTC"):
+        BookLeg(symbol="XRP/USDT:USDT", side="short", target_notional=1000.0,
+                seat_role="hedge")
+
+
+def test_price_edge_horizon_must_match_a_schedulable_daily_bucket():
+    for horizon in (8, 25):
+        legacy_parseable = Book(legs=[BookLeg(
+            symbol="XRP/USDT:USDT", side="short", target_notional=1000.0,
+            edge_horizon_hours=horizon,
+        )])
+        with pytest.raises(ValueError, match="schedulable production buckets"):
+            legacy_parseable.validate_production_contract()
+    assert Book(legs=[BookLeg(
+        symbol="XRP/USDT:USDT", side="short", target_notional=1000.0,
+        edge_horizon_hours=168,
+        edge_calibration_basis="horizon-matched history",
+        invalidation_condition="relative trend reverses",
+    )]).validate_production_contract().legs[0].edge_horizon_hours == 168
+
+
+def test_production_hedge_cannot_carry_an_alpha_forecast_or_thesis():
+    canonical = Book(legs=[BookLeg(
+        symbol="BTC/USDT:USDT",
+        side="short",
+        target_notional=1000.0,
+        seat_role="hedge",
+    )])
+    assert canonical.validate_production_contract().legs[0].edge_horizon_hours == 24
+
+    for update in (
+        {"expected_price_edge_frac": 0.01},
+        {"edge_horizon_hours": 72},
+        {"edge_calibration_basis": "alpha disguise"},
+        {"invalidation_condition": "alpha disguise"},
+    ):
+        malformed = canonical.model_copy(update={
+            "legs": [canonical.legs[0].model_copy(update=update)]
+        })
+        with pytest.raises(ValueError, match="hedge must use zero price edge"):
+            malformed.validate_production_contract()
+
+
+@pytest.mark.parametrize(
+    "legs",
+    [
+        [
+            BookLeg(
+                symbol="SOL/USDT:USDT",
+                side="long",
+                target_notional=1_000.0,
+                edge_calibration_basis="24h matched sample",
+                invalidation_condition="relative trend reverses",
+            ),
+            BookLeg(
+                symbol="SOL/USDT:USDT",
+                side="long",
+                target_notional=2_000.0,
+                edge_calibration_basis="72h matched sample",
+                invalidation_condition="momentum stalls",
+            ),
+        ],
+        [
+            BookLeg(
+                symbol="SOL/USDT:USDT",
+                side="long",
+                target_notional=1_000.0,
+                edge_calibration_basis="24h matched sample",
+                invalidation_condition="relative trend reverses",
+            ),
+            BookLeg(
+                symbol="SOL/USDT:USDT",
+                side="short",
+                target_notional=1_000.0,
+                edge_calibration_basis="24h matched sample",
+                invalidation_condition="relative trend reverses",
+            ),
+        ],
+        [
+            BookLeg(
+                symbol="BTC/USDT:USDT",
+                side="long",
+                target_notional=1_000.0,
+                edge_calibration_basis="24h matched sample",
+                invalidation_condition="relative trend reverses",
+            ),
+            BookLeg(
+                symbol="BTC/USDT:USDT",
+                side="short",
+                target_notional=1_000.0,
+                seat_role="hedge",
+            ),
+        ],
+    ],
+)
+def test_production_book_rejects_duplicate_symbol_legs_across_side_and_role(legs):
+    with pytest.raises(ValueError, match="exactly one net BookLeg per symbol"):
+        Book(legs=legs).validate_production_contract()
+
+
+def test_candidate_reviews_bind_selected_legs_and_every_directional_technical_read():
+    reads = {
+        "technical": [
+            SpecialistRead(symbol="A", lean="long", conviction=0.8, rationale="trend"),
+            SpecialistRead(symbol="B", lean="short", conviction=0.7, rationale="trend"),
+        ],
+        "sentiment": [
+            SpecialistRead(symbol="A", lean="long", conviction=0.6, rationale="catalyst")
+        ],
+        "futures": [
+            SpecialistRead(symbol="A", lean="flat", conviction=0.2, rationale="neutral")
+        ],
+    }
+    leg = BookLeg(
+        symbol="A",
+        side="long",
+        target_notional=1_000.0,
+        expected_price_edge_frac=0.02,
+        edge_horizon_hours=72,
+        edge_calibration_basis="72h walk-forward sample",
+        invalidation_condition="residual slope reverses",
+    )
+    book = Book(
+        legs=[leg],
+        candidate_reviews=[
+            CandidateReview(
+                symbol="A",
+                side="long",
+                status="selected",
+                exclusion_reason="selected",
+                expected_price_edge_frac=0.02,
+                edge_horizon_hours=72,
+                counterfactual_notional=1_000.0,
+                supporting_specialists=[
+                    SpecialistSupportEcho(role="technical", lean="long", conviction=0.8),
+                    SpecialistSupportEcho(role="sentiment", lean="long", conviction=0.6),
+                ],
+                rationale="selected after portfolio construction",
+            ),
+            CandidateReview(
+                symbol="B",
+                side="short",
+                status="rejected",
+                exclusion_reason="entry_gate",
+                expected_price_edge_frac=0.01,
+                edge_horizon_hours=24,
+                counterfactual_notional=900.0,
+                supporting_specialists=[
+                    SpecialistSupportEcho(role="technical", lean="short", conviction=0.7)
+                ],
+                rationale="PM-declared gate exclusion",
+            ),
+        ],
+    )
+
+    assert book.validate_production_contract().validate_candidate_review_coverage(reads) is book
+
+    missing = book.model_copy(update={"candidate_reviews": book.candidate_reviews[:1]})
+    with pytest.raises(ValueError, match="lacks non-flat technical"):
+        missing.validate_candidate_review_coverage(reads)
+
+    mismatched = book.model_copy(
+        update={
+            "candidate_reviews": [
+                book.candidate_reviews[0].model_copy(
+                    update={
+                        "supporting_specialists": [
+                            SpecialistSupportEcho(
+                                role="technical", lean="long", conviction=0.7
+                            ),
+                            SpecialistSupportEcho(
+                                role="sentiment", lean="long", conviction=0.6
+                            ),
+                        ]
+                    }
+                ),
+                book.candidate_reviews[1],
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="echo differs"):
+        mismatched.validate_candidate_review_coverage(reads)
+
+
+def test_candidate_contract_remains_optional_for_historical_books_but_required_by_coverage():
+    historical = Book.model_validate({"legs": []})
+    assert historical.candidate_reviews == []
+    with pytest.raises(ValueError, match="requires candidate_reviews"):
+        historical.validate_candidate_review_coverage(
+            {"sentiment": [], "technical": [], "futures": []}
+        )
+
+    with pytest.raises(ValidationError, match="must agree"):
+        CandidateReview(
+            symbol="A",
+            side="long",
+            status="selected",
+            exclusion_reason="entry_gate",
+            expected_price_edge_frac=0.01,
+            edge_horizon_hours=24,
+            counterfactual_notional=1_000.0,
+            rationale="invalid disposition",
+        )
 
 
 def test_adversary_verdict_roundtrips():
@@ -54,6 +271,94 @@ def test_adversary_requires_exact_bound_set_and_decision_reasoning():
     incomplete_reject["accept"] = False
     with pytest.raises(ValidationError, match="objection"):
         AdversaryVerdict.model_validate(incomplete_reject)
+
+    prose_only_reject = make_verdict().model_dump()
+    prose_only_reject.update({
+        "accept": False,
+        "objections": ["invalidated alpha"],
+        "demanded_changes": ["drop it"],
+    })
+    with pytest.raises(ValidationError, match="revision constraint"):
+        AdversaryVerdict.model_validate(prose_only_reject)
+
+    constrained_accept = make_verdict().model_dump()
+    constrained_accept["revision_constraints"] = [{
+        "kind": "drop_symbol", "symbol": "X", "value": None, "note": "not allowed",
+    }]
+    with pytest.raises(ValidationError, match="accepted book"):
+        AdversaryVerdict.model_validate(constrained_accept)
+
+    unsafe_revision_override = make_verdict(
+        False,
+        objections=["bad book"],
+        demanded_changes=["fix it"],
+    ).model_dump()
+    unsafe_revision_override["revision_allowed_failing_bounds"] = ["B3"]
+    with pytest.raises(ValidationError, match="safety/provenance"):
+        AdversaryVerdict.model_validate(unsafe_revision_override)
+
+
+def test_symbol_mutation_constraints_bind_final_side_and_role():
+    from futures_fund.desk_contracts import RevisionConstraint
+
+    with pytest.raises(ValidationError, match="requires final_side"):
+        RevisionConstraint(
+            kind="permit_symbol_mutation",
+            symbol="BTC/USDT:USDT",
+            note="resize the hedge",
+        )
+    constraint = RevisionConstraint(
+        kind="permit_symbol_mutation",
+        symbol="BTC/USDT:USDT",
+        final_side="short",
+        final_seat_role="hedge",
+        max_expected_price_edge_frac=0.0,
+        min_edge_horizon_hours=24,
+        note="resize the hedge",
+    )
+    assert constraint.final_side == "short"
+    with pytest.raises(ValidationError, match="exact calibration and invalidation"):
+        RevisionConstraint(
+            schema_version=2,
+            kind="permit_symbol_mutation",
+            symbol="XRP/USDT:USDT",
+            final_side="short",
+            final_seat_role="alpha",
+            max_expected_price_edge_frac=0.01,
+            required_expected_price_edge_frac=0.01,
+            required_edge_horizon_hours=24,
+            note="missing exact thesis envelope",
+        )
+    with pytest.raises(ValidationError, match="only BTC"):
+        RevisionConstraint(
+            kind="min_symbol_notional",
+            symbol="XRP/USDT:USDT",
+            value=1000.0,
+            final_side="short",
+            final_seat_role="hedge",
+            max_expected_price_edge_frac=0.0,
+            min_edge_horizon_hours=24,
+            note="invalid disguise",
+        )
+    for update in (
+        {"max_expected_price_edge_frac": 0.01},
+        {"required_edge_horizon_hours": 72},
+        {"min_edge_horizon_hours": 72},
+    ):
+        with pytest.raises(ValidationError, match="canonical 24h horizon"):
+            RevisionConstraint(**{
+                "schema_version": 2,
+                "kind": "permit_symbol_mutation",
+                "symbol": "BTC/USDT:USDT",
+                "final_side": "short",
+                "final_seat_role": "hedge",
+                "max_expected_price_edge_frac": 0.0,
+                "required_expected_price_edge_frac": 0.0,
+                "min_edge_horizon_hours": 24,
+                "required_edge_horizon_hours": 24,
+                "note": "canonical hedge",
+                **update,
+            })
 
 
 def test_reflector_edit_roundtrip():

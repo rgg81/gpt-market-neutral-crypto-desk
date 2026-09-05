@@ -3,8 +3,11 @@
 Production decisions are orchestrated by the subscription workflow in SKILL.md; this module
 intentionally contains no raw-API LLM client.
 """
+
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Protocol
 
 from pydantic import BaseModel
@@ -27,8 +30,23 @@ class AgentRunner(Protocol):
 class StubAgentRunner:
     """Deterministic test double: returns canned model(s) keyed by role, ignoring the prompt."""
 
+    __slots__ = ("__canned",)
+
     def __init__(self, canned: dict[str, object]):
-        self._canned = canned
+        # Copy away arbitrary mapping behavior, expose no instance ``__dict__`` that could replace
+        # ``run``, and freeze role dispatch after construction. The legacy combined-cycle harness
+        # issues capabilities only for this exact class, never a subclass.
+        self.__canned = MappingProxyType(dict(canned))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if hasattr(self, "_StubAgentRunner__canned"):
+            raise AttributeError("StubAgentRunner is immutable after construction")
+        object.__setattr__(self, name, value)
+
+    @property
+    def _canned(self) -> Mapping[str, object]:
+        """Read-only canned packet retained for small deterministic test-fixture derivations."""
+        return self.__canned
 
     def run(self, role: str, prompt: str, schema: type[BaseModel]) -> BaseModel:
         if role not in self._canned:

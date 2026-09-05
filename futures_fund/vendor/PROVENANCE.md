@@ -1,12 +1,14 @@
 # Vendored analytical scripts
 
-Copied **verbatim** from the predecessor desk's `futures_fund/vendor/`
-(itself lifted from the user's personal Claude Code skills) so the market-neutral desk is
-self-contained and reproducible (spec §11 — project-only, all committed).
+Forked from the predecessor desk's `futures_fund/vendor/` so the market-neutral desk is
+self-contained and reproducible. Local changes are explicit below and covered by repository tests.
 
 | File | Upstream source |
 |---|---|
 | `overfit_detector.py` | `~/.claude/skills/walk-forward-validation/scripts/overfit_detector.py` |
 
-**Do not hand-edit** beyond import hygiene. To update, re-copy from upstream and re-run the smoke
-tests. We use only the pure compute functions (DSR / PBO); the data-fetch helpers are unused here.
+`overfit_detector.py` carries a local correctness hardening patch: PBO validates finite 2-D input
+and supports observation-level purge and embargo around test blocks. Any upstream refresh must
+preserve or deliberately supersede those changes and pass `tests/test_research_validation.py`.
+The desk uses only its pure DSR/PBO/minimum-track-record computations; demo helpers are not part of
+production orchestration.

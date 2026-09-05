@@ -11,6 +11,7 @@ never wedge the desk permanently.
 Pure stdlib, no third-party deps. `now` is injected (tz-aware UTC) so the stale check is testable
 and deterministic. Acquisition is atomic via O_CREAT|O_EXCL.
 """
+
 from __future__ import annotations
 
 import json
@@ -74,9 +75,11 @@ def _unlink_if_same(lock: Path, holder: dict | None) -> bool:
     never delete a lock another process already reclaimed. True if removed or already gone; False if
     it now holds a DIFFERENT holder (caller must re-observe)."""
     cur = _read(lock)
-    if (cur is not None and isinstance(holder, dict)
-            and (cur.get("pid") != holder.get("pid")
-                 or cur.get("start_ts") != holder.get("start_ts"))):
+    if (
+        cur is not None
+        and isinstance(holder, dict)
+        and (cur.get("pid") != holder.get("pid") or cur.get("start_ts") != holder.get("start_ts"))
+    ):
         return False
     try:
         os.unlink(lock)
@@ -85,8 +88,9 @@ def _unlink_if_same(lock: Path, holder: dict | None) -> bool:
     return True
 
 
-def try_acquire(state_dir, now: datetime, *, owner: str = "runner",
-                stale_after_s: float = DEFAULT_STALE_AFTER_S) -> tuple[bool, dict | None]:
+def try_acquire(
+    state_dir, now: datetime, *, owner: str = "runner", stale_after_s: float = DEFAULT_STALE_AFTER_S
+) -> tuple[bool, dict | None]:
     """Atomically try to acquire state/.run.lock. Returns (acquired, prior_holder).
 
     Acquired when the lock was free, OR when an existing lock is STALE and is reclaimed. When held
@@ -104,15 +108,15 @@ def try_acquire(state_dir, now: datetime, *, owner: str = "runner",
     evicted: dict | None = None  # the stale holder we reclaimed, returned to the caller on win
     for _ in range(8):  # bounded retries under extreme contention; normal path is 1-2 iterations
         if _create_excl(lock, payload):
-            return True, evicted            # win: free acquire (evicted=None) or stale reclaim
+            return True, evicted  # win: free acquire (evicted=None) or stale reclaim
         holder = _read(lock)
         if not _is_stale(holder, now, stale_after_s):
-            return False, holder            # a live holder -> denied
+            return False, holder  # a live holder -> denied
         if not _unlink_if_same(lock, holder):
-            continue                        # someone reclaimed under us -> re-observe
-        evicted = holder                    # we removed this stale holder; the next create wins
+            continue  # someone reclaimed under us -> re-observe
+        evicted = holder  # we removed this stale holder; the next create wins
         # loop: re-attempt the EXCL create; only the creator wins, losers re-observe a fresh holder
-    return False, _read(lock)               # gave up under contention; never double-writes
+    return False, _read(lock)  # gave up under contention; never double-writes
 
 
 def release(state_dir) -> None:
@@ -124,14 +128,15 @@ def release(state_dir) -> None:
 
 
 @contextmanager
-def single_flight(state_dir, now: datetime, *, owner: str = "runner",
-                  stale_after_s: float = DEFAULT_STALE_AFTER_S):
+def single_flight(
+    state_dir, now: datetime, *, owner: str = "runner", stale_after_s: float = DEFAULT_STALE_AFTER_S
+):
     """Context manager: yields True if the lock was acquired (releasing on exit), else False.
 
-        with single_flight(state_dir, now, owner="paper") as ok:
-            if not ok:
-                return  # another run is in flight; stand down
-            ... run the cadences ...
+    with single_flight(state_dir, now, owner="paper") as ok:
+        if not ok:
+            return  # another run is in flight; stand down
+        ... run the cadences ...
     """
     acquired, _holder = try_acquire(state_dir, now, owner=owner, stale_after_s=stale_after_s)
     try:

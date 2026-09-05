@@ -6,6 +6,7 @@ builds `state/<loop>/cycle/*`). So `cycle_dir(cadence=...)` MUST resolve to
 `state/<cadence>/cycle/<n>` (NOT `state/cycle/<cadence>/n`): the due-gate reader and the writer
 agree on one root and can never diverge. With no `cadence`, the legacy `state/cycle/<n>` is kept.
 """
+
 from __future__ import annotations
 
 import json
@@ -48,8 +49,11 @@ def save_output(
     d = cycle_dir(state_dir, cycle_no, cadence=cadence)
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.json"
-    text = data.model_dump_json(indent=2) if isinstance(data, BaseModel) \
+    text = (
+        data.model_dump_json(indent=2)
+        if isinstance(data, BaseModel)
         else json.dumps(data, indent=2, default=str)
+    )
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(text)
     os.replace(tmp, p)

@@ -3,8 +3,222 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from futures_fund.account import CostInputs, PaperAccount
+import pytest
+from pydantic import ValidationError
+
+from futures_fund.account import ClosedLeg, CostInputs, PaperAccount, Position, load_account
+from futures_fund.desk_contracts import CycleReport
 from futures_fund.pnl_attribution import build_cycle_pnl
+
+
+def test_historical_funding_settlement_uses_raw_published_rate_not_signal_cap():
+    symbol = "BTC/USDT:USDT"
+    start = datetime(2026, 9, 1, 0, 7, tzinfo=UTC)
+    end = datetime(2026, 9, 1, 8, 7, tzinfo=UTC)
+    account = PaperAccount(
+        cash=20_000.0,
+        last_funding_ts=start,
+        positions={
+            symbol: Position(
+                symbol=symbol,
+                direction="long",
+                qty=1.0,
+                entry_price=100.0,
+                opened_ts=start,
+            )
+        },
+    )
+
+    # 1% is intentionally above the strategy's BTC signal cap. A real published settlement must
+    # still debit the full 1%: 1 contract * $100 settlement mark * 1% = $1.
+    account.settle_funding_events(
+        {
+            symbol: [{
+                "timestamp": datetime(2026, 9, 1, 8, 0, tzinfo=UTC),
+                "rate": 0.01,
+                "mark": 100.0,
+            }]
+        },
+        now=end,
+        observed_intervals={symbol: 8},
+    )
+
+    assert account.cash == 19_999.0
+    assert account.funding_paid == 1.0
+    assert account.positions[symbol].accrued_funding == -1.0
+
+
+def test_held_account_without_funding_clock_fails_closed_without_advancing_it():
+    symbol = "ETH/USDT:USDT"
+    now = datetime(2026, 9, 1, 8, 7, tzinfo=UTC)
+
+    def account_without_clock():
+        return PaperAccount(
+            cash=20_000.0,
+            positions={
+                symbol: Position(
+                    symbol=symbol,
+                    direction="short",
+                    qty=2.0,
+                    entry_price=100.0,
+                    opened_ts=now - timedelta(days=1),
+                )
+            },
+        )
+
+    historical = account_without_clock()
+    before = historical.model_dump(mode="json")
+    with pytest.raises(ValueError, match="explicit audited migration is required"):
+        historical.settle_funding_events({symbol: []}, now=now)
+    assert historical.model_dump(mode="json") == before
+
+    legacy = account_without_clock()
+    before = legacy.model_dump(mode="json")
+    with pytest.raises(ValueError, match="explicit audited migration is required"):
+        legacy.settle_funding(
+            now - timedelta(hours=8),
+            now,
+            {symbol: 0.0001},
+            {symbol: 8},
+            {symbol: 100.0},
+        )
+    assert legacy.model_dump(mode="json") == before
+
+
+def test_funding_metadata_for_every_held_symbol_is_mandatory_and_atomic():
+    symbol = "ETH/USDT:USDT"
+    start = datetime(2026, 9, 1, 0, 7, tzinfo=UTC)
+    end = start + timedelta(hours=8)
+    account = PaperAccount(
+        cash=20_000.0,
+        last_funding_ts=start,
+        positions={
+            symbol: Position(
+                symbol=symbol,
+                direction="long",
+                qty=1.0,
+                entry_price=100.0,
+                opened_ts=start,
+            )
+        },
+    )
+    before = account.model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="funding intervals missing held symbols"):
+        account.settle_funding(start, end, {symbol: 0.001}, {}, {symbol: 100.0})
+    assert account.model_dump(mode="json") == before
+
+    with pytest.raises(ValueError, match="observed funding intervals missing held symbols"):
+        account.settle_funding_events({symbol: []}, now=end, observed_intervals={})
+    assert account.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize(
+    ("factory", "match"),
+    [
+        (
+            lambda: Position(
+                symbol="A",
+                direction="long",
+                qty=float("nan"),
+                entry_price=1.0,
+                opened_ts=datetime(2026, 9, 1, tzinfo=UTC),
+            ),
+            "finite number",
+        ),
+        (
+            lambda: Position(
+                symbol="A",
+                direction="long",
+                qty=1.0,
+                entry_price=-1.0,
+                opened_ts=datetime(2026, 9, 1, tzinfo=UTC),
+            ),
+            "greater than 0",
+        ),
+        (
+            lambda: ClosedLeg(symbol="A", direction="long", fees=-0.01),
+            "greater than or equal to 0",
+        ),
+        (lambda: PaperAccount(cash=-1.0), "greater than or equal to 0"),
+        (lambda: PaperAccount(cash=1.0, slippage_paid=float("inf")), "finite number"),
+    ],
+)
+def test_account_models_reject_nonfinite_or_economically_impossible_values(factory, match):
+    with pytest.raises(ValidationError, match=match):
+        factory()
+
+
+def test_account_models_forbid_unknown_fields_and_inconsistent_keys():
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Position.model_validate(
+            {
+                "symbol": "A",
+                "direction": "long",
+                "qty": 1.0,
+                "entry_price": 1.0,
+                "opened_ts": now,
+                "unknown": "not state",
+            }
+        )
+    position = Position(
+        symbol="A", direction="long", qty=1.0, entry_price=1.0, opened_ts=now
+    )
+    with pytest.raises(ValidationError, match="differs from Position.symbol"):
+        PaperAccount(cash=20_000.0, positions={"B": position})
+    with pytest.raises(ValidationError, match="non-held symbols"):
+        PaperAccount(cash=20_000.0, funding_intervals_observed={"A": 8})
+    with pytest.raises(ValidationError, match="invalid held funding intervals"):
+        PaperAccount(
+            cash=20_000.0,
+            positions={"A": position},
+            funding_intervals_observed={"A": 3},
+        )
+
+
+def test_invalid_persisted_account_halts_instead_of_cold_starting(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "account.json").write_text('{"cash": -1, "positions": {}}')
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        load_account(state, default_cash=20_000.0)
+
+    (state / "account.json").write_text(
+        """{
+          "cash": 20000,
+          "positions": {
+            "A": {
+              "symbol": "A", "direction": "long", "qty": 1,
+              "entry_price": 100, "opened_ts": "2026-09-01T00:00:00Z"
+            }
+          }
+        }"""
+    )
+    with pytest.raises(ValueError, match="held account has no funding clock"):
+        load_account(state, default_cash=20_000.0)
+
+
+def test_post_construction_nonfinite_mutation_cannot_be_serialized():
+    account = PaperAccount(cash=20_000.0)
+    account.cash = float("nan")
+    with pytest.raises(ValidationError, match="finite number"):
+        account.to_dict()
+
+
+def test_cycle_report_rejects_nonfinite_values_and_unknown_fields():
+    base = {
+        "cycle": 1,
+        "achieved_deploy_frac": 0.9,
+        "achieved_dollar_residual_frac": 0.0,
+        "achieved_beta_residual": 0.0,
+        "equity": 20_000.0,
+        "n_legs": 4,
+    }
+    with pytest.raises(ValidationError, match="finite number"):
+        CycleReport.model_validate({**base, "equity": float("nan")})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        CycleReport.model_validate({**base, "unknown": True})
 
 
 def test_position_opened_this_cycle_earns_zero_funding_this_cycle():
@@ -45,6 +259,167 @@ def test_weekly_cycle2_resend_does_not_double_qty():
     assert qty2 == qty1                            # NOT doubled to ~2x notional
     assert acct.fees_paid == fees1                 # 0 extra fee on the re-send
     assert acct.slippage_paid == slip1             # 0 extra slippage on the re-send
+
+
+def test_taker_fee_uses_walked_quote_value_not_midpoint_notional():
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    buy = PaperAccount(cash=20_000.0)
+    buy.apply_fills(
+        [{"symbol": "A", "direction": "long", "target_notional": 200.0}],
+        {"A": 100.0},
+        {"A": CostInputs(depth_asks=[(110.0, 2.0)], half_spread_bps=0.0)},
+        opened_ts=now,
+    )
+    assert buy.slippage_paid == pytest.approx(20.0)
+    assert buy.fees_paid == pytest.approx(220.0 * 0.0005)
+
+    sell = PaperAccount(cash=20_000.0)
+    sell.apply_fills(
+        [{"symbol": "A", "direction": "short", "target_notional": 200.0}],
+        {"A": 100.0},
+        {"A": CostInputs(depth_bids=[(90.0, 2.0)], half_spread_bps=0.0)},
+        opened_ts=now,
+    )
+    assert sell.slippage_paid == pytest.approx(20.0)
+    assert sell.fees_paid == pytest.approx(180.0 * 0.0005)
+
+
+def test_zero_turnover_role_change_resets_lifecycle_without_changing_equity():
+    symbol = "BTC/USDT:USDT"
+    old_ts = datetime(2026, 6, 1, tzinfo=UTC)
+    new_ts = datetime(2026, 6, 11, tzinfo=UTC)
+    account = PaperAccount(
+        cash=20_000.0,
+        positions={
+            symbol: Position(
+                symbol=symbol,
+                direction="long",
+                qty=0.1,
+                entry_price=50_000.0,
+                opened_ts=old_ts,
+                opened_cycle=3,
+                opened_cadence="rebal",
+                seat_role="hedge",
+                thesis_cycle=3,
+                thesis_book_sha256="a" * 64,
+                expected_price_edge_frac=0.0,
+                edge_horizon_hours=24,
+                accrued_funding=3.0,
+                accrued_fees=2.0,
+                accrued_slippage=1.0,
+            )
+        },
+        fees_paid=2.0,
+        slippage_paid=1.0,
+        funding_received=3.0,
+    )
+    marks = {symbol: 60_000.0}
+    equity_before = account.equity(marks)
+
+    account.apply_fills(
+        [{
+            "symbol": symbol,
+            "direction": "long",
+            "target_notional": 6_000.0,
+            "seat_role": "alpha",
+            "thesis_cycle": 9,
+            "thesis_book_sha256": "b" * 64,
+            "expected_price_edge_frac": 0.01,
+            "edge_horizon_hours": 72,
+            "edge_calibration_basis": "manifest-bound 72h cohort calibration",
+            "invalidation_condition": "relative 72h and 168h momentum oppose the long",
+        }],
+        marks,
+        {symbol: CostInputs(adv_usd=1e9, half_spread_bps=0.0)},
+        opened_ts=new_ts,
+        opened_cycle=9,
+        opened_cadence="rebal",
+    )
+
+    position = account.positions[symbol]
+    assert account.equity(marks) == equity_before
+    assert account.cash == 21_000.0
+    assert account.fees_paid == 2.0
+    assert account.slippage_paid == 1.0
+    assert position.qty == 0.1
+    assert position.entry_price == 60_000.0
+    assert position.opened_ts == new_ts
+    assert position.opened_cycle == 9
+    assert position.seat_role == "alpha"
+    assert position.accrued_funding == 0.0
+    assert position.accrued_fees == 0.0
+    assert position.accrued_slippage == 0.0
+    assert position.thesis_book_sha256 == "b" * 64
+    assert len(account.closed_legs) == 1
+    closed = account.closed_legs[0]
+    assert closed.seat_role == "hedge"
+    assert closed.realized_pnl == 1_000.0
+    assert closed.realized_funding == 3.0
+    assert closed.fees == 2.0
+    assert closed.slippage == 1.0
+
+
+def test_role_change_reduction_charges_exit_to_old_role_then_transfers_residual():
+    symbol = "BTC/USDT:USDT"
+    old_ts = datetime(2026, 6, 1, tzinfo=UTC)
+    new_ts = datetime(2026, 6, 11, tzinfo=UTC)
+    account = PaperAccount(
+        cash=20_000.0,
+        positions={
+            symbol: Position(
+                symbol=symbol,
+                direction="long",
+                qty=0.1,
+                entry_price=50_000.0,
+                opened_ts=old_ts,
+                opened_cycle=3,
+                opened_cadence="rebal",
+                seat_role="hedge",
+                accrued_fees=2.0,
+            )
+        },
+        fees_paid=2.0,
+    )
+    marks = {symbol: 50_000.0}
+    equity_before = account.equity(marks)
+
+    account.apply_fills(
+        [{
+            "symbol": symbol,
+            "direction": "long",
+            "target_notional": 4_000.0,
+            "seat_role": "alpha",
+            "thesis_cycle": 9,
+            "thesis_book_sha256": "c" * 64,
+            "expected_price_edge_frac": 0.01,
+            "edge_horizon_hours": 72,
+            "edge_calibration_basis": "manifest-bound 72h cohort calibration",
+            "invalidation_condition": "relative trend breaks",
+        }],
+        marks,
+        {symbol: CostInputs(
+            depth_bids=[(50_000.0, 100.0)],
+            depth_asks=[(50_000.0, 100.0)],
+            half_spread_bps=0.0,
+        )},
+        opened_ts=new_ts,
+        opened_cycle=9,
+        opened_cadence="rebal",
+    )
+
+    expected_exit_fee = 1_000.0 * 5.0 / 10_000.0
+    position = account.positions[symbol]
+    assert account.equity(marks) == equity_before - expected_exit_fee
+    assert account.fees_paid == 2.0 + expected_exit_fee
+    assert position.qty == 0.08
+    assert position.seat_role == "alpha"
+    assert position.opened_ts == new_ts
+    assert position.entry_price == 50_000.0
+    assert position.accrued_fees == 0.0
+    assert len(account.closed_legs) == 1
+    closed = account.closed_legs[0]
+    assert closed.seat_role == "hedge"
+    assert closed.fees == 2.0 + expected_exit_fee
 
 
 def test_held_book_is_dollar_and_beta_neutral_with_a_same_symbol_hedge_alpha_pair():

@@ -42,8 +42,9 @@ def test_interval_sourced_per_symbol():
     assert funding_interval_hours("SOL/USDT:USDT", _FakeExchange(4.0)) == pytest.approx(4.0)
 
 
-def test_interval_defaults_to_8h_on_miss():
-    assert funding_interval_hours("SOL/USDT:USDT", _FakeExchange(None)) == pytest.approx(8.0)
+def test_interval_fails_closed_on_metadata_request_failure():
+    with pytest.raises(RuntimeError, match="no funding info"):
+        funding_interval_hours("SOL/USDT:USDT", _FakeExchange(None))
 
 
 def test_funding_interval_consumes_fundinginfo_interval_hours():
@@ -118,10 +119,10 @@ def test_realized_funding_ignores_notional_signed():
     assert bal == pytest.approx(+1.0)
 
 
-def test_clamp_then_realized_composition_for_an_alt():
-    # §11 / contract §2.3 ORDERING: cap the RATE upstream, then realized consumes the SIGNED,
-    # clamped rate and stays signed. SOL raw +0.05 exceeds the +0.02 alt cap -> clamped to +0.02;
-    # a SHORT then RECEIVES a credit on the clamped rate: -(-1)*mark*qty*0.02 = +mark*qty*0.02.
+def test_clamp_can_feed_a_bounded_signal_cash_projection_for_an_alt():
+    # Forecast/ranking projection only: cap the signal upstream, then the funding primitive keeps
+    # its sign. Real account settlement bypasses this cap and uses raw published history (pinned in
+    # test_account_integration.py).
     raw_rate = 0.05
     clamped = clamp_funding_rate("SOL/USDT:USDT", raw_rate)
     assert clamped == pytest.approx(0.02)

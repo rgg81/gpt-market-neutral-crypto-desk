@@ -4,9 +4,9 @@ from datetime import datetime, timedelta
 
 from futures_fund.models import Direction
 
-TAKER_RATE = 0.0005   # 0.05%
-MAKER_RATE = 0.0002   # 0.02%
-BNB_DISCOUNT = 0.90    # 10% off when paying fees in BNB
+TAKER_RATE = 0.0005  # 0.05%
+MAKER_RATE = 0.0002  # 0.02%
+BNB_DISCOUNT = 0.90  # 10% off when paying fees in BNB
 
 
 def trade_fee(notional: float, *, maker: bool, pay_bnb: bool = False) -> float:
@@ -20,9 +20,8 @@ def round_trip_fee(
     notional: float, *, maker_entry: bool, maker_exit: bool, pay_bnb: bool = False
 ) -> float:
     """Entry + exit fee assuming the same notional both legs (conservative)."""
-    return (
-        trade_fee(notional, maker=maker_entry, pay_bnb=pay_bnb)
-        + trade_fee(notional, maker=maker_exit, pay_bnb=pay_bnb)
+    return trade_fee(notional, maker=maker_entry, pay_bnb=pay_bnb) + trade_fee(
+        notional, maker=maker_exit, pay_bnb=pay_bnb
     )
 
 
@@ -35,7 +34,8 @@ def funding_boundary_hours(interval_hours: int = DEFAULT_FUNDING_INTERVAL_HOURS)
 
 
 def count_funding_events(
-    entry_ts: datetime, exit_ts: datetime,
+    entry_ts: datetime,
+    exit_ts: datetime,
     interval_hours: int = DEFAULT_FUNDING_INTERVAL_HOURS,
 ) -> int:
     """Number of funding settlements strictly within (entry_ts, exit_ts]."""
@@ -82,9 +82,7 @@ def vwap_fill(levels: list[tuple[float, float]], qty: float) -> tuple[float, flo
     return filled, vwap
 
 
-def slippage_cost(
-    levels: list[tuple[float, float]], qty: float, reference_price: float
-) -> float:
+def slippage_cost(levels: list[tuple[float, float]], qty: float, reference_price: float) -> float:
     """USDT slippage cost: filled_qty * |vwap - reference_price|."""
     filled, vwap = vwap_fill(levels, qty)
     if filled <= 0:

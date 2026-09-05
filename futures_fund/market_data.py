@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 
@@ -11,13 +12,22 @@ from futures_fund.models import MmrBracket, SymbolSpec
 class FundingInfo(BaseModel):
     symbol: str
     current_rate: float = Field(
-        description="Current (last) funding rate, NOT a prediction "
-        "(ccxt fundingRate == Binance lastFundingRate)."
+        description="DEPRECATED compatibility name for Binance's last settled funding rate; "
+        "this is historical, never a prediction (ccxt fundingRate == Binance lastFundingRate)."
     )
     next_funding_ts: datetime
     interval_hours: float
     mark_price: float
     index_price: float
+
+    @property
+    def last_settled_rate(self) -> float:
+        """Truthful name for ``current_rate`` without breaking older accounting callers.
+
+        Binance's premium-index response calls this value ``lastFundingRate``.  It is the most
+        recently settled observation, not an estimate of the next boundary's rate.
+        """
+        return self.current_rate
 
 
 def _filter_field(filters: list[dict], filter_type: str, field: str) -> float | None:
@@ -136,10 +146,15 @@ def scan_universe(client, top_n: int = 30) -> list[dict]:
         qv = t.get("quoteVolume") or 0.0
         last = t.get("last")
         if qv and last:
-            rows.append({"symbol": sym, "last": float(last),
-                         "chg_24h_pct": round(float(t.get("percentage") or 0.0), 2),
-                         "vol_24h_usd": float(qv),
-                         "onboard_date": parse_onboard_date_ms(market)})
+            rows.append(
+                {
+                    "symbol": sym,
+                    "last": float(last),
+                    "chg_24h_pct": round(float(t.get("percentage") or 0.0), 2),
+                    "vol_24h_usd": float(qv),
+                    "onboard_date": parse_onboard_date_ms(market),
+                }
+            )
     rows.sort(key=lambda r: r["vol_24h_usd"], reverse=True)
     return rows[:top_n]
 
@@ -162,33 +177,45 @@ def _book_depth_usd(levels: list[tuple[float, float]]) -> float:
 
 
 def _age_days(row: dict, *, now: datetime, exchange) -> float | None:
-    """Listing age in days. Prefer onboard_date (ms-epoch); else derive from the earliest OHLCV
-    kline timestamp (now - earliest). Returns None only when neither source is available (caller
-    keeps the name, recording it under 'age_unknown' — a sane fallback, never a silent drop)."""
+    """Listing age in days from point-in-time exchange metadata.
+
+    Do not issue an implicit candle request when ``onboard_date`` is absent.  The production
+    evidence contract pre-declares and audits its complete 1h/1d candle set; a hidden age-probe
+    request would be neither bound to that set nor safely reusable by evidence collection.  The
+    caller records unavailable metadata explicitly as ``age_unknown``.
+    """
+    _ = exchange  # retained for API compatibility with existing injected quality-filter seams
     onboard = row.get("onboard_date")
-    if onboard is not None:
-        return (now.timestamp() * 1000.0 - float(onboard)) / 86_400_000.0
+    if onboard is None:
+        return None
     try:
-        df = exchange.ohlcv(row["symbol"])
-    except Exception:
+        onboard_ms = float(onboard)
+    except (TypeError, ValueError):
         return None
-    if df is None or df.empty or "timestamp" not in df:
+    if not np.isfinite(onboard_ms):
         return None
-    earliest = pd.to_datetime(df["timestamp"].iloc[0], utc=True).to_pydatetime()
-    return (now - earliest).total_seconds() / 86_400.0
+    return (now.timestamp() * 1000.0 - onboard_ms) / 86_400_000.0
 
 
 def quality_filter(
-    rows: list[dict], *, now: datetime, exchange,
-    min_adv_usd: float, min_age_days: int, max_abs_chg_24h_pct: float,
-    min_depth_usd: float, depth_ref_usd: float, symbol_count: int,
+    rows: list[dict],
+    *,
+    now: datetime,
+    exchange,
+    min_adv_usd: float,
+    min_age_days: int,
+    max_abs_chg_24h_pct: float,
+    min_depth_usd: float,
+    depth_ref_usd: float,
+    symbol_count: int,
 ) -> tuple[list[dict], dict[str, int]]:
     """'Liquid + established only': apply, in order, age -> 24h-mover -> depth -> ADV gates to a
     vol-ranked universe, then cap to symbol_count. Returns (kept_rows, drop_counts) so the scout
     can log EXACTLY how many names each gate removed (no silent truncation).
 
-    - age: exclude names listed < min_age_days ago (onboard_date, else earliest-kline fallback);
-      unknown age keeps the name (counted under 'age_unknown').
+    - age: exclude names listed < min_age_days ago from ``onboard_date``; unavailable/invalid
+      metadata never triggers an undeclared candle request and keeps the name under
+      ``age_unknown``.
     - chg_24h: exclude |chg_24h_pct| > max_abs_chg_24h_pct (extreme movers are reversal traps).
     - depth: require the FULL top-of-book notional on the THINNER side >= min_depth_usd via
       exchange.depth(); missing/erroring/empty depth keeps the name ('depth_unavailable').
@@ -198,8 +225,7 @@ def quality_filter(
     used as a cap inside the depth floor.
     """
     _ = depth_ref_usd  # reserved: slippage-model reference clip, not a floor cap
-    drops = {"age": 0, "age_unknown": 0, "chg_24h": 0, "depth": 0,
-             "depth_unavailable": 0, "adv": 0}
+    drops = {"age": 0, "age_unknown": 0, "chg_24h": 0, "depth": 0, "depth_unavailable": 0, "adv": 0}
     kept: list[dict] = []
     for r in rows:
         age = _age_days(r, now=now, exchange=exchange)
@@ -234,6 +260,23 @@ def quality_filter(
 def parse_ohlcv(rows: list[list]) -> pd.DataFrame:
     """ccxt OHLCV rows [[ts_ms,o,h,l,c,v], ...] -> sorted UTC-timestamped DataFrame."""
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    # Binance encodes OHLCV values as decimal strings on the wire. CCXT normally converts them,
+    # while the mandatory local candle proxy preserves the upstream payload. Normalize at this
+    # shared parser boundary so downstream momentum, volatility, and beta always receive numbers.
+    numeric_columns = ["ts", "open", "high", "low", "close", "volume"]
+    df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors="raise")
+    if not np.isfinite(df[numeric_columns].to_numpy(dtype=float)).all():
+        raise ValueError("OHLCV contains non-finite numeric values")
+    prices = df[["open", "high", "low", "close"]]
+    if (prices <= 0.0).any().any():
+        raise ValueError("OHLCV prices must be strictly positive")
+    if (df["volume"] < 0.0).any():
+        raise ValueError("OHLCV volume must be non-negative")
+    coherent = (df["low"] <= df[["open", "close"]].min(axis=1)) & (
+        df[["open", "close"]].max(axis=1) <= df["high"]
+    )
+    if not coherent.all():
+        raise ValueError("OHLCV violates low <= open/close <= high")
     df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return (
         df[["timestamp", "open", "high", "low", "close", "volume"]]
@@ -249,8 +292,7 @@ def parse_funding(fr: dict, interval: dict | None = None) -> FundingInfo:
     return FundingInfo(
         symbol=fr["symbol"],
         current_rate=float(fr["fundingRate"]),
-        next_funding_ts=datetime.fromtimestamp(
-            fr["fundingTimestamp"] / 1000, tz=timezone.utc),  # noqa: UP017
+        next_funding_ts=datetime.fromtimestamp(fr["fundingTimestamp"] / 1000, tz=timezone.utc),  # noqa: UP017
         interval_hours=interval_hours,
         mark_price=float(fr["markPrice"]),
         index_price=float(fr["indexPrice"]),
@@ -262,12 +304,17 @@ def parse_open_interest_history(rows: list[dict]) -> pd.DataFrame:
     recs = []
     for r in rows:
         try:
-            recs.append({
-                "timestamp": pd.to_datetime(int(r["timestamp"]), unit="ms", utc=True),
-                "oi_amount": float(r["openInterestAmount"]),
-                "oi_value": (float(r["openInterestValue"])
-                             if r.get("openInterestValue") is not None else float("nan")),
-            })
+            recs.append(
+                {
+                    "timestamp": pd.to_datetime(int(r["timestamp"]), unit="ms", utc=True),
+                    "oi_amount": float(r["openInterestAmount"]),
+                    "oi_value": (
+                        float(r["openInterestValue"])
+                        if r.get("openInterestValue") is not None
+                        else float("nan")
+                    ),
+                }
+            )
         except (KeyError, ValueError, TypeError):
             continue
     if not recs:
@@ -280,12 +327,14 @@ def parse_long_short_ratio(raw_rows: list[dict]) -> pd.DataFrame:
     recs = []
     for r in raw_rows:
         try:
-            recs.append({
-                "timestamp": pd.to_datetime(int(r["timestamp"]), unit="ms", utc=True),
-                "long_short_ratio": float(r["longShortRatio"]),
-                "long_account": float(r["longAccount"]),
-                "short_account": float(r["shortAccount"]),
-            })
+            recs.append(
+                {
+                    "timestamp": pd.to_datetime(int(r["timestamp"]), unit="ms", utc=True),
+                    "long_short_ratio": float(r["longShortRatio"]),
+                    "long_account": float(r["longAccount"]),
+                    "short_account": float(r["shortAccount"]),
+                }
+            )
         except (KeyError, ValueError, TypeError):
             continue
     if not recs:

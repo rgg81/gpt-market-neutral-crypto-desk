@@ -1,0 +1,13 @@
+[Unit]
+Description=GPT market-neutral PAPER desk token-free heartbeat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@DESK_ROOT@
+ExecStart=/usr/bin/bash @DESK_ROOT@/scripts/run_desk_heartbeat.sh --scheduled
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=15min

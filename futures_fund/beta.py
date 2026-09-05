@@ -14,9 +14,7 @@ def log_returns(prices: pd.Series) -> pd.Series:
     return np.log(clean / clean.shift(1)).dropna()
 
 
-def rolling_beta(
-    asset_returns: pd.Series, btc_returns: pd.Series, lookback: int = 45
-) -> float:
+def rolling_beta(asset_returns: pd.Series, btc_returns: pd.Series, lookback: int = 45) -> float:
     """OLS beta = cov(asset, btc) / var(btc) over the last `lookback` aligned points.
     Falls back to 1.0 if fewer than 10 aligned points or BTC variance is zero."""
     aligned = pd.concat([asset_returns, btc_returns], axis=1, join="inner").dropna()
@@ -33,9 +31,7 @@ def rolling_beta(
     return cov_ab / var_b
 
 
-def beta_series(
-    asset_returns: pd.Series, btc_returns: pd.Series, lookback: int = 45
-) -> pd.Series:
+def beta_series(asset_returns: pd.Series, btc_returns: pd.Series, lookback: int = 45) -> pd.Series:
     """Rolling beta time series for drift monitoring / reviewer re-derivation. NaN until
     at least 10 aligned points are available; thereafter the trailing-`lookback` beta."""
     aligned = pd.concat([asset_returns, btc_returns], axis=1, join="inner").dropna()

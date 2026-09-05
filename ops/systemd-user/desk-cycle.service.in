@@ -1,0 +1,15 @@
+[Unit]
+Description=GPT market-neutral PAPER desk daily decision cycle
+After=network-online.target binance-proxy.service
+Wants=network-online.target
+Requires=binance-proxy.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@DESK_ROOT@
+Environment=BINANCE_PROXY_EXTERNAL_MANAGER=systemd
+ExecStart=/usr/bin/bash @DESK_ROOT@/scripts/run_scheduled_cycle.sh --scheduled
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=110min

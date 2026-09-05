@@ -148,19 +148,29 @@ def make_tw():
 
 
 def make_verdict(accept: bool = True, *, cycle: int = 1, objections: list[str] | None = None,
-                 demanded_changes: list[str] | None = None, override_rationale: str = ""):
+                 demanded_changes: list[str] | None = None, override_rationale: str = "",
+                 revision_constraints: list[dict] | None = None,
+                 revision_allowed_failing_bounds: list[str] | None = None):
     """A schema-valid AdversaryVerdict for tests. The 2026-07 schema REQUIRES the precheck echo
     (cycle, sha, metrics_echo, 12 bound rulings) so a bare `accept` can no longer validate —
     this factory is the one place tests build the boilerplate."""
     from futures_fund.desk_contracts import AdversaryVerdict, BoundVerdict, MetricsEcho
     return AdversaryVerdict(
         accept=accept, cycle=cycle, precheck_sha256="0" * 64,
+        entry_gate_policy_sha256="a" * 64,
         metrics_echo=MetricsEcho(gross=18000.0, deploy_frac=0.95, dollar_residual_frac=0.01,
                                  beta_residual=0.02, max_leg_frac_gross=0.30,
-                                 turnover_legs_changed=0),
+                                 turnover_legs_changed=0,
+                                 turnover_aggressive_legs_changed=0),
         bounds_confirmed=[BoundVerdict(bound_id=f"B{i}", ok=True) for i in range(1, 13)],
+        hard_ban_violations_confirmed=[],
         override_rationale=override_rationale,
-        objections=objections or [], demanded_changes=demanded_changes or [])
+        objections=objections or [], demanded_changes=demanded_changes or [],
+        revision_constraints=(revision_constraints or ([{
+            "kind": "max_deploy_frac", "symbol": "", "value": 1.15,
+            "note": "test rejection must remain below leverage ceiling",
+        }] if not accept else [])),
+        revision_allowed_failing_bounds=revision_allowed_failing_bounds or [])
 
 
 @pytest.fixture

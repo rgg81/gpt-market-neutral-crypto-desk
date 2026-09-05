@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from futures_fund.account import PaperAccount, Position
 from futures_fund.pnl_attribution import append_ledger, build_cycle_pnl
 
@@ -26,9 +28,16 @@ def test_build_cycle_pnl_record_shape_and_arithmetic():
     marks = {"ETH/USDT:USDT": 1950.0}              # short upnl = 2*(2000-1950)=100
     rec = build_cycle_pnl(
         acct, opening_equity=20_000.0, marks=marks, turnover_usd=4000.0,
-        cycle=2, cadence="daily", now=datetime(2026, 6, 11, tzinfo=UTC))
+        cycle=2, cadence="daily", now=datetime(2026, 6, 11, tzinfo=UTC),
+        prior_closing_equity=20_100.0)
 
     assert rec["opening_equity"] == 20_000.0
+    assert rec["pre_reconcile_equity_at_execution_marks"] == 20_000.0
+    assert rec["prior_closing_equity"] == 20_100.0
+    assert rec["close_to_close_pnl"] == pytest.approx(rec["closing_equity"] - 20_100.0)
+    assert rec["close_to_close_return_frac"] == pytest.approx(
+        rec["closing_equity"] / 20_100.0 - 1.0
+    )
     assert rec["fees_paid"] == 4.0
     assert rec["slippage_paid"] == 2.0
     assert rec["funding_received"] == 6.0
@@ -51,7 +60,9 @@ def test_build_cycle_pnl_record_shape_and_arithmetic():
     assert pos["unrealized"] == 100.0
     assert pos["accrued_funding"] == 6.0
     assert pos["accrued_fees"] == 2.0
-    assert "funding" in rec["notes"].lower()
+    assert "Scheduled PAPER ledger" in rec["notes"]
+    assert "Accelerated demo" not in rec["notes"]
+    assert "No exchange orders are placed" in rec["notes"]
 
 
 def test_append_ledger_accumulates_lines(tmp_path):
@@ -62,3 +73,28 @@ def test_append_ledger_accumulates_lines(tmp_path):
     assert len(lines) == 2
     assert json.loads(lines[0])["cycle"] == 1
     assert json.loads(lines[1])["net_pnl"] == 2.0
+
+
+def test_append_ledger_allows_only_an_exact_same_cycle_replay(tmp_path):
+    state = tmp_path / "state"
+    record = {"cycle": 2, "net_pnl": 1.0}
+    append_ledger(state, record)
+    append_ledger(state, record)
+    lines = (state / "ledger.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["net_pnl"] == 1.0
+
+    with pytest.raises(ValueError, match="conflicting ledger replay"):
+        append_ledger(state, {"cycle": 2, "net_pnl": 3.0})
+
+
+def test_append_ledger_never_rewrites_away_a_malformed_loss_row(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    path = state / "ledger.jsonl"
+    original = '{"cycle":1,"net_pnl":-10}\n{broken loss row}\n'
+    path.write_text(original)
+
+    with pytest.raises(ValueError, match="malformed ledger row"):
+        append_ledger(state, {"cycle": 2, "net_pnl": 2.0})
+    assert path.read_text() == original

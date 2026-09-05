@@ -13,16 +13,25 @@ class ExchangeSettings(BaseModel):
 
 
 class DataSettings(BaseModel):
-    news_rss_sources: list[str] = Field(default_factory=lambda: [
-        "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
-        "https://cointelegraph.com/rss",
-        "https://decrypt.co/feed",
-        "https://www.cryptoslate.com/feed/",
-        "https://bitcoinmagazine.com/feed",
-        "https://cryptopotato.com/feed/",
-    ])
+    # Mandatory exclusive source for USD-M klines. Production evidence fails closed if this local
+    # service is unavailable or does not return the currently-forming candle.
+    binance_klines_proxy_url: str = "http://127.0.0.1:8000"
+    candle_proxy_timeout_seconds: float = Field(default=15.0, gt=0.0, le=60.0)
+    binance_proxy_project_dir: str = "~/binance-proxy"
+    binance_proxy_start_timeout_seconds: float = Field(default=15.0, gt=0.0, le=60.0)
+    news_rss_sources: list[str] = Field(
+        default_factory=lambda: [
+            "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+            "https://cointelegraph.com/rss",
+            "https://decrypt.co/feed",
+            "https://www.cryptoslate.com/feed/",
+            "https://bitcoinmagazine.com/feed",
+            "https://cryptopotato.com/feed/",
+        ]
+    )
     reddit_subreddits: list[str] = Field(
-        default_factory=lambda: ["CryptoCurrency", "CryptoMarkets"])
+        default_factory=lambda: ["CryptoCurrency", "CryptoMarkets"]
+    )
     fred_key_env: str = "FRED_API_KEY"
     fred_series: list[str] = Field(
         default_factory=lambda: ["DTWEXBGS", "DGS10", "FEDFUNDS", "CPIAUCSL"]
@@ -39,10 +48,10 @@ class UniverseSettings(BaseModel):
     min_adv_usd: float = 50_000_000.0
     crypto_only: bool = True
     # Phase 10 quality filter (liquid + established only)
-    min_age_days: int = 30                 # exclude names listed < this many days ago
-    max_abs_chg_24h_pct: float = 25.0      # exclude extreme 24h movers (|chg| > this)
-    min_depth_usd: float = 250_000.0       # floor on FULL top-of-book notional (thinner side)
-    depth_ref_usd: float = 100_000.0       # reference clip for the slippage model (NOT a floor cap)
+    min_age_days: int = 60  # supports a complete 60-row daily beta request
+    max_abs_chg_24h_pct: float = 25.0  # exclude extreme 24h movers (|chg| > this)
+    min_depth_usd: float = 250_000.0  # floor on FULL top-of-book notional (thinner side)
+    depth_ref_usd: float = 100_000.0  # reference clip for the slippage model (NOT a floor cap)
 
 
 class FeeSettings(BaseModel):
@@ -69,6 +78,16 @@ class SlippageSettings(BaseModel):
     flat_bps: float | None = None
 
 
+class ExecutionSettings(BaseModel):
+    """Conservative PAPER fill assumptions; mechanics only, never trade selection."""
+
+    latency_ms: float = Field(default=500.0, ge=0.0)
+    displayed_depth_fraction: float = Field(default=0.50, gt=0.0, le=1.0)
+    adverse_selection_bps: float = Field(default=1.0, ge=0.0)
+    legging_bps_per_second: float = Field(default=0.25, ge=0.0)
+    allow_partial_fills: bool = True
+
+
 class MetricsSettings(BaseModel):
     daily_periods_per_year: int = 365
     weekly_periods_per_year: int = 52
@@ -84,17 +103,19 @@ class Settings(BaseModel):
     """LLM market-neutral desk settings. Trading DECISIONS are made by GPT agents; this config
     only parameterizes the deterministic plumbing (universe scan, exchange reads, fills, funding,
     slippage). PAPER-ONLY: `live` MUST stay false forever."""
+
     account_size_usdt: float = 20_000.0
-    live: Literal[False] = False             # structurally PAPER-ONLY; true cannot validate
-    agent_model: str = "gpt-5.6-sol"         # root + inherited subagents, xhigh via launcher
-    universe_top_n: int = 40                 # rank the top-40 by 24h quote volume
-    cadence_tf_minutes: int = 480            # 8h decision cadence (00/08/16 UTC, funding-aligned)
-    btc_symbol: str = "BTC/USDT:USDT"        # beta/hedge reference
+    live: Literal[False] = False  # structurally PAPER-ONLY; true cannot validate
+    agent_model: str = "gpt-5.6-sol"  # root + inherited subagents, xhigh via launcher
+    universe_top_n: int = 40  # rank the top-40 by 24h quote volume
+    cadence_tf_minutes: int = 1440  # 24h full-GPT cadence; 8h heartbeats are token-free
+    btc_symbol: str = "BTC/USDT:USDT"  # beta/hedge reference
     beta: BetaSettings = Field(default_factory=BetaSettings)
     universe: UniverseSettings = Field(default_factory=UniverseSettings)
     fees: FeeSettings = Field(default_factory=FeeSettings)
     funding: FundingSettings = Field(default_factory=FundingSettings)
     slippage: SlippageSettings = Field(default_factory=SlippageSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     metrics: MetricsSettings = Field(default_factory=MetricsSettings)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     data: DataSettings = Field(default_factory=DataSettings)

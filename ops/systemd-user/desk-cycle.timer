@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll the daily GPT PAPER desk UTC claim gate every ten minutes
+
+[Timer]
+OnCalendar=*-*-* *:07,17,27,37,47,57:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=desk-cycle.service
+
+[Install]
+WantedBy=timers.target

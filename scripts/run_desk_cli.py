@@ -1,9 +1,11 @@
-"""LLM Market-Neutral Desk — the 8h decision driver.
+"""INERT offline integration harness for the legacy combined decision driver.
 
-    uv run python scripts/run_desk_cli.py
-    uv run python scripts/run_desk_cli.py --now 2026-07-07T08:00:00+00:00   # pinned (offline)
+It requires an explicit ``--offline-injected-only`` acknowledgement and an injected exact
+``StubAgentRunner``. The checked-in runner factory always raises, so this module cannot start a
+real-agent or production cycle from the command line. Production uses the subscription runbook and
+``scripts/desk_reconcile.py``.
 
-Offline/injected combined driver for exercising one 8h decision cycle under a single run lock.
+Offline/injected combined driver for exercising one 24h decision cycle under a single run lock.
 Production subscription orchestration uses SKILL.md and docs/desk-cycle-runbook.md instead. PAPER.
 """
 from __future__ import annotations
@@ -14,7 +16,7 @@ import sys
 from datetime import UTC, datetime
 
 from futures_fund.config import load_settings
-from futures_fund.desk_cycle import run_cycle
+from futures_fund.desk_cycle import issue_offline_injected_run_capability, run_cycle
 from futures_fund.runlock import single_flight
 from futures_fund.scheduling import cycle_due
 
@@ -52,11 +54,23 @@ def _build_exchange(settings):
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Run one 8h LLM-desk decision cycle (paper).")
+    ap = argparse.ArgumentParser(
+        description="Offline injected integration harness; never a production desk runner."
+    )
+    ap.add_argument(
+        "--offline-injected-only",
+        action="store_true",
+        help="acknowledge that this test harness requires an injected exact StubAgentRunner",
+    )
     ap.add_argument("--now", default=None, help="ISO-8601 run instant (UTC); default wall-clock.")
     ap.add_argument("--state-dir", default=_STATE_DIR)
     ap.add_argument("--memory-dir", default="memory")
     args = ap.parse_args(argv)
+    if not args.offline_injected_only:
+        ap.error(
+            "run_desk_cli.py is disabled without --offline-injected-only; production uses "
+            "scripts/desk_reconcile.py"
+        )
 
     now = _parse_now(args.now)
     settings = load_settings()
@@ -71,10 +85,12 @@ def main(argv: list[str] | None = None) -> None:
             return
         exchange = _build_exchange(settings)
         runner = _build_runner(settings)
+        capability = issue_offline_injected_run_capability(runner)
         symbols = _fetch_universe(settings)
         report = run_cycle(
             args.state_dir, now=now, exchange=exchange, runner=runner, symbols=symbols,
-            cash=settings.account_size_usdt, cycle=cycle, btc_symbol=settings.btc_symbol)
+            cash=settings.account_size_usdt, cycle=cycle, btc_symbol=settings.btc_symbol,
+            offline_injected_capability=capability)
         print(json.dumps({
             "cycle": report.cycle, "n_legs": report.n_legs,
             "achieved_deploy_frac": round(report.achieved_deploy_frac, 4),

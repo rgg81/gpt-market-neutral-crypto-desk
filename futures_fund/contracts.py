@@ -17,8 +17,8 @@ from futures_fund.models import (
 )
 
 # --- analyst-roster type aliases (Phase 4; adapted from the weekly desk's contracts) ---
-Lean = Literal["long", "short", "watch"]      # Universe Scout candidate lean
-Stance = Literal["bullish", "bearish", "neutral"]   # analyst read direction
+Lean = Literal["long", "short", "watch"]  # Universe Scout candidate lean
+Stance = Literal["bullish", "bearish", "neutral"]  # analyst read direction
 # The Research Manager's five-tier verdict ladder (judge of the Bull/Bear debate). `strong_*`
 # requires confluent analysts AND a decisively defeated opponent; `flat` = no trade flows.
 Rating = Literal["strong_long", "long", "flat", "short", "strong_short"]
@@ -33,15 +33,17 @@ Polarity = Literal["restrictive", "enabling", "process"]
 class Candidate(BaseModel):
     """One symbol the Universe Scout nominates for deeper analysis. Adapted from the weekly
     `Candidate`: a triage lean + score, never a sized trade."""
-    symbol: str                                   # ccxt unified symbol, e.g. BTC/USDT:USDT
+
+    symbol: str  # ccxt unified symbol, e.g. BTC/USDT:USDT
     lean: Lean
     rationale: str = ""
-    score: float = Field(ge=0.0, le=1.0)          # triage priority, NOT a probability of profit
-    correlation_group: str | None = None          # e.g. "majors", "alt-l1"; null = stands alone
+    score: float = Field(ge=0.0, le=1.0)  # triage priority, NOT a probability of profit
+    correlation_group: str | None = None  # e.g. "majors", "alt-l1"; null = stands alone
 
 
 class WatcherOutput(BaseModel):
     """The Universe Scout's bundle: a two-sided shortlist of candidates."""
+
     candidates: list[Candidate] = Field(default_factory=list)
 
 
@@ -51,13 +53,14 @@ class AnalystReport(BaseModel):
     `extra="allow"` so each analyst can attach its own structured `signals` keys (e.g. the Pair
     researcher's `hedge_ratio`/`adf_pvalue`, the Carry desk's `signed_funding`/`funding_interval_h`)
     while the shared envelope stays validated."""
+
     model_config = ConfigDict(extra="allow")
-    symbol: str                                   # ccxt unified id, or a pair_id for the Pair desk
-    stance: Stance                                # the READ direction (both sides co-equal)
-    conviction: float = Field(ge=0.0, le=1.0)     # how strongly the evidence backs the stance
-    thesis: str = ""                              # one-paragraph rationale citing the signals
-    signals: dict = Field(default_factory=dict)   # the computed evidence (analyst-specific keys)
-    horizon: str = ""                             # intended hold horizon, e.g. "weekly", "1-3 days"
+    symbol: str  # ccxt unified id, or a pair_id for the Pair desk
+    stance: Stance  # the READ direction (both sides co-equal)
+    conviction: float = Field(ge=0.0, le=1.0)  # how strongly the evidence backs the stance
+    thesis: str = ""  # one-paragraph rationale citing the signals
+    signals: dict = Field(default_factory=dict)  # the computed evidence (analyst-specific keys)
+    horizon: str = ""  # intended hold horizon, e.g. "weekly", "1-3 days"
 
 
 class ResearchPlan(BaseModel):
@@ -65,30 +68,31 @@ class ResearchPlan(BaseModel):
     plus a falsifiable prediction the Reflector grades later. Ported from the weekly desk's
     `ResearchPlan`. The RM does NOT size — `rating` sets only direction/conviction; `flat` means
     no trade flows to the Trader."""
-    symbol: str                                   # ccxt unified id, or a pair_id for a pair leg
-    rating: Rating                                # one of the five tiers (judge of the debate)
-    confidence: float = Field(ge=0.0, le=1.0)     # how decisively the debate resolved
-    thesis: str                                   # why this side won the debate, in this regime
-    falsifiable_prediction: str                   # concrete claim + horizon + explicit invalidation
+
+    symbol: str  # ccxt unified id, or a pair_id for a pair leg
+    rating: Rating  # one of the five tiers (judge of the debate)
+    confidence: float = Field(ge=0.0, le=1.0)  # how decisively the debate resolved
+    thesis: str  # why this side won the debate, in this regime
+    falsifiable_prediction: str  # concrete claim + horizon + explicit invalidation
 
 
 class SentimentSource(BaseModel):
     model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
     url: str
-    published_ts: datetime          # MUST be < owning report's as_of_ts (point-in-time)
+    published_ts: datetime  # MUST be < owning report's as_of_ts (point-in-time)
     title: str = ""
-    feed: str = ""                  # "news_rss" | "reddit" | "fear_greed" | "media"
+    feed: str = ""  # "news_rss" | "reddit" | "fear_greed" | "media"
 
 
 class SentimentReport(BaseModel):
     model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
-    symbol: str                     # ccxt unified id, or "MARKET" for the market-wide read
+    symbol: str  # ccxt unified id, or "MARKET" for the market-wide read
     level: SentimentLevel
     s: float = Field(ge=-1.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
     sources: list[SentimentSource] = Field(default_factory=list)
     rationale: str = ""
-    as_of_ts: datetime              # decision-time anchor; all sources must precede this
+    as_of_ts: datetime  # decision-time anchor; all sources must precede this
     decayed_s: float | None = None  # s after half-life decay toward 0 (filled by ingest)
 
 
@@ -105,10 +109,11 @@ class DiscretionaryView(BaseModel):
     `selection_cache`). A view is a signed conviction on ONE symbol — never a size or an order (the
     optimizer sizes + neutralizes it, capped to the discretionary risk budget). `as_of_ts` is the
     decision anchor; a view at/after the cycle's `now` is dropped (no look-ahead)."""
+
     model_config = ConfigDict(extra="forbid")  # strict-by-default (canonical contract PART 1)
     symbol: str
     direction: Direction
-    conviction: float = Field(ge=0.0, le=1.0)   # strength in [0,1]; age-decays toward 0
+    conviction: float = Field(ge=0.0, le=1.0)  # strength in [0,1]; age-decays toward 0
     rationale: str = ""
     as_of_ts: datetime
 
@@ -139,8 +144,8 @@ class CoinGeometry(BaseModel):
     sentiment_conf: float = Field(default=0.0, ge=0.0, le=1.0)
     # liquidity / filters
     adv_usd: float = 0.0
-    chg_24h_pct: float = 0.0            # 24h % change carried from the universe row (audit/filter)
-    onboard_date: int | None = None    # Binance onboardDate, ms-epoch (None when unavailable)
+    chg_24h_pct: float = 0.0  # 24h % change carried from the universe row (audit/filter)
+    onboard_date: int | None = None  # Binance onboardDate, ms-epoch (None when unavailable)
     # Phase 10 depth-aware slippage: the two crossing sides of the live L2 book at build time.
     # `depth_asks` is the crossing side for a BUY (delta>0), `depth_bids` for a SELL (delta<0).
     # Empty lists (not None) when depth was unavailable -> estimate_slippage uses the ADV fallback.
@@ -214,27 +219,27 @@ class TargetWeights(BaseModel):
 
 
 class Pair(BaseModel):
-    pair_id: str                                  # canonical slash-free id, e.g. "BTCUSDT__ETHUSDT"
-    symbol_y: str                                 # dependent leg (ccxt unified id)
-    symbol_x: str                                 # independent / hedge leg (ccxt unified id)
-    hedge_ratio: float                            # spread = y - hedge_ratio*x
+    pair_id: str  # canonical slash-free id, e.g. "BTCUSDT__ETHUSDT"
+    symbol_y: str  # dependent leg (ccxt unified id)
+    symbol_x: str  # independent / hedge leg (ccxt unified id)
+    hedge_ratio: float  # spread = y - hedge_ratio*x
     method: PairTestMethod
-    adf_pvalue: float                             # Engle-Granger ADF p (info when johansen)
-    adf_pvalue_adj: float | None = None           # FDR/Bonferroni-corrected p
+    adf_pvalue: float  # Engle-Granger ADF p (info when johansen)
+    adf_pvalue_adj: float | None = None  # FDR/Bonferroni-corrected p
     johansen_trace_stat: float | None = None
     johansen_crit_95: float | None = None
-    half_life: float                              # OU half-life in CYCLES (ln2/theta)
-    theta: float                                  # OU mean-reversion speed
-    mu: float                                     # OU long-run spread mean
-    sigma_eq: float                               # OU equilibrium stdev of the spread
+    half_life: float  # OU half-life in CYCLES (ln2/theta)
+    theta: float  # OU mean-reversion speed
+    mu: float  # OU long-run spread mean
+    sigma_eq: float  # OU equilibrium stdev of the spread
     formed_cycle: int
-    cointegrated: bool = True                     # rolling re-test result
+    cointegrated: bool = True  # rolling re-test result
 
 
 class Spread(BaseModel):
     pair_id: str
-    spread_value: float                           # y - hedge_ratio*x at current marks
-    zscore: float                                 # (spread_value - mu) / sigma_eq
+    spread_value: float  # y - hedge_ratio*x at current marks
+    zscore: float  # (spread_value - mu) / sigma_eq
     state: SpreadState
     entry_z: float = 2.0
     exit_z: float = 0.0
@@ -243,14 +248,15 @@ class Spread(BaseModel):
     qty_x: float = 0.0
     notional_y: float = 0.0
     notional_x: float = 0.0
-    realized_pnl: float = 0.0                     # attributed at pair level
+    realized_pnl: float = 0.0  # attributed at pair level
 
 
 class AgentProposal(BaseModel):
     """One gate-ready per-leg order the Trader emits from a `TargetWeights` leg. The Trader does NO
     sizing — notional comes from the optimizer — so this is a pure entry/stop/TP envelope. Field
     names are reused verbatim by the `trader.json` conformance fixture."""
-    symbol: str                                   # ccxt unified id, e.g. BTC/USDT:USDT
+
+    symbol: str  # ccxt unified id, e.g. BTC/USDT:USDT
     direction: Direction
     entry: float
     stop: float
@@ -278,6 +284,7 @@ class AgentProposal(BaseModel):
 class TraderOutput(BaseModel):
     """The Trader/Execution planner's bundle: gate-ready opens + management + triggers. Mirrors
     the weekly `ScalperOutput`; an explicit empty `management` list is the stand-down contract."""
+
     proposals: list[AgentProposal] = Field(default_factory=list)
     management: list[dict] = Field(default_factory=list)
     triggers: list[dict] = Field(default_factory=list)
@@ -289,18 +296,19 @@ class Lesson(BaseModel):
     (§10) — never raw return. Ported from the weekly desk's `lessons.Lesson`. The Reflector mints
     `candidate` lessons in BOTH polarities so the corpus self-heals symmetrically (a losing record
     must not ratchet the desk into an all-`restrictive` never-trade state)."""
+
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     ts: datetime
-    text: str                                     # the contrastive, actionable lesson
-    regime: str | None = None                     # quadrant it applies to; None = all regimes
+    text: str  # the contrastive, actionable lesson
+    regime: str | None = None  # quadrant it applies to; None = all regimes
     symbol: str | None = None
     tags: list[str] = Field(default_factory=list)
     # neutral failure mode (§10): cointegration_break | carry_thesis_miss | neutrality_breach
     # | sentiment_detract; read by the lesson retrieval filter (Task 6.2).
     dimension: str | None = None
     importance: int = Field(default=5, ge=1, le=10)
-    polarity: Polarity = "restrictive"            # restrictive | enabling | process
-    state: LessonState = "candidate"              # Reflector proposes; eval harness promotes
+    polarity: Polarity = "restrictive"  # restrictive | enabling | process
+    state: LessonState = "candidate"  # Reflector proposes; eval harness promotes
     confirmations: int = 0
     provenance: list[str] = Field(default_factory=list)  # source journal decision id(s)
 
@@ -310,10 +318,11 @@ class ReviewerCheck(BaseModel):
     an artifact's stated number — it recomputes `expected` from ground truth and compares it to
     the `actual` it found in the artifact, within `tolerance`. `name` is one of the canonical,
     verbatim check ids the gate keys off."""
-    name: str                                     # canonical check id (see the canonical set)
+
+    name: str  # canonical check id (see the canonical set)
     ok: bool
-    expected: float | str | None = None           # reviewer's ground-truth re-derivation
-    actual: float | str | None = None             # value found in the artifact under review
+    expected: float | str | None = None  # reviewer's ground-truth re-derivation
+    actual: float | str | None = None  # value found in the artifact under review
     tolerance: float = 1e-6
     detail: str = ""
 
@@ -323,6 +332,7 @@ class ReviewerVerdict(BaseModel):
     DETERMINISTIC flag `reviewer_gate_ok` reads; the execute step HALTs (`SystemExit(2)`) if it is
     absent or false (§10 mandatory non-skippable stage). `mismatches` is exactly the names of the
     failed checks (`[c.name for c in checks if not c.ok]`)."""
+
     passed: bool
     checks: list[ReviewerCheck] = Field(default_factory=list)
     mismatches: list[str] = Field(default_factory=list)

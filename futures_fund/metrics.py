@@ -4,10 +4,11 @@ import numpy as np
 
 # Sharpe periodicity FIX (spec §11/§18): the daily equity series annualizes x365,
 # the weekly x52. The inherited 2190 (4h) factor would make every Sharpe/Sortino/DSR wrong.
-# The 8h re-selection cadence (`rebal`, 3 candles/day) annualizes x1095 = 365 * 3.
+# The live `rebal` decision cadence is daily. Keep the 8h constant for historical/offline series.
 PERIODS_PER_YEAR_DAILY = 365.0
 PERIODS_PER_YEAR_WEEKLY = 52.0
 PERIODS_PER_YEAR_8H = 1095.0
+PERIODS_PER_YEAR_REBAL = PERIODS_PER_YEAR_DAILY
 
 
 def sharpe(returns: list[float], periods_per_year: float = PERIODS_PER_YEAR_DAILY) -> float:

@@ -50,11 +50,14 @@ deliberately not migrated.
 
 - The active reasoning team is pinned to `gpt-5.6-sol` at `xhigh` effort on the root and every
   inherited subagent, using ChatGPT subscription authentication rather than a raw API key.
-- A persistent managed cron launches a fresh Codex session at 00:07 / 08:07 / 16:07 UTC. The
-  launcher combines a UTC-slot guard, exclusive `flock`, 100-minute timeout, workspace-write
-  sandbox, native web search, and the deterministic desk watchdog.
-- The crontab installer is idempotent and preserves unrelated jobs. It accounts for this Debian
-  cron daemon's lack of per-user timezone support and refuses unstable timezone mappings.
+- A persistent managed cron polls a UTC-aware gate every ten minutes. It launches a fresh Codex
+  session once for the daily 00:07 UTC slot; token-free funding/portfolio heartbeats claim the
+  08:07 and 16:07 UTC slots, share the same lock, and cannot trade. Each slot has a six-hour
+  recovery window. Full-cycle claims remain attempt receipts; a failed durable/idempotent
+  heartbeat releases only its exact claim for safe retry.
+- The GPT launcher combines the UTC slot gate, network/runtime preflight, exclusive `flock`,
+  100-minute timeout, workspace-write sandbox, native web search, and deterministic desk watchdog.
+  The crontab installer is timezone-independent, idempotent, and preserves unrelated jobs.
 - A live subscription smoke test proved the root model/effort, network-enabled workspace sandbox,
   and inherited GPT subagent handshake. Sessions remain in Codex history because Codex CLI
   ephemeral sessions currently cannot initialize collaboration threads.

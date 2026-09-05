@@ -10,11 +10,27 @@ def test_llm_desk_settings_defaults():
     assert s.account_size_usdt == 20000.0
     assert s.universe_top_n == 40              # top-40 by 24h volume (widened 2026-07-15)
     assert s.universe.symbol_count == 20       # post-gate cap desk_evidence now honors
-    assert s.cadence_tf_minutes == 480         # 8h
+    assert s.cadence_tf_minutes == 1440        # 24h full-GPT cycle
     assert s.agent_model == "gpt-5.6-sol"
     assert s.btc_symbol == "BTC/USDT:USDT"
+    assert s.data.binance_klines_proxy_url == "http://127.0.0.1:8000"
+    assert s.data.candle_proxy_timeout_seconds == 15.0
+    assert s.data.binance_proxy_project_dir == "~/binance-proxy"
+    assert s.data.binance_proxy_start_timeout_seconds == 15.0
+    assert s.execution.latency_ms == 500.0
+    assert s.execution.displayed_depth_fraction == 0.5
+    assert s.execution.adverse_selection_bps == 1.0
+    assert s.execution.legging_bps_per_second == 0.25
+    assert s.execution.allow_partial_fills is True
 
 
 def test_live_mode_cannot_be_configured():
     with pytest.raises(ValidationError):
         Settings(live=True)
+
+
+def test_execution_realism_config_is_bounded():
+    with pytest.raises(ValidationError):
+        Settings(execution={"displayed_depth_fraction": 0.0})
+    with pytest.raises(ValidationError):
+        Settings(execution={"adverse_selection_bps": -0.1})

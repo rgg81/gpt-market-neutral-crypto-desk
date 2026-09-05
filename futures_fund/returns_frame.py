@@ -12,6 +12,7 @@ symbol's length so the covariance is computed over an overlapping recent period 
 mix of different histories). A symbol with fewer than ``min_obs`` returns is dropped (too short to
 contribute a stable covariance row) rather than poisoning the matrix with NaNs.
 """
+
 from __future__ import annotations
 
 import numpy as np

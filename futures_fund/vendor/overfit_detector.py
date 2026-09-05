@@ -31,6 +31,7 @@ from scipy.stats import norm
 
 # ── Data Classes ────────────────────────────────────────────────────
 
+
 @dataclasses.dataclass
 class DSRResult:
     """Results from Deflated Sharpe Ratio analysis.
@@ -100,6 +101,7 @@ class MinBTLResult:
 
 # ── Deflated Sharpe Ratio ───────────────────────────────────────────
 
+
 def deflated_sharpe_ratio(
     observed_sr: float,
     num_trials: int,
@@ -143,10 +145,7 @@ def deflated_sharpe_ratio(
     sr = observed_sr / annualization if annualization > 1.0 else observed_sr
 
     # Standard error of the Sharpe ratio estimator
-    sr_std = np.sqrt(
-        (1.0 - skewness * sr + (kurtosis - 1.0) / 4.0 * sr**2)
-        / (backtest_length - 1)
-    )
+    sr_std = np.sqrt((1.0 - skewness * sr + (kurtosis - 1.0) / 4.0 * sr**2) / (backtest_length - 1))
 
     # Cross-trial Sharpe dispersion: explicit (tracked trial Sharpes) or the single-strategy
     # reduction sigma_sr = sr_std (so the expected-max bracket is on the observed Sharpe's scale).
@@ -183,10 +182,13 @@ def deflated_sharpe_ratio(
 
 # ── Probability of Backtest Overfitting ─────────────────────────────
 
+
 def probability_of_backtest_overfitting(
     strategy_returns: np.ndarray,
     n_groups: int = 6,
     n_test_groups: int = 2,
+    purge_observations: int = 0,
+    embargo_observations: int = 0,
 ) -> PBOResult:
     """Compute Probability of Backtest Overfitting using CPCV.
 
@@ -199,21 +201,33 @@ def probability_of_backtest_overfitting(
             Each column is a strategy's return time series.
         n_groups: Number of contiguous groups to split data into.
         n_test_groups: Number of groups to use as test in each combination.
+        purge_observations: Observations removed from the training set immediately before each
+            test block. Use at least the longest overlapping label horizon when applicable.
+        embargo_observations: Observations removed from the training set immediately after each
+            test block to prevent adjacent-sample leakage.
 
     Returns:
         PBOResult with PBO estimate and diagnostics.
     """
+    strategy_returns = np.asarray(strategy_returns, dtype=float)
+    if strategy_returns.ndim != 2:
+        raise ValueError("strategy_returns must be a 2D observation-by-strategy matrix")
+    if not np.isfinite(strategy_returns).all():
+        raise ValueError("strategy_returns must contain only finite values")
     n_obs, n_strategies = strategy_returns.shape
     if n_strategies < 2:
         raise ValueError("Need at least 2 strategies for PBO")
     if n_groups < 3:
         raise ValueError("Need at least 3 groups for meaningful CPCV")
+    if not 1 <= n_test_groups < n_groups:
+        raise ValueError("n_test_groups must be between 1 and n_groups - 1")
+    if purge_observations < 0 or embargo_observations < 0:
+        raise ValueError("purge_observations and embargo_observations must be non-negative")
 
     group_size = n_obs // n_groups
     if group_size < 5:
         raise ValueError(
-            f"Each group has only {group_size} observations. "
-            f"Reduce n_groups or provide more data."
+            f"Each group has only {group_size} observations. Reduce n_groups or provide more data."
         )
 
     # Create group boundaries
@@ -240,6 +254,16 @@ def probability_of_backtest_overfitting(
                 test_indices.extend(indices)
             else:
                 train_indices.extend(indices)
+
+        # Remove training observations adjacent to each test block. Test observations themselves
+        # are already absent from the training list; the set also handles adjacent test groups.
+        excluded_from_train: set[int] = set()
+        for g_idx in test_set:
+            start, end = group_bounds[g_idx]
+            excluded_from_train.update(range(max(0, start - purge_observations), start))
+            excluded_from_train.update(range(end, min(n_obs, end + embargo_observations)))
+        if excluded_from_train:
+            train_indices = [idx for idx in train_indices if idx not in excluded_from_train]
 
         if not train_indices or not test_indices:
             continue
@@ -270,9 +294,11 @@ def probability_of_backtest_overfitting(
 
     n_paths = len(logit_values)
     pbo = n_overfit / n_paths if n_paths > 0 else 1.0
-    mean_rank = float(np.mean([
-        (1.0 / (1.0 + np.exp(-lv))) for lv in logit_values
-    ])) if logit_values else 1.0
+    mean_rank = (
+        float(np.mean([(1.0 / (1.0 + np.exp(-lv))) for lv in logit_values]))
+        if logit_values
+        else 1.0
+    )
 
     return PBOResult(
         pbo=pbo,
@@ -285,6 +311,7 @@ def probability_of_backtest_overfitting(
 
 
 # ── Minimum Backtest Length ─────────────────────────────────────────
+
 
 def minimum_backtest_length(
     target_sr: float,
@@ -320,6 +347,7 @@ def minimum_backtest_length(
 
 
 # ── Multiple Testing Corrections ───────────────────────────────────
+
 
 def bonferroni_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     """Apply Bonferroni correction to a list of p-values.
@@ -362,6 +390,7 @@ def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
 
 # ── Demo ────────────────────────────────────────────────────────────
 
+
 def generate_synthetic_strategies(
     n_obs: int = 500,
     n_strategies: int = 20,
@@ -393,11 +422,11 @@ def generate_synthetic_strategies(
             # Genuine alpha: small positive drift
             drift = 0.0003  # ~11% annualized
             returns[:, i] = rng.normal(drift, daily_vol, n_obs)
-            names.append(f"alpha_{i+1}")
+            names.append(f"alpha_{i + 1}")
         else:
             # Zero alpha: pure noise
             returns[:, i] = rng.normal(0.0, daily_vol, n_obs)
-            names.append(f"noise_{i-n_genuine+1}")
+            names.append(f"noise_{i - n_genuine + 1}")
 
     return returns, names
 
@@ -420,8 +449,10 @@ def run_demo() -> None:
         seed=42,
     )
 
-    print(f"Generated {n_strategies} strategies ({n_genuine} with genuine alpha, "
-          f"{n_strategies - n_genuine} noise)")
+    print(
+        f"Generated {n_strategies} strategies ({n_genuine} with genuine alpha, "
+        f"{n_strategies - n_genuine} noise)"
+    )
     print(f"Each strategy has {n_obs} daily return observations")
     print()
 
@@ -441,7 +472,7 @@ def run_demo() -> None:
     print("-" * 40)
     for rank, idx in enumerate(sorted_idx[:10]):
         stype = "ALPHA" if idx < n_genuine else "noise"
-        print(f"{rank+1:>4} {names[idx]:>12} {sharpes[idx]:>10.3f} {stype:>8}")
+        print(f"{rank + 1:>4} {names[idx]:>12} {sharpes[idx]:>10.3f} {stype:>8}")
     print("  ...")
     print()
 
@@ -524,9 +555,11 @@ def run_demo() -> None:
     print("Part 4: Minimum Backtest Length")
     print("-" * 72)
 
-    for sr_target, label in [(0.05, "Low SR (daily ~0.05, ann ~0.96)"),
-                              (0.10, "Med SR (daily ~0.10, ann ~1.91)"),
-                              (0.20, "High SR (daily ~0.20, ann ~3.82)")]:
+    for sr_target, label in [
+        (0.05, "Low SR (daily ~0.05, ann ~0.96)"),
+        (0.10, "Med SR (daily ~0.10, ann ~1.91)"),
+        (0.20, "High SR (daily ~0.20, ann ~3.82)"),
+    ]:
         result = minimum_backtest_length(
             target_sr=sr_target, confidence=0.95, skewness=skew, kurtosis=kurt
         )
@@ -573,8 +606,12 @@ def run_demo() -> None:
     print("Summary")
     print("=" * 72)
     print(f"  Best raw Sharpe:    {best_sr:.3f} ({best_name})")
-    print(f"  DSR p-value:        {dsr_result.dsr_pvalue:.4f} ({'significant' if dsr_result.is_significant else 'NOT significant'})")
-    print(f"  PBO:                {pbo_result.pbo:.3f} ({'overfit' if pbo_result.is_overfit else 'acceptable'})")
+    print(
+        f"  DSR p-value:        {dsr_result.dsr_pvalue:.4f} ({'significant' if dsr_result.is_significant else 'NOT significant'})"
+    )
+    print(
+        f"  PBO:                {pbo_result.pbo:.3f} ({'overfit' if pbo_result.is_overfit else 'acceptable'})"
+    )
     print(f"  Bonferroni pass:    {n_bonf_sig} strategies")
     print(f"  Holm pass:          {n_holm_sig} strategies")
     print()
@@ -585,6 +622,7 @@ def run_demo() -> None:
 
 
 # ── Main ────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     """Entry point for overfit detection."""
@@ -603,7 +641,9 @@ def main() -> None:
         print("Example: python scripts/overfit_detector.py --demo")
         print()
         print("Or use the functions programmatically:")
-        print("  from overfit_detector import deflated_sharpe_ratio, probability_of_backtest_overfitting")
+        print(
+            "  from overfit_detector import deflated_sharpe_ratio, probability_of_backtest_overfitting"
+        )
         sys.exit(0)
 
     run_demo()

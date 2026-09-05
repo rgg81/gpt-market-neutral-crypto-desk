@@ -4,9 +4,12 @@ import pytest
 
 from futures_fund.slippage import (
     DEFAULT_K,
+    ExecutionRealism,
     depth_slippage,
     estimate_slippage,
+    execution_risk_cost,
     fallback_slippage,
+    haircut_depth,
     slippage_bps,
 )
 
@@ -86,3 +89,16 @@ def test_estimate_never_flat_two_bps():
 def test_slippage_bps_converts_cost_to_bps():
     assert slippage_bps(cost_usdt=125.0, notional=1_000_000.0) == pytest.approx(1.25)
     assert slippage_bps(cost_usdt=10.0, notional=0.0) == 0.0
+
+
+def test_execution_realism_haircuts_displayed_depth_and_adds_shortfall_reserve():
+    policy = ExecutionRealism(
+        latency_ms=250.0,
+        displayed_depth_fraction=0.5,
+        adverse_selection_bps=1.5,
+        legging_bps_per_second=0.2,
+    )
+    assert haircut_depth([(100.0, 10.0)], policy.displayed_depth_fraction) == [(100.0, 5.0)]
+    assert execution_risk_cost(
+        10_000.0, adverse_selection_bps=1.5, legging_bps=0.5
+    ) == pytest.approx(2.0)

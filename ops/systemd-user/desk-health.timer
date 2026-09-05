@@ -1,0 +1,11 @@
+[Unit]
+Description=Check PAPER desk health every ten minutes
+
+[Timer]
+OnCalendar=*-*-* *:02,12,22,32,42,52:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=desk-health.service
+
+[Install]
+WantedBy=timers.target

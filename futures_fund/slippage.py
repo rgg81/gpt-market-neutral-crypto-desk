@@ -1,15 +1,64 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from futures_fund.costs import slippage_cost, vwap_fill
 
-DEFAULT_K: float = 0.1   # sqrt-impact coefficient for the ADV fallback (config.yaml slippage.k)
+DEFAULT_K: float = 0.1  # sqrt-impact coefficient for the ADV fallback (config.yaml slippage.k)
 
 
-def depth_slippage(
-    levels: list[tuple[float, float]], qty: float, reference_price: float
+@dataclass(frozen=True)
+class ExecutionRealism:
+    """Conservative, configurable assumptions for PAPER market-order execution.
+
+    The PM still selects every symbol, side, and requested size. These parameters only describe
+    how much displayed liquidity a market order can actually obtain and the implementation
+    shortfall charged after that decision.
+    """
+
+    latency_ms: float = 500.0
+    displayed_depth_fraction: float = 0.50
+    adverse_selection_bps: float = 1.0
+    legging_bps_per_second: float = 0.25
+    allow_partial_fills: bool = True
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.latency_ms) or self.latency_ms < 0.0:
+            raise ValueError("execution latency must be finite and non-negative")
+        if (
+            not math.isfinite(self.displayed_depth_fraction)
+            or not 0.0 < self.displayed_depth_fraction <= 1.0
+        ):
+            raise ValueError("displayed depth fraction must be in (0, 1]")
+        for name, value in (
+            ("adverse selection", self.adverse_selection_bps),
+            ("legging rate", self.legging_bps_per_second),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+
+
+def haircut_depth(
+    levels: list[tuple[float, float]], displayed_fraction: float
+) -> list[tuple[float, float]]:
+    """Return the executable share of displayed depth without inventing hidden liquidity."""
+    if not math.isfinite(displayed_fraction) or not 0.0 < displayed_fraction <= 1.0:
+        raise ValueError("displayed depth fraction must be in (0, 1]")
+    return [(float(price), float(qty) * displayed_fraction) for price, qty in levels]
+
+
+def execution_risk_cost(
+    notional: float, *, adverse_selection_bps: float = 0.0, legging_bps: float = 0.0
 ) -> float:
+    """Implementation-shortfall reserve beyond the observed L2 walk."""
+    risk_bps = float(adverse_selection_bps) + float(legging_bps)
+    if not math.isfinite(risk_bps) or risk_bps < 0.0:
+        raise ValueError("execution-risk basis points must be finite and non-negative")
+    return abs(float(notional)) * risk_bps / 1e4
+
+
+def depth_slippage(levels: list[tuple[float, float]], qty: float, reference_price: float) -> float:
     """Thin wrapper over costs.slippage_cost against an L2 depth snapshot (USDT cost).
 
     Direction-symmetric: `levels` are the crossing side of the book (asks to buy, bids to sell).
@@ -38,9 +87,16 @@ def fallback_slippage(
 
 
 def estimate_slippage(
-    symbol: str, qty: float, reference_price: float, *,
-    depth: list[tuple[float, float]] | None, adv_usd: float,
-    half_spread_bps: float, k: float = DEFAULT_K,
+    symbol: str,
+    qty: float,
+    reference_price: float,
+    *,
+    depth: list[tuple[float, float]] | None,
+    adv_usd: float,
+    half_spread_bps: float,
+    k: float = DEFAULT_K,
+    adverse_selection_bps: float = 0.0,
+    legging_bps: float = 0.0,
 ) -> float:
     """Slippage cost in USDT for filling `qty` at `reference_price`. NEVER flat 2 bps.
 
@@ -51,15 +107,20 @@ def estimate_slippage(
     partial fill). Strengthen-only: for a clip that fits the book the remainder is 0 (unchanged).
     No depth -> the pure ADV √-impact fallback.
     """
+    risk_cost = execution_risk_cost(
+        abs(qty) * reference_price,
+        adverse_selection_bps=adverse_selection_bps,
+        legging_bps=legging_bps,
+    )
     if depth:
         cost = depth_slippage(depth, qty, reference_price)
         filled_qty, _ = vwap_fill(depth, abs(qty))
         over_qty = abs(qty) - filled_qty
         if over_qty > 1e-12:
             cost += fallback_slippage(over_qty * reference_price, adv_usd, half_spread_bps, k=k)
-        return cost
+        return cost + risk_cost
     notional = abs(qty) * reference_price
-    return fallback_slippage(notional, adv_usd, half_spread_bps, k=k)
+    return fallback_slippage(notional, adv_usd, half_spread_bps, k=k) + risk_cost
 
 
 def slippage_bps(cost_usdt: float, notional: float) -> float:

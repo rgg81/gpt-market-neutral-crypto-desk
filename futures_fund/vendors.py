@@ -24,7 +24,7 @@ class NewsItem(BaseModel):
     source: str
     kind: str
     instruments: list[str]
-    summary: str = ""               # HTML-stripped article body/snippet (not just the title)
+    summary: str = ""  # HTML-stripped article body/snippet (not just the title)
     votes_positive: int = 0
     votes_negative: int = 0
 
@@ -32,11 +32,12 @@ class NewsItem(BaseModel):
 class SocialPost(BaseModel):
     """A reddit post the Sentiment analyst reads to gauge crowd CONTENT (not just an index number).
     `score` = net upvotes (the crowd's weight on the post); `summary` = the self-text snippet."""
+
     title: str
     summary: str = ""
     score: int = 0
     num_comments: int = 0
-    source: str = ""                # the subreddit, e.g. 'CryptoCurrency'
+    source: str = ""  # the subreddit, e.g. 'CryptoCurrency'
     instruments: list[str] = []
 
 
@@ -51,9 +52,14 @@ def parse_fear_greed(payload: dict) -> FearGreed:
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _ALIASES = {
-    "BTC": ("btc", "bitcoin"), "ETH": ("eth", "ethereum"), "SOL": ("sol", "solana"),
-    "BNB": ("bnb", "binance coin"), "XRP": ("xrp", "ripple"), "DOGE": ("doge", "dogecoin"),
-    "ADA": ("ada", "cardano"), "AVAX": ("avax", "avalanche"),
+    "BTC": ("btc", "bitcoin"),
+    "ETH": ("eth", "ethereum"),
+    "SOL": ("sol", "solana"),
+    "BNB": ("bnb", "binance coin"),
+    "XRP": ("xrp", "ripple"),
+    "DOGE": ("doge", "dogecoin"),
+    "ADA": ("ada", "cardano"),
+    "AVAX": ("avax", "avalanche"),
 }
 
 
@@ -119,20 +125,28 @@ def parse_rss(content: bytes, source: str, symbols: list[str]) -> list[NewsItem]
         # Body: RSS <content:encoded> (full) or <description>; Atom <content>/<summary>. The body
         # often names coins the title doesn't, so tag instruments on title + body, and hand the
         # analyst the HTML-stripped snippet — not just the headline.
-        raw_body = (_rss_text(n, _CONTENT + "encoded") or _rss_text(n, "encoded")
-                    or _rss_text(n, "description") or _rss_text(n, "content")
-                    or _rss_text(n, "summary"))
+        raw_body = (
+            _rss_text(n, _CONTENT + "encoded")
+            or _rss_text(n, "encoded")
+            or _rss_text(n, "description")
+            or _rss_text(n, "content")
+            or _rss_text(n, "summary")
+        )
         summary = _clean_html(raw_body)
-        items.append(NewsItem(
-            title=title,
-            url=_rss_text(n, "link") or "",
-            published_at=_rss_text(n, "pubDate") or _rss_text(n, "published")
-            or _rss_text(n, "updated") or "",
-            source=source,
-            kind="news",
-            instruments=tag_instruments(f"{title} {summary}", symbols),
-            summary=summary,
-        ))
+        items.append(
+            NewsItem(
+                title=title,
+                url=_rss_text(n, "link") or "",
+                published_at=_rss_text(n, "pubDate")
+                or _rss_text(n, "published")
+                or _rss_text(n, "updated")
+                or "",
+                source=source,
+                kind="news",
+                instruments=tag_instruments(f"{title} {summary}", symbols),
+                summary=summary,
+            )
+        )
     return items
 
 
@@ -174,10 +188,16 @@ def parse_reddit(payload: dict, subreddit: str, symbols: list[str]) -> list[Soci
         if not title:
             continue
         body = _clean_html(d.get("selftext") or "")
-        out.append(SocialPost(
-            title=title, summary=body,
-            score=int(d.get("score") or 0), num_comments=int(d.get("num_comments") or 0),
-            source=subreddit, instruments=tag_instruments(f"{title} {body}", symbols)))
+        out.append(
+            SocialPost(
+                title=title,
+                summary=body,
+                score=int(d.get("score") or 0),
+                num_comments=int(d.get("num_comments") or 0),
+                source=subreddit,
+                instruments=tag_instruments(f"{title} {body}", symbols),
+            )
+        )
     return out
 
 
@@ -186,8 +206,11 @@ def _posts_for_sub(client, sub: str, symbols: list[str], per_sub: int) -> list[S
     OFTEN 403s for keyless/datacenter reads; falls back to the /.rss Atom feed (works keyless but
     has no score). Returns [] if both fail."""
     try:
-        r = client.get(f"https://www.reddit.com/r/{sub}/hot.json",
-                       params={"limit": per_sub}, headers={"User-Agent": _REDDIT_UA})
+        r = client.get(
+            f"https://www.reddit.com/r/{sub}/hot.json",
+            params={"limit": per_sub},
+            headers={"User-Agent": _REDDIT_UA},
+        )
         r.raise_for_status()
         posts = parse_reddit(r.json(), subreddit=sub, symbols=symbols)
         if posts:
@@ -197,8 +220,10 @@ def _posts_for_sub(client, sub: str, symbols: list[str], per_sub: int) -> list[S
     try:
         r = client.get(f"https://www.reddit.com/r/{sub}/.rss", headers={"User-Agent": _REDDIT_UA})
         r.raise_for_status()
-        return [SocialPost(title=i.title, summary=i.summary, source=sub, instruments=i.instruments)
-                for i in parse_rss(r.content, source=sub, symbols=symbols)[:per_sub]]
+        return [
+            SocialPost(title=i.title, summary=i.summary, source=sub, instruments=i.instruments)
+            for i in parse_rss(r.content, source=sub, symbols=symbols)[:per_sub]
+        ]
     except Exception:
         return []
 
@@ -234,9 +259,16 @@ def fetch_macro(client, series: list[str], api_key: str | None) -> dict[str, flo
     out: dict[str, float] = {}
     for sid in series:
         try:
-            r = client.get(FRED_URL, params={"series_id": sid, "api_key": api_key,
-                                              "file_type": "json", "sort_order": "desc",
-                                              "limit": 1})
+            r = client.get(
+                FRED_URL,
+                params={
+                    "series_id": sid,
+                    "api_key": api_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 1,
+                },
+            )
             r.raise_for_status()
             # pick the latest observation by ISO date — order-independent (don't trust API order)
             vals = parse_fred(r.json())  # [(date, value)], skips "."

@@ -18,9 +18,7 @@ Verdict = Literal["approve", "resize", "veto"]
 # `discretionary` is the 8h-redesign agent-agency sleeve: out-of-band LLM proposals (fail-soft,
 # point-in-time) enter the book as a budget-CAPPED sleeve alongside the four systematic sleeves.
 SleeveName = Literal["carry", "pairs", "factor", "sentiment", "discretionary"]
-SentimentLevel = Literal[
-    "very_positive", "positive", "neutral", "negative", "very_negative"
-]
+SentimentLevel = Literal["very_positive", "positive", "neutral", "negative", "very_negative"]
 SpreadState = Literal["flat", "long_spread", "short_spread", "stop"]
 PairTestMethod = Literal["engle_granger", "johansen"]
 Cadence = Literal["weekly", "daily", "rebal"]
@@ -29,8 +27,8 @@ Cadence = Literal["weekly", "daily", "rebal"]
 class MmrBracket(BaseModel):
     notional_floor: float
     notional_cap: float
-    mmr: float                      # maintenance margin rate
-    maint_amount: float             # maintenance amount offset (cum)
+    mmr: float  # maintenance margin rate
+    maint_amount: float  # maintenance amount offset (cum)
     max_leverage: float
 
 
@@ -39,6 +37,10 @@ class SymbolSpec(BaseModel):
     tick_size: float
     step_size: float
     min_notional: float
+    min_qty: float | None = Field(default=None, gt=0.0)
+    # Quantity rules for this desk's simulated MARKET orders. None is retained only for legacy
+    # injected specs; production exchangeInfo supplies a positive MARKET_LOT_SIZE/LOT_SIZE cap.
+    max_qty: float | None = Field(default=None, gt=0.0)
     mmr_brackets: list[MmrBracket]
 
     @property
@@ -55,7 +57,7 @@ class TradeProposal(BaseModel):
     atr: float
     confidence: float = Field(ge=0.0, le=1.0)
     horizon_hours: float = Field(gt=0)
-    funding_rate: float             # current/predicted per-interval funding rate
+    funding_rate: float  # current/predicted per-interval funding rate
     funding_interval_hours: float = Field(default=8.0, gt=0)
     risk_mult: float = 1.0
 

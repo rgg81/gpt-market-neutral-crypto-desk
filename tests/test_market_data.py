@@ -164,12 +164,39 @@ def test_parse_ohlcv_sorts_and_labels_columns():
     assert df["timestamp"].is_monotonic_increasing
 
 
+def test_parse_ohlcv_normalizes_binance_wire_strings():
+    df = parse_ohlcv([[
+        "1700000000000", "70000.0", "70100.0", "69900.0", "70050.0", "12.5"
+    ]])
+
+    assert df.iloc[0]["close"] == pytest.approx(70050.0)
+    assert df.iloc[0]["volume"] == pytest.approx(12.5)
+    assert df["close"].dtype.kind in "fi"
+
+
+@pytest.mark.parametrize(
+    "row, message",
+    [
+        ([1700000000000, 1, 2, 0.5, float("nan"), 10], "non-finite"),
+        ([1700000000000, 1, 2, 0.5, 0, 10], "strictly positive"),
+        ([1700000000000, 1, 2, 0.5, -1, 10], "strictly positive"),
+        ([1700000000000, 1, 0.9, 0.5, 1.0, 10], "low <= open/close <= high"),
+        ([1700000000000, 1, 2, 1.1, 1.0, 10], "low <= open/close <= high"),
+        ([1700000000000, 1, 2, 0.5, 1.0, -1], "non-negative"),
+    ],
+)
+def test_parse_ohlcv_rejects_invalid_numeric_or_candle_geometry(row, message):
+    with pytest.raises(ValueError, match=message):
+        parse_ohlcv([row])
+
+
 def test_parse_funding_defaults_interval_8h():
     fr = {"symbol": "BTC/USDT:USDT", "fundingRate": "0.0001",
           "fundingTimestamp": 1700000000000, "markPrice": "70000", "indexPrice": "69990"}
     info = parse_funding(fr)
     assert info.interval_hours == pytest.approx(8.0)
     assert info.current_rate == pytest.approx(0.0001)
+    assert info.last_settled_rate == pytest.approx(0.0001)
     assert info.mark_price == pytest.approx(70000.0)
 
 
