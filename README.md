@@ -243,6 +243,7 @@ For a token-free, read-only operational report:
 ```bash
 bash scripts/run_scheduled_cycle.sh --probe-only
 uv run python scripts/desk_health.py --state-dir live_state --log-dir logs
+uv run python scripts/desk_status_performance.py
 ```
 
 The report takes a state-transaction-consistent snapshot and checks completed-cycle and heartbeat
@@ -250,6 +251,12 @@ age, manifest/account consistency, unified account/heartbeat chains, funding-clo
 flat-book duration, and the proxy's current HTTP + exact managed-PID/listener identity. The older
 manager receipt is retained as separate audit context. Local deduplicated alerts require no
 credentials and send nothing externally by default:
+
+`desk_status_performance.py` is the compact operator view: current health/exposure, one reconciled
+row per UTC calendar month, lifetime net P&L and return, realized/unrealized/funding/cost attribution,
+turnover, drawdown, and the official daily Sharpe/Sortino availability status. It is deterministic,
+read-only, and agent/token-free. Add `--json` for full-precision machine output, `--strict` for a
+nonzero exit on critical health, or `--now <aware-ISO-8601>` for a fixed observation timestamp.
 
 ```bash
 uv run python scripts/desk_health_alert.py --state-dir live_state --log-dir logs
