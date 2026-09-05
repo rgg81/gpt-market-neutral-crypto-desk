@@ -11,21 +11,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import traceback
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from futures_fund.cycle_io import cycle_dir
+from futures_fund.durable_io import durable_unlink, durable_write_text
 from futures_fund.pending_io import resolve_pending
 from futures_fund.performance import canonical_sha256
 from futures_fund.prompt_guard import split_managed
 from futures_fund.reconcile_commit import completed_cycle_numbers
 from futures_fund.reflection import (
+    CANONICAL_BTC_SYMBOL,
     DAILY_LEARNING_HORIZON_HOURS,
     SCHEDULED_MARK_TOLERANCE,
-    committed_scoring_observations,
+    canonical_daily_score_observation,
     horizon_is_on_schedule,
     learning_origin_is_bound,
     reflection_authority_recovery_status,
@@ -37,31 +38,53 @@ from futures_fund.reflection import (
 from futures_fund.scorecard import Recurrence
 
 
-def _seal_recurrences(pending: Path) -> str:
-    """Schema-normalize and seal the complete recurrence authorization packet."""
-    path = pending / "recurrences.json"
+def _canonical_recurrences(path: Path) -> list[dict]:
     raw = json.loads(path.read_text())
     if not isinstance(raw, list):
         raise ValueError("recurrences.json must be a list")
-    canonical = [
-        Recurrence.model_validate(item).model_dump(mode="json") for item in raw
-    ]
+    return [Recurrence.model_validate(item).model_dump(mode="json") for item in raw]
+
+
+def _write_recurrences(path: Path, recurrences: list[dict]) -> None:
+    normalized = json.dumps(recurrences, indent=2, sort_keys=True) + "\n"
+    durable_write_text(path, normalized)
+
+
+def _load_sealed_recurrences(pending: Path) -> tuple[list[dict], str] | None:
+    """Validate a prepared recurrence packet without changing either of its files."""
+    path = pending / "recurrences.json"
+    seal_path = pending / "recurrences.sha256"
+    if not seal_path.exists():
+        return None
+    if not path.exists():
+        raise ValueError("recurrences.sha256 exists without recurrences.json")
+    digest = seal_path.read_text().strip()
+    if (
+        len(digest) != 64
+        or digest != digest.lower()
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("recurrences.sha256 is not a lowercase SHA-256 digest")
+    canonical = _canonical_recurrences(path)
+    if canonical_sha256(canonical) != digest:
+        raise ValueError("sealed recurrence packet does not match recurrences.sha256")
+    return canonical, digest
+
+
+def _seal_recurrences(pending: Path) -> str:
+    """Schema-normalize and seal the complete recurrence authorization packet."""
+    path = pending / "recurrences.json"
+    canonical = _canonical_recurrences(path)
     digest = canonical_sha256(canonical)
-    normalized = json.dumps(canonical, indent=2, sort_keys=True) + "\n"
     seal_path = pending / "recurrences.sha256"
     if seal_path.exists() and seal_path.read_text().strip() != digest:
         raise ValueError("existing recurrences.sha256 conflicts with the current packet")
-    path_tmp = path.with_suffix(path.suffix + ".tmp")
-    path_tmp.write_text(normalized)
-    os.replace(path_tmp, path)
+    _write_recurrences(path, canonical)
     if seal_path.exists():
         return digest
-    fd = os.open(seal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-    try:
-        os.write(fd, (digest + "\n").encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    # The host cycle lock provides exclusivity; the shared durable writer prevents SIGKILL or a
+    # power loss from exposing a partially-created immutable seal.
+    durable_write_text(seal_path, digest + "\n", mode=0o400)
     return digest
 
 
@@ -74,15 +97,65 @@ def _recover_reflection_authority_packet(
     )
     if recovery is None:
         return None
-    recurrences = (
-        recovery["receipt"]["recurrences"]
-        if recovery["status"] == "unconsumed"
-        else []
-    )
-    (pending / "recurrences.json").write_text(json.dumps(recurrences, indent=2) + "\n")
-    recurrences_sha256 = _seal_recurrences(pending)
+    receipt_recurrences = recovery["receipt"]["recurrences"]
+    receipt_sha256 = recovery["receipt"]["recurrences_sha256"]
+    sealed = _load_sealed_recurrences(pending)
+    if recovery["status"] == "unconsumed":
+        if sealed is not None and sealed != (receipt_recurrences, receipt_sha256):
+            raise ValueError("pending recurrence seal conflicts with unconsumed authority")
+        if sealed is None:
+            _write_recurrences(pending / "recurrences.json", receipt_recurrences)
+            recurrences_sha256 = _seal_recurrences(pending)
+        else:
+            recurrences_sha256 = sealed[1]
+        recurrences = receipt_recurrences
+    else:
+        # A consumed authority is the sole permission to rotate its ephemeral pending packet to an
+        # empty stand-down. Validate any old prepared packet before removing its immutable seal;
+        # the authority receipt retains the original packet permanently.
+        empty: list[dict] = []
+        empty_sha256 = canonical_sha256(empty)
+        if (
+            sealed is not None
+            and sealed != (receipt_recurrences, receipt_sha256)
+            and sealed != (empty, empty_sha256)
+        ):
+            raise ValueError("pending recurrence seal conflicts with consumed authority")
+        if sealed != (empty, empty_sha256):
+            durable_unlink(pending / "recurrences.sha256")
+            _write_recurrences(pending / "recurrences.json", empty)
+            recurrences_sha256 = _seal_recurrences(pending)
+        else:
+            recurrences_sha256 = empty_sha256
+        durable_unlink(pending / "reflection.json")
+        recurrences = empty
     return {
         "reflection_authority_recovery": recovery["status"],
+        "recurrences": recurrences,
+        "recurrences_sha256": recurrences_sha256,
+    }
+
+
+def _recover_sealed_packet_before_authority(
+    state_dir: str,
+    memory_dir: str,
+    pending: Path,
+    source_cycle: int,
+) -> dict | None:
+    """Finish the crash boundary where the packet seal exists but its authority does not."""
+    sealed = _load_sealed_recurrences(pending)
+    if sealed is None:
+        return None
+    recurrences, recurrences_sha256 = sealed
+    write_reflection_authority(
+        state_dir,
+        memory_dir,
+        source_cycle=source_cycle,
+        recurrences_sha256=recurrences_sha256,
+        recurrences=recurrences,
+    )
+    return {
+        "reflection_authority_recovery": "sealed_packet_before_authority",
         "recurrences": recurrences,
         "recurrences_sha256": recurrences_sha256,
     }
@@ -111,9 +184,10 @@ def score_eligible_completed_cycles(
     cadence: str = "rebal",
 ) -> dict:
     """Catch up every unscored origin at its earliest complete, all-symbol mark packet."""
+    if btc_symbol != CANONICAL_BTC_SYMBOL:
+        raise ValueError(f"daily score benchmark must be {CANONICAL_BTC_SYMBOL}")
     completed = completed_cycle_numbers(state_dir, cadence=cadence)
     seen = scored_cycles(memory_dir, state_dir=state_dir, cadence=cadence)
-    observations = committed_scoring_observations(state_dir, cadence=cadence)
     results: list[dict] = []
     waiting: list[int] = []
     off_horizon_scored: list[dict] = []
@@ -138,22 +212,8 @@ def score_eligible_completed_cycles(
         except (TypeError, ValueError):
             waiting.append(origin_cycle)
             continue
-        scheduled_target = origin_ts + timedelta(hours=DAILY_LEARNING_HORIZON_HOURS)
-        required = {
-            str(row["symbol"])
-            for row in evidence
-            if isinstance(row, dict) and row.get("symbol")
-        }
-        required.add(btc_symbol)
-        eligible = next(
-            (
-                (observation_cycle, observation_ts, marks, artifact_sha256)
-                for observation_cycle, observation_ts, marks, artifact_sha256 in observations
-                if observation_cycle > origin_cycle
-                and observation_ts >= scheduled_target - SCHEDULED_MARK_TOLERANCE
-                and required.issubset(marks)
-            ),
-            None,
+        eligible = canonical_daily_score_observation(
+            state_dir, origin_cycle, cadence=cadence
         )
         if eligible is None:
             waiting.append(origin_cycle)
@@ -182,9 +242,37 @@ def score_eligible_completed_cycles(
                 "learning_eligible": False,
             })
         seen.add(origin_cycle)
-    if not results:
+    recurrence_refresh: dict | None = None
+    if not results and seen:
+        # The score row is the durable side of score_previous_cycle's write-ahead boundary. A host
+        # crash after that replace but before recurrences.json must not make the now-seen cycle skip
+        # its feedback forever. Replay the newest strictly state-verified row against its one
+        # canonical observation; immutable attribution keeps the label unchanged while recurrence
+        # detection is recomputed over the complete verified scorecard.
+        refresh_cycle = max(seen)
+        observation = canonical_daily_score_observation(
+            state_dir, refresh_cycle, cadence=cadence
+        )
+        if observation is None:
+            raise ValueError(
+                f"verified score cycle {refresh_cycle} lost its canonical outcome during refresh"
+            )
+        observation_cycle, observation_ts, marks, artifact_sha256 = observation
+        recurrence_refresh = score_previous_cycle(
+            state_dir,
+            memory_dir,
+            scored_cycle=refresh_cycle,
+            cur_marks=marks,
+            now=observation_ts.isoformat(),
+            btc_symbol=btc_symbol,
+            cadence=cadence,
+            active_calibration_roles=active_calibration_roles,
+            outcome_observation_cycle=observation_cycle,
+            outcome_scoring_marks_sha256=artifact_sha256,
+        )
+    elif not results:
         pending, _meta = resolve_pending(memory_dir)
-        (pending / "recurrences.json").write_text("[]")
+        _write_recurrences(pending / "recurrences.json", [])
     forecast_status = score_mature_leg_forecasts(
         state_dir,
         memory_dir,
@@ -201,6 +289,11 @@ def score_eligible_completed_cycles(
         "off_horizon_scores_retained_for_audit": off_horizon_scored,
         "unscored_waiting_for_committed_marks": waiting,
         "latest_result": results[-1] if results else None,
+        "recurrence_refresh_cycle": (
+            int(recurrence_refresh["scored_cycle"])
+            if recurrence_refresh is not None
+            else None
+        ),
         **forecast_status,
     }
 
@@ -213,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     pending = Path(args.memory_dir) / "pending"
     meta: dict | None = None
+    scoring_attempted = False
     try:
         pending, meta = resolve_pending(args.memory_dir)
         scoring = json.loads((pending / "scoring_marks.json").read_text())
@@ -229,6 +323,13 @@ def main(argv: list[str] | None = None) -> int:
         if authority_recovery is not None:
             print(json.dumps(authority_recovery, indent=2))
             return 0
+        sealed_recovery = _recover_sealed_packet_before_authority(
+            args.state_dir, args.memory_dir, pending, int(meta["cycle"])
+        )
+        if sealed_recovery is not None:
+            print(json.dumps(sealed_recovery, indent=2))
+            return 0
+        scoring_attempted = True
         res = score_eligible_completed_cycles(
             args.state_dir,
             args.memory_dir,
@@ -245,25 +346,54 @@ def main(argv: list[str] | None = None) -> int:
         )
         res["recurrences_sha256"] = recurrences_sha256
         print(json.dumps(res, indent=2))
-    except Exception:  # noqa: BLE001 — learning is fail-soft; never block the cycle
+    except Exception as exc:  # noqa: BLE001 — learning is fail-soft unless recovery is untrusted
         pending.mkdir(parents=True, exist_ok=True)
-        if not (pending / "recurrences.sha256").exists():
-            (pending / "recurrences.json").write_text("[]")
-            recurrences_sha256 = _seal_recurrences(pending)
-            outcome = "wrote sealed empty recurrences.json"
-        else:
-            recurrences_sha256 = (pending / "recurrences.sha256").read_text().strip()
-            outcome = "left the prior sealed recurrence packet untouched"
-        if meta is not None:
-            write_reflection_authority(
-                args.state_dir,
-                args.memory_dir,
-                source_cycle=int(meta["cycle"]),
-                recurrences_sha256=recurrences_sha256,
-                recurrences=json.loads((pending / "recurrences.json").read_text()),
+        try:
+            sealed = _load_sealed_recurrences(pending)
+            if sealed is None and scoring_attempted and meta is not None:
+                # Retry a partially-published score exactly once. If its scorecard row made it to
+                # disk, score_eligible_completed_cycles now refreshes recurrence state from that
+                # verified row even though no new origin remains to score.
+                try:
+                    score_eligible_completed_cycles(
+                        args.state_dir,
+                        args.memory_dir,
+                        btc_symbol=meta["btc_symbol"],
+                        active_calibration_roles=_active_calibration_roles(
+                            Path(args.agents_dir)
+                        ),
+                    )
+                    outcome = "replayed score state and sealed its recurrence packet"
+                except Exception:  # noqa: BLE001 — ordinary learning failure remains fail-soft
+                    _write_recurrences(pending / "recurrences.json", [])
+                    outcome = "wrote sealed empty recurrences after replay also failed"
+                recurrences_sha256 = _seal_recurrences(pending)
+                recurrences = _canonical_recurrences(pending / "recurrences.json")
+            elif sealed is None:
+                _write_recurrences(pending / "recurrences.json", [])
+                recurrences_sha256 = _seal_recurrences(pending)
+                recurrences = []
+                outcome = "wrote sealed empty recurrences.json"
+            else:
+                recurrences, recurrences_sha256 = sealed
+                outcome = "validated and retained the prior sealed recurrence packet"
+            if meta is not None:
+                write_reflection_authority(
+                    args.state_dir,
+                    args.memory_dir,
+                    source_cycle=int(meta["cycle"]),
+                    recurrences_sha256=recurrences_sha256,
+                    recurrences=recurrences,
+                )
+        except Exception:  # noqa: BLE001 — never bless or overwrite a corrupt prepared packet
+            print(
+                "desk_score recovery failed; recurrence authority was not changed",
+                file=sys.stderr,
             )
+            traceback.print_exc()
+            return 1
         print(f"desk_score failed (fail-soft); {outcome}", file=sys.stderr)
-        traceback.print_exc()
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
     return 0
 
 

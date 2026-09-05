@@ -35,7 +35,13 @@ from futures_fund.reflection import (
     score_record_is_manifest_bound,
 )
 from futures_fund.risk_context import position_correlation_context
-from futures_fund.scorecard import ScoreRecord, pm_decision_edge_frac, realized_edge_frac
+from futures_fund.scorecard import (
+    SCORECARD_MIGRATION_WAL_FILE,
+    ScoreRecord,
+    parse_score_record_json,
+    pm_decision_edge_frac,
+    realized_edge_frac,
+)
 from futures_fund.slippage import ExecutionRealism
 
 _WINDOWS = (3, 5, 10)
@@ -83,6 +89,24 @@ def _jsonl(path: Path) -> list[dict]:
         if not isinstance(row, dict):
             raise ValueError(f"non-object JSONL row {path}:{line_number}")
         rows.append(row)
+    return rows
+
+
+def _score_jsonl(path: Path) -> list[ScoreRecord]:
+    """Load score rows with the scorecard's strict serialized-JSON contract."""
+    if (path.parent / SCORECARD_MIGRATION_WAL_FILE).exists():
+        raise ValueError("scorecard migration is incomplete; recover it before performance")
+    if not path.exists():
+        return []
+    rows: list[ScoreRecord] = []
+    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = parse_score_record_json(line)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"malformed score JSONL row {path}:{line_number}") from exc
+        rows.append(record)
     return rows
 
 
@@ -1323,7 +1347,7 @@ def _agent_performance(score_rows: list[dict], *, window: int = _CALIBRATION_WIN
     parsed_records: list[ScoreRecord] = []
     for raw in score_rows:
         try:
-            parsed_records.append(ScoreRecord.model_validate(raw))
+            parsed_records.append(ScoreRecord.model_validate(raw, strict=True))
         except (TypeError, ValueError):
             continue
     unverified_records = [
@@ -2110,15 +2134,19 @@ def build_performance_snapshot(
 
     ledger_rows, ledger_duplicates = _dedupe_cycles(_jsonl(state / "ledger.jsonl"))
     heartbeat_rows = _jsonl(state / "portfolio-heartbeats.jsonl")
-    score_rows, score_duplicates = _dedupe_cycles(_jsonl(memory / "scorecard.jsonl"))
-    parsed_score_records = []
-    for row in score_rows:
-        record = ScoreRecord.model_validate(row)
+    raw_score_records = _score_jsonl(memory / "scorecard.jsonl")
+    score_by_cycle: dict[int, ScoreRecord] = {}
+    for record in raw_score_records:
         if record.outcome_provenance == "manifest_bound" and not score_record_is_manifest_bound(
             state, record
         ):
             raise ValueError(f"score cycle {record.cycle} is not bound to committed artifacts")
-        parsed_score_records.append(record)
+        prior = score_by_cycle.get(record.cycle)
+        if prior is not None and prior != record:
+            raise ValueError(f"conflicting duplicate scorecard cycle {record.cycle}")
+        score_by_cycle.setdefault(record.cycle, record)
+    parsed_score_records = [score_by_cycle[cycle] for cycle in sorted(score_by_cycle)]
+    score_duplicates = len(raw_score_records) - len(parsed_score_records)
     forecast_rows = read_forecast_scorecard(memory / "forecast-scorecard.jsonl", state_dir=state)
     candidate_rows = read_candidate_scorecard(memory / "candidate-scorecard.jsonl", state_dir=state)
     historical_equity = (
@@ -2362,7 +2390,11 @@ def build_performance_snapshot(
         )
 
     latest_cycle = int(ledger_rows[-1]["cycle"]) if ledger_rows else None
-    agent_performance = _agent_performance(score_rows)
+    # Consume the same exact objects that passed provenance replay above. Never reparse or aggregate
+    # a looser raw representation after the trust boundary has approved a stricter one.
+    agent_performance = _agent_performance(
+        [record.model_dump(mode="json") for record in parsed_score_records]
+    )
     forecast_performance = {
         **_forecast_performance(forecast_rows),
         **_pending_forecast_inventory(state, forecast_rows, now=now),
@@ -2464,9 +2496,11 @@ def build_performance_snapshot(
             "ledger_duplicate_cycles_removed": ledger_duplicates,
             "heartbeat_rows": len(heartbeat_rows),
             "latest_heartbeat_ts": (str(heartbeat_rows[-1].get("ts")) if heartbeat_rows else None),
-            "score_rows": len(score_rows),
+            "score_rows": len(parsed_score_records),
             "score_duplicate_cycles_removed": score_duplicates,
-            "latest_scored_cycle": int(score_rows[-1]["cycle"]) if score_rows else None,
+            "latest_scored_cycle": (
+                parsed_score_records[-1].cycle if parsed_score_records else None
+            ),
             "forecast_score_rows": len(forecast_rows),
             "candidate_score_rows": len(candidate_rows),
             "committed_alpha_thesis_available": sum(

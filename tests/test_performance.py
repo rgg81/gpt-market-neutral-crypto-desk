@@ -236,9 +236,24 @@ def _seed(tmp_path):
     outcome_ts = datetime(2026, 8, 16, 0, 7, tzinfo=UTC)
     origin_artifacts = {
         "evidence": [
-            {"symbol": "A", "mark": 100.0, "beta_clamped": 1.0},
-            {"symbol": "B", "mark": 100.0, "beta_clamped": 0.0},
-            {"symbol": "BTC/USDT:USDT", "mark": 100.0, "beta_clamped": 1.0},
+            {
+                "symbol": "A",
+                "mark": 100.0,
+                "beta_clamped": 1.0,
+                "as_of_ts": origin_ts.isoformat(),
+            },
+            {
+                "symbol": "B",
+                "mark": 100.0,
+                "beta_clamped": 0.0,
+                "as_of_ts": origin_ts.isoformat(),
+            },
+            {
+                "symbol": "BTC/USDT:USDT",
+                "mark": 100.0,
+                "beta_clamped": 1.0,
+                "as_of_ts": origin_ts.isoformat(),
+            },
         ],
         "reads": {
             "sentiment": [],
@@ -283,6 +298,22 @@ def _seed(tmp_path):
     recover_reconcile_transaction(state)
     outcome_marks = {"A": 102.0, "B": 100.0, "BTC/USDT:USDT": 100.0}
     scoring_packet = {"as_of_ts": outcome_ts.isoformat(), "marks": outcome_marks}
+    outcome_evidence = [
+        {
+            "symbol": symbol,
+            "mark": mark,
+            "beta_clamped": 1.0 if symbol != "B" else 0.0,
+            "as_of_ts": outcome_ts.isoformat(),
+        }
+        for symbol, mark in outcome_marks.items()
+    ]
+    outcome_meta = {
+        "cycle": 2,
+        "now": outcome_ts.isoformat(),
+        "btc_symbol": "BTC/USDT:USDT",
+        "scoring_marks_sha256": canonical_sha256(scoring_packet),
+        "evidence_sha256": canonical_sha256(outcome_evidence),
+    }
     stage_reconcile_transaction(
         state,
         expected_base_account_sha256=current_account_sha256(state),
@@ -290,6 +321,8 @@ def _seed(tmp_path):
         cadence="rebal",
         account=account,
         artifacts={
+            "evidence": outcome_evidence,
+            "meta": outcome_meta,
             "scoring_marks": scoring_packet,
             "report": {"cycle": 2, "decision_ts": outcome_ts.isoformat()},
         },
@@ -588,6 +621,34 @@ def test_snapshot_rejects_a_self_declared_manifest_bound_normal_score(tmp_path):
     path = memory / "scorecard.jsonl"
     row = json.loads(path.read_text().splitlines()[0])
     row["specialists"]["technical"]["conv_weighted_edge"] = 9.0
+    path.write_text(json.dumps(row) + "\n")
+
+    with pytest.raises(ValueError, match="not bound to committed artifacts"):
+        build_performance_snapshot(
+            state, memory, pending, cycle=2, as_of_ts=NOW, starting_capital=20_000.0
+        )
+
+
+@pytest.mark.parametrize(
+    "field_path",
+    [
+        ("adv_reason_tags",),
+        ("book", "decision_kind"),
+    ],
+    ids=("top-level-default", "nested-default"),
+)
+def test_snapshot_cannot_materialize_omitted_score_defaults_before_verification(
+    tmp_path, field_path
+):
+    state, memory, pending = _seed(tmp_path)
+    path = memory / "scorecard.jsonl"
+    row = json.loads(path.read_text().splitlines()[0])
+    assert row["adv_reason_tags"] == []
+    assert row["book"]["decision_kind"] == "cash_hold"
+    cursor = row
+    for field in field_path[:-1]:
+        cursor = cursor[field]
+    cursor.pop(field_path[-1])
     path.write_text(json.dumps(row) + "\n")
 
     with pytest.raises(ValueError, match="not bound to committed artifacts"):

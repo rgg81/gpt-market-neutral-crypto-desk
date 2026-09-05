@@ -71,6 +71,18 @@ Cycle and heartbeat intents use same-directory temporary files, file `fsync`, at
 parent-directory `fsync`. Completion binds the account snapshot and runtime provenance. Recovery
 finishes that exact durable intent or fails closed; never edit a pending transaction by hand.
 
+If `live_memory/scorecard-migration-v2.wal.json` exists after an interrupted schema migration,
+recover it before launching Codex:
+
+```bash
+uv run python scripts/desk_scorecard_migrate.py \
+  --state-dir live_state --memory-dir live_memory
+```
+
+The command takes the shared desk lock, accepts only the archived source/target lineage, and is
+idempotent. Never delete the WAL or rewrite `scorecard.jsonl`/`attribution.json` by hand;
+production score and performance readers intentionally refuse an unfinished migration.
+
 ## 3. Run one manual catch-up
 
 The manual form bypasses only the launcher's UTC-slot check. The desk watchdog remains mandatory

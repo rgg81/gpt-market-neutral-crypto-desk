@@ -97,6 +97,23 @@ exact generation idempotently or fails closed.
 `scripts/desk_backfill_manifests.py` is the audited, idempotent one-time migration for protocol
 cycles created before manifests existed.
 
+Historical manifest-bound daily score rows created before score schema v2 require one audited
+operator migration before this code can run a cycle:
+
+```bash
+uv run python scripts/desk_scorecard_migrate.py \
+  --state-dir live_state --memory-dir live_memory
+```
+
+Run it outside a desk cycle. It acquires the same `logs/desk-cycle.lock` used by cycles and
+heartbeats, archives the exact source scorecard and per-cycle attributions in a content-addressed
+generation, independently rebuilds every manifest-bound row from the canonical earliest complete
+observation, publishes attributions before the aggregate scorecard, and closes with a durable
+protocol receipt. It is idempotent and recovers its own WAL after interruption. While that WAL is
+present, production score and performance readers fail closed. It never edits account, ledger,
+equity, completion manifests, books, or fills. Do not hand-edit or delete its WAL/archive/protocol;
+rerun the same command after diagnosing an interruption.
+
 ---
 
 ## Step 0a — Managed-region provenance (deterministic, fail-closed)

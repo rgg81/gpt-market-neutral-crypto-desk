@@ -40,6 +40,9 @@ The Python layer does not rank trades or override the agents. It does enforce st
 - fees, order-book slippage, funding, realized P&L, and unrealized P&L reconcile in one ledger;
 - every GPT role receives a cycle-matched performance packet with desk PnL/drawdown, frictions,
   seat economics, and its own measured calibration history;
+- current learning rows carry an explicit schema version and are replayed in full against the
+  canonical BTC benchmark and earliest eligible completed observation; duplicate-key, non-finite,
+  type-coerced, downgraded, incomplete, or row-selected labels fail closed;
 - every incumbent alpha seat must requalify each cycle with a calibrated beta-adjusted price edge,
   objective invalidation, risk review, and hold-versus-cash/replacement comparison;
 - persistent relative-price alpha is the anchor; history-qualified carry is an overlay that may
@@ -209,6 +212,19 @@ uv run python scripts/desk_reconcile.py --state-dir live_state --memory-dir live
 
 Do not run reconcile without valid specialist, PM, precheck, and Adversary artifacts in the active
 per-cycle pending directory; decision-chain validation will refuse them.
+
+When upgrading a desk that contains pre-v2 manifest-bound rows, run the audited one-time score
+migration outside a cycle:
+
+```bash
+uv run python scripts/desk_scorecard_migrate.py \
+  --state-dir live_state --memory-dir live_memory
+```
+
+It uses the shared desk lock, archives the exact source generation, independently rebuilds each
+trusted row and attribution, and recovers idempotently after interruption. It does not touch the
+paper account, ledger, equity history, completion manifests, books, or fills. An unfinished
+migration WAL blocks score/performance consumers until this command recovers it.
 
 The older `futures_fund.desk_cycle.run_cycle` and `scripts/run_desk_cli.py` interfaces exist only
 for canned offline integration tests. They require an explicit acknowledgement and a runner-bound

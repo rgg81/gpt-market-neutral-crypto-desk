@@ -31,11 +31,14 @@ from futures_fund.reconcile_commit import (
     completed_cycle_numbers,
 )
 from futures_fund.scorecard import (
+    CURRENT_SCORE_SCHEMA_VERSION,
+    SCORECARD_MIGRATION_WAL_FILE,
     Recurrence,
     ScoreRecord,
     classify_objections,
     detect_recurrences,
     forward_returns,
+    parse_score_record_json,
     realized_edge_frac,
     score_book,
     score_candidate_opportunities,
@@ -43,6 +46,7 @@ from futures_fund.scorecard import (
 )
 
 SPECIALIST_ROLES = ("sentiment", "technical", "futures")
+CANONICAL_BTC_SYMBOL = "BTC/USDT:USDT"
 RECURRENCE_COOLDOWN_CYCLES = 3
 DAILY_LEARNING_HORIZON_HOURS = 24.0
 # A full cycle is scheduled for the same UTC slot every day, but process/network jitter can put a
@@ -143,13 +147,15 @@ def _adversary_recovery_recurrences(records: list[ScoreRecord]) -> list[Recurren
 
 def _read_scorecard(path: Path, *, state_dir=None, cadence: str = "rebal") -> list[ScoreRecord]:
     by_cycle: dict[int, ScoreRecord] = {}
+    if (path.parent / SCORECARD_MIGRATION_WAL_FILE).exists():
+        raise ValueError("scorecard migration is incomplete; recover it before reading scores")
     if not path.exists():
         return []
     for line_number, line in enumerate(path.read_text().splitlines(), start=1):
         if not line.strip():
             continue
         try:
-            record = ScoreRecord.model_validate_json(line)
+            record = parse_score_record_json(line)
             if (
                 state_dir is not None
                 and record.outcome_provenance == "manifest_bound"
@@ -272,6 +278,34 @@ def persist_decision_snapshot(
 
 def _read_json(path: Path, default):
     return json.loads(path.read_text()) if path.exists() else default
+
+
+def _read_strict_json(path: Path):
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            path.read_text(),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number: {token}")
+            ),
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid JSON object: {path}") from exc
+
+
+def _read_strict_json_object(path: Path) -> dict:
+    value = _read_strict_json(path)
+    if not isinstance(value, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return value
 
 
 def read_forecast_scorecard(
@@ -583,17 +617,50 @@ def committed_scoring_observations(
     """
     observations: list[tuple[int, datetime, dict[str, float], str]] = []
     for observation_cycle in completed_cycle_numbers(state_dir, cadence=cadence):
+        directory = cycle_dir(state_dir, observation_cycle, cadence=cadence)
+        path = directory / "scoring_marks.json"
         artifact_sha256 = completed_artifact_sha256(
             state_dir, observation_cycle, "scoring_marks", cadence=cadence
         )
         if artifact_sha256 is None:
-            continue
-        path = cycle_dir(state_dir, observation_cycle, cadence=cadence) / "scoring_marks.json"
-        if not path.exists():
+            if path.exists():
+                raise ValueError(
+                    f"completed cycle {observation_cycle} has unbound scoring marks"
+                )
             continue
         try:
-            raw = _read_json(path, {})
+            related_hashes = {
+                name: completed_artifact_sha256(
+                    state_dir, observation_cycle, name, cadence=cadence
+                )
+                for name in ("evidence", "meta", "report")
+            }
+            if any(value is None for value in related_hashes.values()):
+                raise ValueError("scoring observation lacks bound evidence/meta/report")
+            raw = _read_strict_json_object(path)
+            if set(raw) != {"as_of_ts", "marks"}:
+                raise ValueError("scoring marks have an unsupported shape")
+            report = _read_strict_json_object(directory / "report.json")
+            meta = _read_strict_json_object(directory / "meta.json")
+            evidence = _read_strict_json(directory / "evidence.json")
+            if not isinstance(evidence, list) or not evidence:
+                raise ValueError("scoring observation evidence must be a non-empty list")
+            if (
+                type(meta.get("cycle")) is not int
+                or meta["cycle"] != observation_cycle
+                or type(report.get("cycle")) is not int
+                or report["cycle"] != observation_cycle
+                or meta.get("btc_symbol") != CANONICAL_BTC_SYMBOL
+                or meta.get("scoring_marks_sha256") != artifact_sha256
+                or meta.get("evidence_sha256") != related_hashes["evidence"]
+            ):
+                raise ValueError("scoring observation identity/hash binding is inconsistent")
             observation_ts = _as_utc(str(raw["as_of_ts"]))
+            if not (
+                observation_ts == _as_utc(str(report["decision_ts"]))
+                == _as_utc(str(meta["now"]))
+            ):
+                raise ValueError("scoring observation timestamps do not identify one cycle")
             raw_marks = raw["marks"]
             if not isinstance(raw_marks, dict) or not raw_marks:
                 raise ValueError("marks must be a non-empty object")
@@ -603,11 +670,94 @@ def committed_scoring_observations(
                 for symbol, mark in marks.items()
             ):
                 raise ValueError("marks must be finite and positive")
-        except (KeyError, TypeError, ValueError) as exc:
+            evidence_marks: dict[str, float] = {}
+            for row in evidence:
+                if not isinstance(row, dict):
+                    raise ValueError("evidence row must be an object")
+                symbol = str(row["symbol"])
+                mark = float(row["mark"])
+                if (
+                    not symbol
+                    or symbol in evidence_marks
+                    or not math.isfinite(mark)
+                    or mark <= 0.0
+                    or _as_utc(str(row["as_of_ts"])) != observation_ts
+                ):
+                    raise ValueError("evidence mark identity is invalid")
+                evidence_marks[symbol] = mark
+            if any(marks.get(symbol) != mark for symbol, mark in evidence_marks.items()):
+                raise ValueError("scoring marks conflict with same-cycle evidence marks")
+        except (KeyError, OSError, TypeError, ValueError) as exc:
             raise ValueError(f"invalid committed scoring marks: {path}") from exc
         observations.append((observation_cycle, observation_ts, marks, artifact_sha256))
     observations.sort(key=lambda item: (item[1], item[0]))
     return observations
+
+
+def canonical_daily_score_observation(
+    state_dir,
+    origin_cycle: int,
+    *,
+    cadence: str = "rebal",
+) -> tuple[int, datetime, dict[str, float], str] | None:
+    """Resolve the one admissible daily label without trusting a scorecard row.
+
+    The benchmark, origin timestamp, required coverage, horizon and first eligible observation are
+    all derived from committed desk artifacts. A row therefore cannot select another benchmark,
+    omit a losing symbol, or move its label to a more convenient later cycle.
+    """
+    if not learning_origin_is_bound(state_dir, origin_cycle, cadence=cadence):
+        return None
+    origin_dir = cycle_dir(state_dir, origin_cycle, cadence=cadence)
+    try:
+        evidence = _read_strict_json(origin_dir / "evidence.json")
+        report = _read_strict_json_object(origin_dir / "report.json")
+        if type(report.get("cycle")) is not int or report["cycle"] != origin_cycle:
+            return None
+        origin_ts = _as_utc(str(report["decision_ts"]))
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(evidence, list) or not evidence:
+        return None
+    symbols: list[str] = []
+    for row in evidence:
+        if not isinstance(row, dict):
+            return None
+        symbol = str(row.get("symbol") or "")
+        try:
+            mark = float(row.get("mark"))
+        except (TypeError, ValueError):
+            return None
+        try:
+            evidence_ts = _as_utc(str(row["as_of_ts"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            not symbol
+            or not math.isfinite(mark)
+            or mark <= 0.0
+            or evidence_ts != origin_ts
+        ):
+            return None
+        symbols.append(symbol)
+    if len(symbols) != len(set(symbols)) or CANONICAL_BTC_SYMBOL not in symbols:
+        return None
+    earliest_ts = (
+        origin_ts
+        + timedelta(hours=DAILY_LEARNING_HORIZON_HOURS)
+        - SCHEDULED_MARK_TOLERANCE
+    )
+    required = {*symbols, CANONICAL_BTC_SYMBOL}
+    return next(
+        (
+            observation
+            for observation in committed_scoring_observations(state_dir, cadence=cadence)
+            if observation[0] > origin_cycle
+            and observation[1] >= earliest_ts
+            and required.issubset(observation[2])
+        ),
+        None,
+    )
 
 
 def _explicit_alpha_forecast(
@@ -983,61 +1133,58 @@ def learning_origin_is_bound(state_dir, cycle: int, *, cadence: str = "rebal") -
 def score_record_is_manifest_bound(
     state_dir, record: ScoreRecord, *, cadence: str = "rebal"
 ) -> bool:
-    """Rebind a normal score row to its exact origin and committed outcome packet."""
-    if record.outcome_provenance != "manifest_bound":
-        return False
-    observation_cycle = record.outcome_observation_cycle
-    if observation_cycle is None or not learning_origin_is_bound(
-        state_dir, record.cycle, cadence=cadence
+    """Strictly rederive a current score from its canonical committed observation."""
+    if (
+        record.outcome_provenance != "manifest_bound"
+        or record.score_schema_version != CURRENT_SCORE_SCHEMA_VERSION
+        or record.btc_symbol != CANONICAL_BTC_SYMBOL
     ):
         return False
-    artifact_sha256 = completed_artifact_sha256(
-        state_dir, observation_cycle, "scoring_marks", cadence=cadence
-    )
-    if artifact_sha256 != record.outcome_scoring_marks_sha256:
+
+    # Missing serialized fields must not silently acquire model defaults. Extra keys are rejected
+    # by the score models themselves; these exact field-set checks cover top-level and nested
+    # deletions before full-value replay.
+    if set(record.model_fields_set) != set(type(record).model_fields):
         return False
-    packet_path = cycle_dir(state_dir, observation_cycle, cadence=cadence) / "scoring_marks.json"
+    if set(record.book.model_fields_set) != set(type(record.book).model_fields):
+        return False
+    if set(record.specialists) != set(SPECIALIST_ROLES) or any(
+        set(item.model_fields_set) != set(type(item).model_fields)
+        for item in record.specialists.values()
+    ):
+        return False
+    if any(
+        set(item.model_fields_set) != set(type(item).model_fields)
+        for item in record.candidate_opportunities
+    ):
+        return False
+
     try:
-        packet = _read_json(packet_path, {})
-        raw_marks = packet["marks"]
-        if not isinstance(raw_marks, dict) or not raw_marks:
+        observation = canonical_daily_score_observation(
+            state_dir, record.cycle, cadence=cadence
+        )
+        if observation is None:
             return False
-        marks = {str(symbol): float(mark) for symbol, mark in raw_marks.items()}
-        if any(
-            not symbol or not math.isfinite(mark) or mark <= 0.0 for symbol, mark in marks.items()
-        ):
-            return False
+        observation_cycle, observation_ts, marks, artifact_sha256 = observation
         if not (
-            _marks_sha256(marks) == record.outcome_marks_sha256
-            and _as_utc(str(packet["as_of_ts"])) == _as_utc(record.scored_at)
+            observation_cycle == record.outcome_observation_cycle
+            and artifact_sha256 == record.outcome_scoring_marks_sha256
+            and _marks_sha256(marks) == record.outcome_marks_sha256
+            and observation_ts == _as_utc(record.scored_at)
         ):
             return False
         expected = _build_score_record(
             state_dir,
             scored_cycle=record.cycle,
             cur_marks=marks,
-            now=record.scored_at,
-            btc_symbol=record.btc_symbol,
+            now=observation_ts.isoformat(),
+            btc_symbol=CANONICAL_BTC_SYMBOL,
             cadence=cadence,
             outcome_observation_cycle=observation_cycle,
             outcome_scoring_marks_sha256=artifact_sha256,
             outcome_provenance="manifest_bound",
         )
-        expected_payload = expected.model_dump(mode="json")
-        actual_payload = record.model_dump(mode="json")
-        # ScoreRecord predates explicit alpha-gross, funding, exit, and candidate fields. Compare
-        # immutable legacy rows only over the fields actually serialized at creation; new rows
-        # remain fully strict because their model_fields_set contains the complete current schema.
-        for field in record.model_fields_set:
-            if field == "book":
-                for book_field in record.book.model_fields_set:
-                    if expected_payload["book"].get(book_field) != actual_payload["book"].get(
-                        book_field
-                    ):
-                        return False
-            elif expected_payload.get(field) != actual_payload.get(field):
-                return False
-        return True
+        return expected.model_dump(mode="json") == record.model_dump(mode="json")
     except (KeyError, OSError, TypeError, ValueError):
         return False
 
@@ -1541,6 +1688,8 @@ def _build_score_record(
     funding_horizon_events: float | None = None,
 ) -> ScoreRecord:
     """Deterministically derive a normal learning row from bound decision and mark inputs."""
+    if btc_symbol != CANONICAL_BTC_SYMBOL:
+        raise ValueError(f"daily score benchmark must be {CANONICAL_BTC_SYMBOL}")
     directory = cycle_dir(state_dir, scored_cycle, cadence=cadence)
     prev_ev = _read_json(directory / "evidence.json", [])
     marks_prev = {e["symbol"]: float(e["mark"]) for e in prev_ev}
@@ -1644,6 +1793,7 @@ def _build_score_record(
     adv_accept = bool(adv_raw.get("accept", True))
     adv_objections = list(adv_raw.get("objections", []))
     return ScoreRecord(
+        score_schema_version=CURRENT_SCORE_SCHEMA_VERSION,
         cycle=scored_cycle,
         btc_symbol=btc_symbol,
         scored_at=now,
@@ -1682,6 +1832,8 @@ def score_previous_cycle(
     outcome_observation_cycle: int | None = None,
     outcome_scoring_marks_sha256: str = "",
 ) -> dict:
+    if btc_symbol != CANONICAL_BTC_SYMBOL:
+        raise ValueError(f"daily score benchmark must be {CANONICAL_BTC_SYMBOL}")
     pending = _resolve_pending_dir(memory_dir)
     pending.mkdir(parents=True, exist_ok=True)
     rec_path = pending / "recurrences.json"
@@ -1701,26 +1853,19 @@ def score_previous_cycle(
 
     outcome_provenance = "legacy_unverified"
     if outcome_observation_cycle is not None or outcome_scoring_marks_sha256:
-        eligible = next(
-            (
-                (observation_ts, marks)
-                for observation_cycle, observation_ts, marks, artifact_sha256 in (
-                    committed_scoring_observations(state_dir, cadence=cadence)
-                )
-                if observation_cycle == outcome_observation_cycle
-                and artifact_sha256 == outcome_scoring_marks_sha256
-            ),
-            None,
+        eligible = canonical_daily_score_observation(
+            state_dir, scored_cycle, cadence=cadence
         )
         if eligible is None:
-            raise ValueError("score outcome is not a manifest-bound scoring observation")
-        observation_ts, observation_marks = eligible
-        if observation_ts != _as_utc(now) or _marks_sha256(observation_marks) != _marks_sha256(
-            cur_marks
+            raise ValueError("score origin has no canonical manifest-bound scoring observation")
+        observation_cycle, observation_ts, observation_marks, artifact_sha256 = eligible
+        if not (
+            observation_cycle == outcome_observation_cycle
+            and artifact_sha256 == outcome_scoring_marks_sha256
+            and observation_ts == _as_utc(now)
+            and _marks_sha256(observation_marks) == _marks_sha256(cur_marks)
         ):
-            raise ValueError("score outcome does not match the committed scoring observation")
-        if not learning_origin_is_bound(state_dir, scored_cycle, cadence=cadence):
-            raise ValueError("score origin decision artifacts are not manifest-bound")
+            raise ValueError("score outcome is not the canonical committed scoring observation")
         outcome_provenance = "manifest_bound"
 
     candidate = _build_score_record(
@@ -1756,7 +1901,7 @@ def score_previous_cycle(
     if immutable_reused:
         record = prior_record
         if attribution_path.exists():
-            attribution = ScoreRecord.model_validate_json(attribution_path.read_text())
+            attribution = parse_score_record_json(attribution_path.read_text())
             if attribution.model_dump(mode="json") != record.model_dump(mode="json"):
                 raise ValueError(
                     f"cycle {scored_cycle} attribution conflicts with immutable scorecard"
@@ -1772,7 +1917,7 @@ def score_previous_cycle(
     elif attribution_path.exists():
         # Crash boundary: attribution is written before scorecard. Treat that valid first record
         # as the immutable intent rather than relabeling the decision at this retry's later marks.
-        attribution = ScoreRecord.model_validate_json(attribution_path.read_text())
+        attribution = parse_score_record_json(attribution_path.read_text())
         if attribution.cycle != scored_cycle:
             raise ValueError("attribution cycle does not match the score request")
         if attribution.outcome_provenance == "manifest_bound":

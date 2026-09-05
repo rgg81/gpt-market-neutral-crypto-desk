@@ -8,6 +8,7 @@ import pytest
 from futures_fund.account import PaperAccount
 from futures_fund.cycle_io import cycle_dir, save_output
 from futures_fund.desk_contracts import ReflectionProposal
+from futures_fund.durable_io import canonical_json_sha256
 from futures_fund.prompt_guard import BEGIN, END, splice_managed, split_managed
 from futures_fund.reconcile_commit import (
     recover_reconcile_transaction,
@@ -15,12 +16,14 @@ from futures_fund.reconcile_commit import (
 )
 from futures_fund.reflection import (
     _adversary_recovery_recurrences,
+    _build_score_record,
     _filter_recurrences,
     _marks_sha256,
     _pm_gate_inactive_recurrences,
     apply_reflection,
     audit_managed_region_provenance,
     bootstrap_reflector_heads,
+    canonical_daily_score_observation,
     mark_recurrences_handled,
     persist_decision_snapshot,
     read_candidate_scorecard,
@@ -28,6 +31,7 @@ from futures_fund.reflection import (
     reflector_heads_path,
     score_mature_leg_forecasts,
     score_previous_cycle,
+    score_record_is_manifest_bound,
     scored_cycles,
     write_reflection_authority,
 )
@@ -53,6 +57,7 @@ def _seed_cycle(
     report=None,
 ):
     funding_bps = funding_bps or {}
+    evidence_ts = report.get("decision_ts") if isinstance(report, dict) else None
     ev = [
         {
             "symbol": s,
@@ -60,6 +65,7 @@ def _seed_cycle(
             "beta_btc": betas.get(s, 1.0),
             "beta_clamped": betas.get(s, 1.0),
             "expected_funding_8h_bps": funding_bps.get(s, 0.0),
+            **({"as_of_ts": evidence_ts} if evidence_ts is not None else {}),
         }
         for s in marks
     ]
@@ -71,7 +77,14 @@ def _seed_cycle(
         save_output(state_dir, cycle, "report", report, cadence="rebal")
 
 
-def _commit_seeded_cycle(state_dir, cycle, scoring_marks=None):
+def _commit_seeded_cycle(
+    state_dir,
+    cycle,
+    scoring_marks=None,
+    *,
+    normalize_scoring_evidence: bool = True,
+    meta_now: str | None = None,
+):
     directory = cycle_dir(state_dir, cycle, cadence="rebal")
     artifacts = {
         name: json.loads((directory / f"{name}.json").read_text())
@@ -79,6 +92,22 @@ def _commit_seeded_cycle(state_dir, cycle, scoring_marks=None):
     }
     if scoring_marks is not None:
         artifacts["scoring_marks"] = scoring_marks
+        observation_ts = scoring_marks["as_of_ts"]
+        observation_marks = scoring_marks["marks"]
+        evidence = []
+        for row in artifacts["evidence"]:
+            bound_row = {**row, "as_of_ts": observation_ts}
+            if normalize_scoring_evidence and bound_row["symbol"] in observation_marks:
+                bound_row["mark"] = observation_marks[bound_row["symbol"]]
+            evidence.append(bound_row)
+        artifacts["evidence"] = evidence
+        artifacts["meta"] = {
+            "cycle": cycle,
+            "now": meta_now or observation_ts,
+            "btc_symbol": "BTC/USDT:USDT",
+            "scoring_marks_sha256": canonical_json_sha256(scoring_marks),
+            "evidence_sha256": canonical_json_sha256(evidence),
+        }
     entry_gate_policy = directory / "entry_gate_policy.json"
     if entry_gate_policy.exists():
         artifacts["entry_gate_policy"] = json.loads(entry_gate_policy.read_text())
@@ -115,6 +144,7 @@ def _seed_gate_cycle(
 ) -> None:
     symbol = "A/USDT:USDT"
     btc = "BTC/USDT:USDT"
+    marks = {symbol: 100.0 + max(0, cycle - 1) * 2.0, btc: 100.0}
     reads = {
         "sentiment": [
             {
@@ -193,7 +223,7 @@ def _seed_gate_cycle(
     _seed_cycle(
         state_dir,
         cycle,
-        marks={symbol: 100.0, btc: 100.0},
+        marks=marks,
         betas={symbol: 0.0, btc: 1.0},
         reads=reads,
         book=book,
@@ -218,7 +248,7 @@ def _seed_gate_cycle(
         cycle,
         {
             "as_of_ts": timestamp,
-            "marks": {symbol: 100.0 + cycle, btc: 100.0},
+            "marks": marks,
         },
     )
 
@@ -588,6 +618,284 @@ def test_daily_score_accepts_small_scheduled_slot_jitter_and_keeps_actual_elapse
     row = json.loads((Path(mem) / "scorecard.jsonl").read_text())
     assert row["evaluation_horizon_hours"] == pytest.approx(24.0 - 10.0 / 3600.0)
     assert row["scored_at"] == observation
+
+
+def _seed_strict_daily_score(
+    tmp_path,
+    *,
+    outcome_report_ts: str | None = None,
+    outcome_meta_ts: str | None = None,
+    outcome_evidence_marks: dict[str, float] | None = None,
+    normalize_scoring_evidence: bool = True,
+    score: bool = True,
+):
+    state = str(tmp_path / "state")
+    memory = str(tmp_path / "memory")
+    btc = "BTC/USDT:USDT"
+    eth = "ETH/USDT:USDT"
+    origin_ts = "2026-08-01T00:07:00+00:00"
+    outcome_ts = "2026-08-02T00:07:00+00:00"
+    reads = {
+        "sentiment": [],
+        "technical": [
+            {"symbol": "A", "lean": "long", "conviction": 0.7, "rationale": "trend"},
+            {"symbol": btc, "lean": "flat", "conviction": 0.0, "rationale": "benchmark"},
+            {"symbol": eth, "lean": "flat", "conviction": 0.0, "rationale": "control"},
+        ],
+        "futures": [],
+    }
+    origin_marks = {"A": 100.0, btc: 100.0, eth: 50.0}
+    _seed_cycle(
+        state,
+        1,
+        marks=origin_marks,
+        betas={"A": 0.5, btc: 1.0, eth: 0.8},
+        reads=reads,
+        book={"legs": [{"symbol": "A", "side": "long", "target_notional": 1_000.0}]},
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin_ts},
+    )
+    _commit_seeded_cycle(state, 1)
+    outcome_marks = {"A": 110.0, btc: 102.0, eth: 55.0}
+    _seed_cycle(
+        state,
+        2,
+        marks=outcome_evidence_marks or outcome_marks,
+        betas={"A": 0.5, btc: 1.0, eth: 0.8},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 2, "decision_ts": outcome_report_ts or outcome_ts},
+    )
+    _commit_seeded_cycle(
+        state,
+        2,
+        {"as_of_ts": outcome_ts, "marks": outcome_marks},
+        normalize_scoring_evidence=normalize_scoring_evidence,
+        meta_now=outcome_meta_ts,
+    )
+    if not score:
+        return state, memory, None, None, outcome_marks, outcome_ts
+    result = score_eligible_completed_cycles(
+        state, memory, btc_symbol=btc, active_calibration_roles=set()
+    )
+    assert result["scored_cycles"] == [1]
+    path = Path(memory) / "scorecard.jsonl"
+    return state, memory, path, json.loads(path.read_text()), outcome_marks, outcome_ts
+
+
+def test_current_score_requires_every_serialized_field_and_rejects_extras(tmp_path):
+    state, memory, path, row, _marks, _ts = _seed_strict_daily_score(tmp_path)
+    assert score_record_is_manifest_bound(state, ScoreRecord.model_validate(row))
+
+    mutations = []
+    for top_field in ("book", "specialists", "decision_book_sha256", "decision_reads_sha256"):
+        candidate = json.loads(json.dumps(row))
+        candidate.pop(top_field)
+        mutations.append(candidate)
+    candidate = json.loads(json.dumps(row))
+    candidate["book"].pop("decision_kind")
+    mutations.append(candidate)
+    candidate = json.loads(json.dumps(row))
+    candidate["specialists"]["technical"].pop("conv_weighted_edge")
+    mutations.append(candidate)
+    candidate = json.loads(json.dumps(row))
+    candidate["unrecognized_learning_claim"] = True
+    mutations.append(candidate)
+
+    for candidate in mutations:
+        path.write_text(json.dumps(candidate) + "\n")
+        with pytest.raises(ValueError, match="invalid scorecard row"):
+            scored_cycles(memory, state_dir=state)
+    path.write_text(json.dumps(row) + "\n")
+
+
+@pytest.mark.parametrize(
+    "fixture_kwargs",
+    [
+        {"outcome_report_ts": "2026-08-02T00:08:00+00:00"},
+        {"outcome_meta_ts": "2026-08-02T00:08:00+00:00"},
+    ],
+    ids=("report-timestamp", "meta-timestamp"),
+)
+def test_canonical_daily_score_refuses_mismatched_outcome_timestamps(
+    tmp_path, fixture_kwargs
+):
+    state, memory, _path, _row, marks, outcome_ts = _seed_strict_daily_score(
+        tmp_path, score=False, **fixture_kwargs
+    )
+
+    with pytest.raises(ValueError, match="invalid committed scoring marks"):
+        canonical_daily_score_observation(state, 1)
+    scoring_sha256 = json.loads(
+        (cycle_dir(state, 2, cadence="rebal") / "complete.json").read_text()
+    )["manifest"]["artifact_sha256"]["scoring_marks"]
+    with pytest.raises(ValueError, match="invalid committed scoring marks"):
+        score_previous_cycle(
+            state,
+            memory,
+            scored_cycle=1,
+            cur_marks=marks,
+            now=outcome_ts,
+            btc_symbol="BTC/USDT:USDT",
+            outcome_observation_cycle=2,
+            outcome_scoring_marks_sha256=scoring_sha256,
+        )
+
+
+def test_canonical_daily_score_refuses_evidence_mark_conflicting_with_scoring_marks(
+    tmp_path,
+):
+    state, memory, _path, _row, marks, outcome_ts = _seed_strict_daily_score(
+        tmp_path,
+        score=False,
+        outcome_evidence_marks={
+            "A": 109.0,
+            "BTC/USDT:USDT": 102.0,
+            "ETH/USDT:USDT": 55.0,
+        },
+        normalize_scoring_evidence=False,
+    )
+
+    with pytest.raises(ValueError, match="invalid committed scoring marks"):
+        canonical_daily_score_observation(state, 1)
+    scoring_sha256 = json.loads(
+        (cycle_dir(state, 2, cadence="rebal") / "complete.json").read_text()
+    )["manifest"]["artifact_sha256"]["scoring_marks"]
+    with pytest.raises(ValueError, match="invalid committed scoring marks"):
+        score_previous_cycle(
+            state,
+            memory,
+            scored_cycle=1,
+            cur_marks=marks,
+            now=outcome_ts,
+            btc_symbol="BTC/USDT:USDT",
+            outcome_observation_cycle=2,
+            outcome_scoring_marks_sha256=scoring_sha256,
+        )
+
+
+def test_current_score_json_rejects_duplicate_and_nonfinite_values(tmp_path):
+    state, memory, path, row, _marks, _ts = _seed_strict_daily_score(tmp_path)
+    canonical = json.dumps(row, separators=(",", ":"))
+    malformed_rows = [
+        canonical[:-1] + ',"cycle":1}',
+        canonical.replace('"book":{', '"book":{"n_legs":0,', 1),
+        canonical.replace('"evaluation_horizon_hours":24.0', '"evaluation_horizon_hours":NaN'),
+        canonical.replace('"evaluation_horizon_hours":24.0', '"evaluation_horizon_hours":Infinity'),
+    ]
+
+    for malformed in malformed_rows:
+        path.write_text(malformed + "\n")
+        with pytest.raises(ValueError, match="invalid scorecard row"):
+            scored_cycles(memory, state_dir=state)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "wrong_value"),
+    [
+        (("score_schema_version",), 2.0),
+        (("cycle",), "1"),
+        (("adv_accepted",), 1),
+        (("book", "n_legs"), "1"),
+        (("specialists", "technical", "n_scored"), "1"),
+    ],
+)
+def test_current_score_json_rejects_coercible_wrong_types(
+    tmp_path, field_path, wrong_value
+):
+    state, memory, path, row, _marks, _ts = _seed_strict_daily_score(tmp_path)
+    cursor = row
+    for field in field_path[:-1]:
+        cursor = cursor[field]
+    cursor[field_path[-1]] = wrong_value
+    path.write_text(json.dumps(row) + "\n")
+
+    with pytest.raises(ValueError, match="invalid scorecard row"):
+        scored_cycles(memory, state_dir=state)
+
+
+def test_current_score_rejects_row_selected_benchmark_and_later_outcome(tmp_path, monkeypatch):
+    import futures_fund.reflection as reflection
+
+    state, _memory, _path, row, outcome_marks, outcome_ts = _seed_strict_daily_score(tmp_path)
+    eth = "ETH/USDT:USDT"
+    with monkeypatch.context() as context:
+        context.setattr(reflection, "CANONICAL_BTC_SYMBOL", eth)
+        alternate_benchmark = _build_score_record(
+            state,
+            scored_cycle=1,
+            cur_marks=outcome_marks,
+            now=outcome_ts,
+            btc_symbol=eth,
+            cadence="rebal",
+            outcome_observation_cycle=2,
+            outcome_scoring_marks_sha256=row["outcome_scoring_marks_sha256"],
+            outcome_provenance="manifest_bound",
+        )
+    assert not score_record_is_manifest_bound(state, alternate_benchmark)
+
+    later_ts = "2026-08-03T00:07:00+00:00"
+    later_marks = {"A": 90.0, "BTC/USDT:USDT": 101.0, eth: 52.0}
+    _seed_cycle(
+        state,
+        3,
+        marks=later_marks,
+        betas={"A": 0.5, "BTC/USDT:USDT": 1.0, eth: 0.8},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 3, "decision_ts": later_ts},
+    )
+    _commit_seeded_cycle(state, 3, {"as_of_ts": later_ts, "marks": later_marks})
+    later_sha = json.loads(
+        (cycle_dir(state, 3, cadence="rebal") / "complete.json").read_text()
+    )["manifest"]["artifact_sha256"]["scoring_marks"]
+    later = _build_score_record(
+        state,
+        scored_cycle=1,
+        cur_marks=later_marks,
+        now=later_ts,
+        btc_symbol="BTC/USDT:USDT",
+        cadence="rebal",
+        outcome_observation_cycle=3,
+        outcome_scoring_marks_sha256=later_sha,
+        outcome_provenance="manifest_bound",
+    )
+    assert not score_record_is_manifest_bound(state, later)
+
+
+def test_canonical_daily_score_skips_incomplete_mark_packet(tmp_path):
+    state2 = str(tmp_path / "state")
+    btc = "BTC/USDT:USDT"
+    _seed_cycle(
+        state2,
+        1,
+        marks={"A": 100.0, btc: 100.0},
+        betas={"A": 1.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": "2026-08-01T00:07:00+00:00"},
+    )
+    _commit_seeded_cycle(state2, 1)
+    for cycle, ts, scoring in (
+        (2, "2026-08-02T00:07:00+00:00", {btc: 102.0}),
+        (3, "2026-08-03T00:07:00+00:00", {"A": 110.0, btc: 103.0}),
+    ):
+        _seed_cycle(
+            state2,
+            cycle,
+            marks=scoring,
+            betas={"A": 1.0, btc: 1.0},
+            reads={"sentiment": [], "technical": [], "futures": []},
+            book={"legs": []},
+            adversary={"accept": True},
+            report={"cycle": cycle, "decision_ts": ts},
+        )
+        _commit_seeded_cycle(state2, cycle, {"as_of_ts": ts, "marks": scoring})
+    observation = canonical_daily_score_observation(state2, 1)
+    assert observation is not None and observation[0] == 3
 
 
 def test_leg_forecast_waits_for_declared_horizon_and_first_mature_mark_is_immutable(tmp_path):
@@ -1051,6 +1359,195 @@ def test_desk_score_seals_schema_normalized_recurrence_packet(tmp_path):
             json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     )
+
+
+def test_score_scan_recomputes_recurrences_after_scorecard_only_crash(tmp_path, monkeypatch):
+    import futures_fund.reflection as reflection
+
+    state, memory, _path, _row, _marks, _outcome_ts = _seed_strict_daily_score(
+        tmp_path, score=False
+    )
+    original_write = reflection._write_scorecard
+
+    def crash_after_scorecard(path, records):
+        original_write(path, records)
+        raise RuntimeError("crash after scorecard persistence")
+
+    monkeypatch.setattr(reflection, "_write_scorecard", crash_after_scorecard)
+    with pytest.raises(RuntimeError, match="crash after scorecard persistence"):
+        score_eligible_completed_cycles(
+            state,
+            memory,
+            btc_symbol="BTC/USDT:USDT",
+            active_calibration_roles=set(),
+        )
+    persisted = (Path(memory) / "scorecard.jsonl").read_bytes()
+
+    monkeypatch.setattr(reflection, "_write_scorecard", original_write)
+    original_detect = reflection.detect_recurrences
+    replayed_cycles: list[list[int]] = []
+
+    def capture_replay(records, **kwargs):
+        replayed_cycles.append([record.cycle for record in records])
+        return original_detect(records, **kwargs)
+
+    monkeypatch.setattr(reflection, "detect_recurrences", capture_replay)
+    retry = score_eligible_completed_cycles(
+        state,
+        memory,
+        btc_symbol="BTC/USDT:USDT",
+        active_calibration_roles=set(),
+    )
+
+    assert retry["scored_cycles"] == []
+    assert retry["recurrence_refresh_cycle"] == 1
+    assert replayed_cycles == [[1]]
+    assert (Path(memory) / "scorecard.jsonl").read_bytes() == persisted
+
+
+def _pending_score_packet(tmp_path, *, cycle: int = 7):
+    from scripts import desk_score
+
+    _role_file(tmp_path, "pm", "protected")
+    state = tmp_path / "state"
+    memory = tmp_path / "memory"
+    agents = tmp_path / "agents"
+    bootstrap_reflector_heads(agents, memory / "reflector-journal.md")
+    pending = memory / "pending" / str(cycle)
+    pending.mkdir(parents=True)
+    now = datetime.now().astimezone().isoformat()
+    scoring = {
+        "as_of_ts": now,
+        "marks": {"BTC/USDT:USDT": 100_000.0},
+    }
+    meta = {
+        "cycle": cycle,
+        "now": now,
+        "btc_symbol": "BTC/USDT:USDT",
+        "scoring_marks_sha256": canonical_json_sha256(scoring),
+    }
+    (pending / "scoring_marks.json").write_text(json.dumps(scoring))
+    (pending / "meta.json").write_text(json.dumps(meta))
+    (memory / "pending" / "current.json").write_text(
+        json.dumps({"cycle": cycle, "dir": str(pending.resolve())})
+    )
+    argv = [
+        "--state-dir",
+        str(state),
+        "--memory-dir",
+        str(memory),
+        "--agents-dir",
+        str(agents),
+    ]
+    return desk_score, state, memory, pending, argv
+
+
+def test_desk_score_recovers_seal_before_authority_and_same_dir_consumed_retry(tmp_path):
+    from futures_fund.reflection import (
+        reflection_authority_recovery_status,
+        write_reflection_authority_consumption,
+    )
+
+    desk_score, state, memory, pending, argv = _pending_score_packet(tmp_path)
+    recurrences = [
+        {
+            "kind": "pm_negative_alpha",
+            "role": "pm",
+            "count": 3,
+            "window": 6,
+            "evidence": ["bound"],
+            "suggestion": "review",
+        }
+    ]
+    (pending / "recurrences.json").write_text(json.dumps(recurrences))
+    prepared_sha256 = _seal_recurrences(pending)
+
+    # Simulate a host crash after the immutable pending seal and before authority publication.
+    assert desk_score.main(argv) == 0
+    assert json.loads((pending / "recurrences.json").read_text()) == recurrences
+    assert (pending / "recurrences.sha256").read_text().strip() == prepared_sha256
+    assert reflection_authority_recovery_status(state, memory, 7)["status"] == "unconsumed"
+
+    write_reflection_authority_consumption(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=prepared_sha256,
+        outcome="no_head_change",
+    )
+    (pending / "reflection.json").write_text(json.dumps({"edits": []}))
+
+    # A same-directory retry must not collide with the old non-empty seal or expose the proposal a
+    # second time. The immutable authority/consumption pair is the permission for this rotation.
+    assert desk_score.main(argv) == 0
+    assert json.loads((pending / "recurrences.json").read_text()) == []
+    assert (pending / "recurrences.sha256").read_text().strip() == canonical_json_sha256([])
+    assert not (pending / "reflection.json").exists()
+    assert reflection_authority_recovery_status(state, memory, 7)["status"] == "consumed"
+
+
+@pytest.mark.parametrize(
+    "crash_primitive",
+    ["durable_unlink", "durable_write_text", "seal_publish"],
+)
+def test_consumed_recurrence_rotation_recovers_every_durable_boundary(
+    tmp_path, monkeypatch, crash_primitive
+):
+    from futures_fund.reflection import write_reflection_authority_consumption
+
+    desk_score, state, memory, pending, argv = _pending_score_packet(tmp_path)
+    recurrences = [
+        {
+            "kind": "pm_negative_alpha",
+            "role": "pm",
+            "count": 3,
+            "window": 6,
+            "evidence": ["bound"],
+            "suggestion": "review",
+        }
+    ]
+    (pending / "recurrences.json").write_text(json.dumps(recurrences))
+    prepared_sha256 = _seal_recurrences(pending)
+    assert desk_score.main(argv) == 0
+    write_reflection_authority_consumption(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=prepared_sha256,
+        outcome="no_head_change",
+    )
+
+    primitive_name = (
+        "durable_write_text" if crash_primitive == "seal_publish" else crash_primitive
+    )
+    original = getattr(desk_score, primitive_name)
+    crashed = False
+
+    def crash_once_after_operation(*args, **kwargs):
+        nonlocal crashed
+        result = original(*args, **kwargs)
+        is_selected_write = (
+            crash_primitive != "seal_publish"
+            or Path(args[0]).name == "recurrences.sha256"
+        )
+        if not crashed and is_selected_write:
+            crashed = True
+            raise OSError(f"crash after {crash_primitive}")
+        return result
+
+    monkeypatch.setattr(desk_score, primitive_name, crash_once_after_operation)
+    with pytest.raises(OSError, match=f"crash after {crash_primitive}"):
+        desk_score._recover_reflection_authority_packet(
+            str(state), str(memory), pending, 7
+        )
+
+    recovered = desk_score._recover_reflection_authority_packet(
+        str(state), str(memory), pending, 7
+    )
+    assert recovered["reflection_authority_recovery"] == "consumed"
+    assert recovered["recurrences"] == []
+    assert json.loads((pending / "recurrences.json").read_text()) == []
+    assert (pending / "recurrences.sha256").read_text().strip() == canonical_json_sha256([])
 
 
 def test_reflection_rejects_unsealed_or_mutated_recurrence_authority(tmp_path):

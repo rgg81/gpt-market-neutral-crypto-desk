@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal
+import math
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from futures_fund.desk_contracts import Book, CandidateReview, SpecialistRead
 
@@ -22,6 +23,8 @@ LAX_NET_EDGE_FRAC = -0.005  # accepted book whose strategy net edge < -0.5% of g
 # => adversary too lax
 PM_NET_EDGE_FRAC = -0.0025  # only material (< -25bps) strategy losses tune the carry PM
 _SCHEDULED_HORIZON_TOLERANCE_HOURS = 5.0 / 60.0
+CURRENT_SCORE_SCHEMA_VERSION = 2
+SCORECARD_MIGRATION_WAL_FILE = "scorecard-migration-v2.wal.json"
 
 
 def forward_returns(marks_prev: dict[str, float], marks_now: dict[str, float]) -> dict[str, float]:
@@ -36,6 +39,8 @@ def forward_returns(marks_prev: dict[str, float], marks_now: dict[str, float]) -
 
 
 class SpecialistScore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str
     n_available: int = 0
     n_scored: int = 0
@@ -79,6 +84,8 @@ def score_specialist(
 
 
 class BookScore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     n_legs: int = 0
     gross_notional: float = 0.0
     alpha_n_legs: int = 0
@@ -128,6 +135,8 @@ class CandidateOpportunityScore(BaseModel):
     The causal label is never inferred. ``gate_causal_claim`` is true only when the bound PM
     explicitly wrote ``exclusion_reason='entry_gate'`` before the outcome was known.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     candidate_sha256: str
     symbol: str
@@ -402,6 +411,12 @@ def classify_objections(objections: list[str]) -> list[str]:
 
 
 class ScoreRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Rows written before this discriminator existed intentionally parse as ``None`` so they can
+    # be inspected by the one-time audited migration. They are never accepted as current learning
+    # evidence merely because Pydantic supplied newer fields at their defaults.
+    score_schema_version: Literal[CURRENT_SCORE_SCHEMA_VERSION] | None = None
     cycle: int
     btc_symbol: str = "BTC/USDT:USDT"
     scored_at: str = ""
@@ -446,6 +461,50 @@ class ScoreRecord(BaseModel):
         if not self.btc_symbol:
             raise ValueError("manifest-bound score requires btc_symbol")
         return self
+
+
+def _reject_duplicate_score_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate score JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_score_constant(value: str) -> None:
+    raise ValueError(f"non-finite score JSON number: {value}")
+
+
+def _assert_finite_score_json(value: object) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite score JSON number")
+    if isinstance(value, dict):
+        for child in value.values():
+            _assert_finite_score_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_finite_score_json(child)
+
+
+def parse_score_record_json(value: str) -> ScoreRecord:
+    """Parse one score row without ambiguous duplicate/non-finite JSON semantics."""
+    try:
+        raw = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_score_pairs,
+            parse_constant=_reject_nonfinite_score_constant,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("malformed score JSON") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("score JSON must be an object")
+    _assert_finite_score_json(raw)
+    if raw.get("score_schema_version") is not None and type(
+        raw["score_schema_version"]
+    ) is not int:
+        raise ValueError("score_schema_version must be an integer")
+    return ScoreRecord.model_validate(raw, strict=True)
 
 
 class Recurrence(BaseModel):
