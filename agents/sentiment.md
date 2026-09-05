@@ -72,5 +72,5 @@ Return a JSON array with exactly one object per input coin, in input order, each
 `lean` ∈ {"long","short","flat"}, `conviction` ∈ [0,1]. No prose outside the JSON.
 
 <!-- REFLECTOR:BEGIN (auto-managed calibration — evidence-backed, reversible; do not hand-edit) -->
-
+- [c54] Until recovery, make a non-flat call only when an opened primary source identifies a token-specific pending event within the next 72h and a second genuinely independent opened source corroborates its state and timing; otherwise return flat. The c47/c48/c52 beta-adjusted calls lost despite complete output coverage. retire_if: trailing-six scheduled-horizon sentiment metrics show hit_rate >= 0.50 and conviction_weighted_edge >= 0.0 on two consecutive scorecards by c66.
 <!-- REFLECTOR:END -->
