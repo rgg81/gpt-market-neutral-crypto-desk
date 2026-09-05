@@ -40,6 +40,26 @@ def test_attestation_requires_a_new_manifest_complete_cycle(tmp_path):
     assert len(receipt["complete_marker_sha256"]) == 64
 
 
+def test_attestation_reports_completed_cycle_with_retryable_directive_finalization(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    _commit(state, 1, NOW)
+    monkeypatch.setattr(
+        "scripts.desk_cycle_outcome.finalize_cycle_directive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unlink interrupted")),
+    )
+
+    receipt, valid = attest_cycle_outcome(
+        state, before_cycle=0, now=NOW + timedelta(minutes=1)
+    )
+
+    assert valid is False
+    assert receipt["outcome"] == "COMPLETED_DIRECTIVE_FINALIZATION_PENDING"
+    assert receipt["after_cycle"] == 1
+    assert receipt["error"] == "unlink interrupted"
+
+
 def test_attestation_accepts_only_an_early_noop_without_a_new_cycle(tmp_path):
     state = tmp_path / "state"
     _commit(state, 1, NOW)

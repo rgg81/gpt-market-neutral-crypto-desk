@@ -82,6 +82,7 @@ def test_launcher_pins_sol_xhigh_and_supports_real_subagents():
     assert "exit=0 rejected by outcome attestation" in launcher
     assert '"${1:-}" == "--probe-only"' in launcher
     assert "scripts/ensure_binance_proxy.py --probe-only" in launcher
+    assert "--memory-dir live_memory --agents-dir agents --probe-existing" in launcher
     assert "BINANCE_PROXY_EXTERNAL_MANAGER" in launcher
     assert "systemd-owned Binance proxy did not become ready" in launcher
     assert "PROBE_OK read_only=true" in launcher

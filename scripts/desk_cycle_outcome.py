@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from futures_fund.directives import finalize_cycle_directive
 from futures_fund.durable_io import durable_write_json, file_sha256
 from futures_fund.reconcile_commit import completed_cycle_numbers
 from scripts.desk_watchdog import classify, last_cycle_ts
@@ -36,12 +37,26 @@ def attest_cycle_outcome(
     }
     if after_cycle == before_cycle + 1:
         marker = state / "rebal" / "cycle" / str(after_cycle) / "complete.json"
+        try:
+            directive_finalization = finalize_cycle_directive(state, after_cycle)
+        except Exception as exc:  # noqa: BLE001 - completion stands; finalization must be retried
+            return (
+                {
+                    **base,
+                    "outcome": "COMPLETED_DIRECTIVE_FINALIZATION_PENDING",
+                    "complete_marker": str(marker),
+                    "complete_marker_sha256": file_sha256(marker),
+                    "error": str(exc),
+                },
+                False,
+            )
         return (
             {
                 **base,
                 "outcome": "COMPLETED",
                 "complete_marker": str(marker),
                 "complete_marker_sha256": file_sha256(marker),
+                "directive_claim_finalization": directive_finalization,
             },
             True,
         )

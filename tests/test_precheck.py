@@ -12,10 +12,13 @@ import pytest
 from pydantic import ValidationError
 
 from futures_fund.desk_contracts import AdversaryVerdict, Book, BookLeg
+from futures_fund.durable_io import canonical_json_sha256
 from futures_fund.precheck import (
     MAX_PAYBACK_FUNDING_INTERVALS,
     PrecheckMetrics,
+    PriorBookLineage,
     compute_precheck,
+    load_prior_book_lineage,
     precheck_sha256,
 )
 from futures_fund.slippage import ExecutionRealism
@@ -1153,6 +1156,652 @@ def test_b9_caps_aggressive_changes_without_trapping_material_risk_reductions():
     assert next(b for b in m.bounds if b.bound_id == "B9").ok
 
 
+def _cold_start_book(symbols: list[str], *, hedge_symbol: str | None = None) -> Book:
+    split = len(symbols) // 2
+    sides = ["long"] * split + ["short"] * (len(symbols) - split)
+    if len(symbols) == 3:
+        notionals = [4_000.0, 2_000.0, 2_000.0]
+    elif len(symbols) == 5:
+        notionals = [4_500.0, 4_500.0, 3_000.0, 3_000.0, 3_000.0]
+    else:
+        notionals = [4_000.0] * len(symbols)
+    return Book(
+        controlled_restart_origin_cycle=10,
+        controlled_restart_phase=True,
+        legs=[
+            BookLeg(
+                symbol=symbol,
+                side=side,
+                seat_role="hedge" if symbol == hedge_symbol else "alpha",
+                target_notional=notional,
+                is_new=True,
+                hold_breaking_reason="tested cold-start entry",
+                expected_price_edge_frac=0.02 if symbol != hedge_symbol else 0.0,
+            )
+            for symbol, side, notional in zip(symbols, sides, notionals, strict=True)
+        ],
+        stated_deploy_frac=sum(notionals) / 20_000.0,
+        stated_dollar_residual_frac=0.0,
+        stated_beta_residual=0.0,
+        turnover_legs_changed=len(symbols),
+    )
+
+
+def _cold_start_evidence(symbols: list[str]) -> list[dict]:
+    return [
+        _ev(symbol, 1.0, 1.0, curve={"5k": 1.0})
+        for symbol in symbols
+    ]
+
+
+def _cold_start_risk_model(symbols: list[str]) -> dict:
+    return {
+        "available": True,
+        "residual_vol_ewma_shrunk_annualized": {symbol: 0.20 for symbol in symbols},
+        "covariance_ewma_shrunk_annualized": {
+            left: {
+                right: 0.04 if left == right else 0.0
+                for right in symbols
+            }
+            for left in symbols
+        },
+    }
+
+
+def test_exactly_flat_four_non_btc_alpha_entries_receive_the_b9_cold_start_limit():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    b9 = next(bound for bound in metrics.bounds if bound.bound_id == "B9")
+    assert metrics.schema_version == 9
+    assert metrics.risk_model_available is True
+    assert metrics.cold_start_reentry_eligible is True
+    assert metrics.b9_aggressive_change_limit == 4
+    assert metrics.controlled_restart_origin_cycle == 10
+    assert metrics.controlled_restart_phase is True
+    assert metrics.controlled_restart_initial_eligible is True
+    assert metrics.controlled_restart_continuation_eligible is False
+    assert metrics.controlled_restart_lineage_valid is True
+    assert metrics.turnover_aggressive_legs_changed == 4
+    assert b9.limit == "<= 4"
+    assert b9.ok
+
+
+def test_flat_inventory_nonempty_book_without_restart_lineage_is_invalid():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    unbound_book = _cold_start_book(symbols).model_copy(update={
+        "controlled_restart_origin_cycle": None,
+        "controlled_restart_phase": False,
+    })
+    metrics = compute_precheck(
+        unbound_book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is True
+    assert metrics.controlled_restart_initial_eligible is False
+    assert metrics.controlled_restart_lineage_valid is False
+
+
+def test_binding_directive_uses_distinct_false_null_lineage_path():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    directive_book = _cold_start_book(symbols).model_copy(update={
+        "controlled_restart_origin_cycle": None,
+        "controlled_restart_phase": False,
+    })
+    metrics = compute_precheck(
+        directive_book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+        binding_user_directive_present=True,
+    )
+
+    assert metrics.binding_user_directive_present is True
+    assert metrics.controlled_restart_initial_eligible is False
+    assert metrics.controlled_restart_lineage_valid is True
+
+    laundered = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+        binding_user_directive_present=True,
+    )
+    assert laundered.controlled_restart_initial_eligible is False
+    assert laundered.controlled_restart_lineage_valid is False
+
+
+def test_typed_restart_graduation_scope_requires_a_bound_directive():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    with pytest.raises(ValueError, match="requires a bound directive"):
+        compute_precheck(
+            _cold_start_book(symbols),
+            _cold_start_evidence(symbols),
+            cash=20_000.0,
+            cycle=10,
+            current_book=[],
+            risk_model=_cold_start_risk_model(symbols),
+            binding_user_directive_controlled_restart_graduation=True,
+        )
+
+
+def test_empty_inventory_cannot_replace_an_active_prior_restart_origin():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    active_prior = PriorBookLineage(
+        cycle=9,
+        book_sha256="9" * 64,
+        controlled_restart_origin_cycle=9,
+        controlled_restart_phase=True,
+    )
+    replacement = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=active_prior,
+    )
+    assert replacement.controlled_restart_initial_eligible is False
+    assert replacement.controlled_restart_continuation_eligible is False
+    assert replacement.controlled_restart_lineage_valid is False
+
+    explicit_end = compute_precheck(
+        Book(),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=active_prior,
+    )
+    assert explicit_end.controlled_restart_lineage_valid is True
+
+
+def test_active_prior_lineage_loader_requires_manifest_bound_valid_precheck(
+    tmp_path, monkeypatch
+):
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    book = _cold_start_book(symbols)
+    precheck = compute_precheck(
+        book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+    directory = tmp_path / "rebal" / "cycle" / "10"
+    directory.mkdir(parents=True)
+    (directory / "complete.json").write_text("{}")
+    book_payload = book.model_dump(mode="json")
+    precheck_payload = precheck.model_dump(mode="json")
+    (directory / "book.json").write_text(json.dumps(book_payload))
+    (directory / "precheck.json").write_text(json.dumps(precheck_payload))
+
+    monkeypatch.setattr(
+        "futures_fund.reconcile_commit.cycle_is_complete", lambda *args, **kwargs: True
+    )
+
+    def artifact_sha(_state, _cycle, artifact, **_kwargs):
+        return canonical_json_sha256(
+            book_payload if artifact == "book" else precheck_payload
+        )
+
+    monkeypatch.setattr(
+        "futures_fund.reconcile_commit.completed_artifact_sha256", artifact_sha
+    )
+    loaded = load_prior_book_lineage(tmp_path, before_cycle=11)
+    assert loaded is not None
+    assert loaded.controlled_restart_origin_cycle == 10
+    assert loaded.controlled_restart_phase is True
+
+    omitted = dict(precheck_payload)
+    omitted.pop("controlled_restart_prior_phase")
+    (directory / "precheck.json").write_text(json.dumps(omitted))
+
+    def omitted_artifact_sha(_state, _cycle, artifact, **_kwargs):
+        return canonical_json_sha256(book_payload if artifact == "book" else omitted)
+
+    monkeypatch.setattr(
+        "futures_fund.reconcile_commit.completed_artifact_sha256",
+        omitted_artifact_sha,
+    )
+    with pytest.raises(ValueError, match="unauthenticated"):
+        load_prior_book_lineage(tmp_path, before_cycle=11)
+
+    forward = {**precheck_payload, "schema_version": 999, "sha256": ""}
+    forward["sha256"] = precheck_sha256(PrecheckMetrics.model_validate(forward))
+    (directory / "precheck.json").write_text(json.dumps(forward))
+
+    def forward_artifact_sha(_state, _cycle, artifact, **_kwargs):
+        return canonical_json_sha256(book_payload if artifact == "book" else forward)
+
+    monkeypatch.setattr(
+        "futures_fund.reconcile_commit.completed_artifact_sha256",
+        forward_artifact_sha,
+    )
+    with pytest.raises(ValueError, match="unauthenticated"):
+        load_prior_book_lineage(tmp_path, before_cycle=11)
+
+    tampered = {**precheck_payload, "controlled_restart_lineage_valid": False}
+    (directory / "precheck.json").write_text(json.dumps(tampered))
+
+    def tampered_artifact_sha(_state, _cycle, artifact, **_kwargs):
+        return canonical_json_sha256(book_payload if artifact == "book" else tampered)
+
+    monkeypatch.setattr(
+        "futures_fund.reconcile_commit.completed_artifact_sha256",
+        tampered_artifact_sha,
+    )
+    with pytest.raises(ValueError, match="unauthenticated"):
+        load_prior_book_lineage(tmp_path, before_cycle=11)
+
+
+def test_controlled_restart_continuation_preserves_manifest_bound_origin():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    book = _cold_start_book(symbols)
+    for leg in book.legs:
+        leg.is_new = False
+        leg.hold_breaking_reason = ""
+    book.turnover_legs_changed = 0
+    current = [
+        {
+            "symbol": leg.symbol,
+            "side": leg.side,
+            "target_notional": leg.target_notional,
+            "seat_role": leg.seat_role,
+        }
+        for leg in book.legs
+    ]
+    prior = PriorBookLineage(
+        cycle=10,
+        book_sha256="a" * 64,
+        controlled_restart_origin_cycle=10,
+        controlled_restart_phase=True,
+    )
+
+    metrics = compute_precheck(
+        book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=11,
+        current_book=current,
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=prior,
+    )
+
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.controlled_restart_initial_eligible is False
+    assert metrics.controlled_restart_continuation_eligible is True
+    assert metrics.controlled_restart_lineage_valid is True
+    assert metrics.controlled_restart_prior_cycle == 10
+    assert metrics.controlled_restart_prior_book_sha256 == "a" * 64
+    assert metrics.controlled_restart_prior_origin_cycle == 10
+    assert metrics.controlled_restart_prior_phase is True
+
+
+@pytest.mark.parametrize("origin", [9, 11, 12])
+def test_nonempty_restart_cannot_invent_or_change_manifest_origin(origin):
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    book = _cold_start_book(symbols).model_copy(
+        update={"controlled_restart_origin_cycle": origin}
+    )
+    prior = PriorBookLineage(
+        cycle=10,
+        book_sha256="b" * 64,
+        controlled_restart_origin_cycle=10,
+        controlled_restart_phase=True,
+    )
+
+    metrics = compute_precheck(
+        book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=11,
+        current_book=[{
+            "symbol": symbols[0],
+            "side": "long",
+            "target_notional": 4_000.0,
+            "seat_role": "alpha",
+        }],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=prior,
+    )
+
+    assert metrics.controlled_restart_initial_eligible is False
+    assert metrics.controlled_restart_continuation_eligible is False
+    assert metrics.controlled_restart_lineage_valid is False
+
+
+def test_ended_restart_cannot_reactivate_while_inventory_remains_nonempty():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    prior = PriorBookLineage(
+        cycle=10,
+        book_sha256="c" * 64,
+        controlled_restart_origin_cycle=None,
+        controlled_restart_phase=False,
+    )
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=11,
+        current_book=[{
+            "symbol": symbols[0],
+            "side": "long",
+            "target_notional": 4_000.0,
+            "seat_role": "alpha",
+        }],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=prior,
+    )
+
+    assert metrics.controlled_restart_continuation_eligible is False
+    assert metrics.controlled_restart_lineage_valid is False
+
+
+def test_active_restart_cannot_clear_phase_while_proposed_book_remains_nonempty():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    active_prior = PriorBookLineage(
+        cycle=10,
+        book_sha256="d" * 64,
+        controlled_restart_origin_cycle=10,
+        controlled_restart_phase=True,
+    )
+    ended_book = _cold_start_book(symbols).model_copy(update={
+        "controlled_restart_origin_cycle": None,
+        "controlled_restart_phase": False,
+    })
+    escaped = compute_precheck(
+        ended_book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=11,
+        current_book=[{
+            "symbol": symbols[0],
+            "side": "long",
+            "target_notional": 4_000.0,
+            "seat_role": "alpha",
+        }],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=active_prior,
+    )
+    assert escaped.controlled_restart_phase is False
+    assert escaped.controlled_restart_lineage_valid is False
+
+
+def test_fully_flat_book_explicitly_ends_restart_and_future_flat_state_gets_new_origin():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    active_prior = PriorBookLineage(
+        cycle=10,
+        book_sha256="d" * 64,
+        controlled_restart_origin_cycle=10,
+        controlled_restart_phase=True,
+    )
+    ended = compute_precheck(
+        Book(legs=[], turnover_legs_changed=4),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=11,
+        current_book=[{
+            "symbol": symbols[0],
+            "side": "long",
+            "target_notional": 4_000.0,
+            "seat_role": "alpha",
+        }],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=active_prior,
+    )
+    assert ended.controlled_restart_phase is False
+    assert ended.controlled_restart_lineage_valid is True
+
+    new_book = _cold_start_book(symbols).model_copy(
+        update={"controlled_restart_origin_cycle": 12}
+    )
+    new_origin = compute_precheck(
+        new_book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=12,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+        prior_book_lineage=PriorBookLineage(
+            cycle=11,
+            book_sha256="e" * 64,
+            controlled_restart_origin_cycle=None,
+            controlled_restart_phase=False,
+        ),
+    )
+    assert new_origin.controlled_restart_initial_eligible is True
+    assert new_origin.controlled_restart_lineage_valid is True
+
+
+def test_active_restart_cannot_flatten_without_explicitly_ending_phase():
+    with pytest.raises(ValidationError, match="requires a non-empty Book"):
+        Book(
+            controlled_restart_origin_cycle=10,
+            controlled_restart_phase=True,
+            legs=[],
+            turnover_legs_changed=1,
+        )
+
+
+def test_exactly_flat_five_non_btc_alpha_entries_still_fail_b9():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCDE"]
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is True
+    assert metrics.b9_aggressive_change_limit == 4
+    assert metrics.turnover_aggressive_legs_changed == 5
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+@pytest.mark.parametrize("seat_count", [1, 2, 3])
+def test_cold_start_one_to_three_seats_cannot_bypass_unchanged_b4(seat_count):
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABC"[:seat_count]]
+    book = _cold_start_book(symbols)
+    metrics = compute_precheck(
+        book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is True
+    assert next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B4").ok
+
+
+def test_nonflat_inventory_keeps_the_ordinary_b9_limit():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    book = _cold_start_book(symbols)
+    book.legs[0].is_new = False
+    book.legs[0].hold_breaking_reason = ""
+    current = [{
+        "symbol": symbols[0],
+        "side": book.legs[0].side,
+        "target_notional": book.legs[0].target_notional,
+        "seat_role": "alpha",
+    }]
+
+    metrics = compute_precheck(
+        book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=current,
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert metrics.turnover_aggressive_legs_changed == 3
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+def test_dust_inventory_is_not_treated_as_an_empty_cold_start():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    dust_symbol = "DUST/USDT:USDT"
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence([*symbols, dust_symbol]),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[{
+            "symbol": dust_symbol,
+            "side": "long",
+            "target_notional": 0.01,
+            "seat_role": "alpha",
+        }],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert metrics.turnover_aggressive_legs_changed == 4
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+def test_omitted_inventory_is_not_proof_of_an_empty_cold_start():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+def test_proposed_btc_hedge_cannot_activate_the_cold_start_limit():
+    symbols = [
+        "A/USDT:USDT",
+        "B/USDT:USDT",
+        "C/USDT:USDT",
+        "BTC/USDT:USDT",
+    ]
+    metrics = compute_precheck(
+        _cold_start_book(symbols, hedge_symbol="BTC/USDT:USDT"),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert metrics.turnover_aggressive_legs_changed == 4
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+def test_hedge_to_alpha_role_activation_keeps_the_ordinary_b9_limit():
+    symbols = [
+        "A/USDT:USDT",
+        "B/USDT:USDT",
+        "C/USDT:USDT",
+        "BTC/USDT:USDT",
+    ]
+    book = _cold_start_book(symbols)
+    book.legs[-1].is_new = False
+    book.legs[-1].hold_breaking_reason = ""
+    book.turnover_legs_changed = 3
+    current = [{
+        "symbol": "BTC/USDT:USDT",
+        "side": book.legs[-1].side,
+        "target_notional": book.legs[-1].target_notional,
+        "seat_role": "hedge",
+    }]
+
+    metrics = compute_precheck(
+        book,
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=current,
+        risk_model=_cold_start_risk_model(symbols),
+    )
+
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert metrics.turnover_aggressive_legs_changed == 4
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+def test_unavailable_risk_model_keeps_flat_four_entry_book_at_the_ordinary_b9_limit():
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model={"available": False, "unavailable_reason": "test feed unavailable"},
+    )
+
+    assert metrics.risk_model_available is False
+    assert metrics.risk_model_unavailable_reason == "test feed unavailable"
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
+@pytest.mark.parametrize("covariance_defect", ["missing_symbol", "missing_pair"])
+def test_incomplete_cold_start_covariance_keeps_the_ordinary_b9_limit(covariance_defect):
+    symbols = [f"{letter}/USDT:USDT" for letter in "ABCD"]
+    risk_model = _cold_start_risk_model(symbols)
+    covariance = risk_model["covariance_ewma_shrunk_annualized"]
+    if covariance_defect == "missing_symbol":
+        covariance.pop(symbols[-1])
+    else:
+        covariance[symbols[0]].pop(symbols[-1])
+
+    metrics = compute_precheck(
+        _cold_start_book(symbols),
+        _cold_start_evidence(symbols),
+        cash=20_000.0,
+        cycle=10,
+        current_book=[],
+        risk_model=risk_model,
+    )
+
+    assert metrics.risk_model_available is False
+    assert metrics.risk_model_unavailable_reason.startswith("missing ")
+    assert metrics.cold_start_reentry_eligible is False
+    assert metrics.b9_aggressive_change_limit == 2
+    assert not next(bound for bound in metrics.bounds if bound.bound_id == "B9").ok
+
+
 def test_more_than_two_entries_or_material_increases_still_fail_b9():
     ev = [
         _ev(f"{symbol}/USDT:USDT", 1.0, 1.0, funding_bps=2.0, curve={"2k": 1.0})
@@ -1936,7 +2585,7 @@ def test_b12_uses_the_same_depth_haircut_and_execution_reserves_as_reconcile():
         execution_realism=realism,
     )
 
-    assert metrics.schema_version == 5
+    assert metrics.schema_version == 9
     assert metrics.execution_policy_applied is True
     assert metrics.execution_displayed_depth_fraction == 0.5
     assert metrics.pretrade_legging_reserve_bps == pytest.approx(0.125)
@@ -2090,3 +2739,155 @@ def test_schema4_hash_ignores_schema5_objective_hard_ban_default():
     assert "hard_ban_violations" not in loaded.model_dump(
         mode="json", exclude_unset=True
     )
+
+
+def test_schema5_hash_ignores_schema6_cold_start_provenance_defaults():
+    metrics = compute_precheck(
+        Book(
+            legs=[
+                BookLeg(
+                    symbol="A/USDT:USDT",
+                    side="long",
+                    target_notional=1_000.0,
+                    is_new=True,
+                    hold_breaking_reason="schema replay",
+                )
+            ],
+            turnover_legs_changed=1,
+        ),
+        [_ev("A/USDT:USDT", 10.0, 1.0, curve={"2k": 1.0})],
+        cash=2_000.0,
+        cycle=2,
+        current_book=[],
+    )
+    schema5 = metrics.model_dump(mode="json")
+    schema5["schema_version"] = 5
+    schema5.pop("sha256")
+    schema5.pop("cold_start_reentry_eligible")
+    schema5.pop("b9_aggressive_change_limit")
+    schema5.pop("binding_user_directive_present")
+    schema5.pop("binding_user_directive_controlled_restart_graduation")
+    for field in (
+        "controlled_restart_origin_cycle",
+        "controlled_restart_phase",
+        "controlled_restart_initial_eligible",
+        "controlled_restart_continuation_eligible",
+        "controlled_restart_lineage_valid",
+        "controlled_restart_prior_cycle",
+        "controlled_restart_prior_book_sha256",
+        "controlled_restart_prior_origin_cycle",
+        "controlled_restart_prior_phase",
+    ):
+        schema5.pop(field)
+    expected_hash = hashlib.sha256(
+        json.dumps(schema5, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    schema5["sha256"] = expected_hash
+
+    loaded = PrecheckMetrics.model_validate(schema5)
+
+    assert precheck_sha256(loaded) == expected_hash
+    persisted = loaded.model_dump(mode="json", exclude_unset=True)
+    assert "cold_start_reentry_eligible" not in persisted
+    assert "b9_aggressive_change_limit" not in persisted
+
+
+def test_schema6_hash_ignores_schema7_controlled_restart_defaults():
+    metrics = compute_precheck(
+        Book(legs=[]),
+        [],
+        cash=2_000.0,
+        cycle=2,
+        current_book=[],
+    )
+    schema6 = metrics.model_dump(mode="json")
+    schema6["schema_version"] = 6
+    schema6.pop("sha256")
+    fields = (
+        "controlled_restart_origin_cycle",
+        "controlled_restart_phase",
+        "controlled_restart_initial_eligible",
+        "controlled_restart_continuation_eligible",
+        "controlled_restart_lineage_valid",
+        "controlled_restart_prior_cycle",
+        "controlled_restart_prior_book_sha256",
+        "controlled_restart_prior_origin_cycle",
+        "controlled_restart_prior_phase",
+    )
+    for field in fields:
+        schema6.pop(field)
+    schema6.pop("binding_user_directive_present")
+    schema6.pop("binding_user_directive_controlled_restart_graduation")
+    expected_hash = hashlib.sha256(
+        json.dumps(schema6, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    schema6["sha256"] = expected_hash
+
+    loaded = PrecheckMetrics.model_validate(schema6)
+
+    assert precheck_sha256(loaded) == expected_hash
+    persisted = loaded.model_dump(mode="json", exclude_unset=True)
+    assert all(field not in persisted for field in fields)
+
+
+def test_schema7_hash_ignores_schema8_directive_presence_default():
+    metrics = compute_precheck(
+        Book(legs=[]),
+        [],
+        cash=2_000.0,
+        cycle=2,
+        current_book=[],
+    )
+    schema7 = metrics.model_dump(mode="json")
+    schema7["schema_version"] = 7
+    schema7.pop("sha256")
+    schema7.pop("binding_user_directive_present")
+    schema7.pop("binding_user_directive_controlled_restart_graduation")
+    expected_hash = hashlib.sha256(
+        json.dumps(schema7, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    schema7["sha256"] = expected_hash
+
+    loaded = PrecheckMetrics.model_validate(schema7)
+
+    assert precheck_sha256(loaded) == expected_hash
+    assert "binding_user_directive_present" not in loaded.model_dump(
+        mode="json", exclude_unset=True
+    )
+
+
+def test_schema8_hash_ignores_schema9_typed_directive_capability_default():
+    metrics = compute_precheck(
+        Book(legs=[]),
+        [],
+        cash=2_000.0,
+        cycle=2,
+        current_book=[],
+    )
+    schema8 = metrics.model_dump(mode="json")
+    schema8["schema_version"] = 8
+    schema8.pop("sha256")
+    schema8.pop("binding_user_directive_controlled_restart_graduation")
+    expected_hash = hashlib.sha256(
+        json.dumps(schema8, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    schema8["sha256"] = expected_hash
+
+    loaded = PrecheckMetrics.model_validate(schema8)
+
+    assert precheck_sha256(loaded) == expected_hash
+    assert (
+        "binding_user_directive_controlled_restart_graduation"
+        not in loaded.model_dump(mode="json", exclude_unset=True)
+    )
+
+
+def test_historical_book_restart_defaults_and_new_shape_are_strict():
+    historical = Book.model_validate({"legs": []})
+    assert historical.controlled_restart_phase is False
+    assert historical.controlled_restart_origin_cycle is None
+
+    with pytest.raises(ValidationError, match="phase=true requires an origin"):
+        Book.model_validate({"controlled_restart_phase": True, "legs": []})
+    with pytest.raises(ValidationError, match="phase=false requires a null origin"):
+        Book.model_validate({"controlled_restart_origin_cycle": 7, "legs": []})

@@ -1,10 +1,11 @@
-"""Recover any durable PAPER reconcile intent before watchdog/evidence/heartbeat work."""
+"""Recover PAPER reconcile and claimed-directive state before watchdog/evidence/heartbeat work."""
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 
+from futures_fund.directives import recover_directive_lifecycle
 from futures_fund.heartbeat import recover_heartbeat_transaction
 from futures_fund.reconcile_commit import recover_reconcile_transaction
 
@@ -14,8 +15,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", default="live_state")
     args = parser.parse_args(argv)
     try:
+        reconcile = recover_reconcile_transaction(args.state_dir)
+        directive_lifecycle = recover_directive_lifecycle(args.state_dir)
         result = {
-            "reconcile": recover_reconcile_transaction(args.state_dir),
+            "reconcile": reconcile,
+            "directive_lifecycle": directive_lifecycle,
             "heartbeat": recover_heartbeat_transaction(args.state_dir),
         }
     except Exception as exc:  # noqa: BLE001 — recovery must fail closed before another task

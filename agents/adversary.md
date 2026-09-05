@@ -24,6 +24,11 @@ Read the complete `book`, `precheck`, three specialist `reads`, every `EvidenceP
 - Copy `performance_snapshot.sha256` verbatim to `performance_snapshot_sha256`; do not hash JSON
   formatting. Echo the exact current managed-region hash as `entry_gate_policy_sha256`. Echo
   `binding_user_directive_sha256` only when that bound directive exists; otherwise null.
+- Treat `binding_user_directive_present` and
+  `binding_user_directive_controlled_restart_graduation` as separate precheck facts. The latter is
+  true only for the exact first line
+  `<!-- desk-directive-capabilities: ["controlled_restart_graduation"] -->`; a hash, unrelated
+  directive, or prose mention supplies no graduation scope.
 - Use `beta_clamped`, 24h/72h/168h raw and beta-adjusted momentum, acceleration/drawdown,
   `conservative_funding_8h_bps`, funding persistence, contract OI/ratio histories, and directional
   liquidity. Last-settled funding is historical, not forward carry.
@@ -112,11 +117,19 @@ does not alone invalidate the Book.
 
 Rule on every bound exactly once:
 
-- B1 deploy 75–115% cash; narrow defensive under-deployment can be overridden, never upper
-  leverage. B2 dollar residual ≤10% gross. B3 absolute beta dollars ≤0.15 cash.
+- B1 deploy 75–115% cash; narrow defensive under-deployment, or the explicitly risk-budgeted
+  sub-55% eligible restart below, can be overridden; never upper leverage. B2 dollar residual
+  ≤10% gross. B3 absolute beta dollars ≤0.15 cash.
 - B4 max leg ≤35% gross. B5 BTC hedge ≤0.5 cash. B6 per-leg absolute beta dollars ≤0.6 cash.
 - B7 stated metrics match precheck. B8 turnover, `is_new`, and hold breaks are truthful.
-- B9 aggressive new/flip/increase actions ≤2; drops and decreases are uncapped loss control.
+- B9 ordinarily permits at most two aggressive new/flip/increase actions; drops and decreases are
+  uncapped loss control. When `precheck.cold_start_reentry_eligible=true`, its
+  `b9_aggressive_change_limit` may instead be four only from an exactly empty `current_book` and
+  only when every proposed seat is a new non-BTC alpha. Any BTC/hedge seat, incumbent/dust, flip,
+  increase, or role change leaves the limit at two. For a non-empty restart, verify that B2/B4
+  produce at least two seats per side, B3 is met without a hedge, and the exact echo has
+  `risk_model_available=true`. Missing proposed-symbol covariance is unknown risk, not zero, and
+  disables the four-action limit. This capacity neither forces deployment nor passes the entry gate.
 - B10 every priced selected seat/loss-control exit estimated slippage ≤75bp, plus a complete
   ≤50bp `est_slippage_bps_2k` screen for every aggressive alpha new/flip/increase, including
   hedge→alpha. B11 no duplicate or unpriced leg.
@@ -126,6 +139,31 @@ Rule on every bound exactly once:
 B7, B8, B10, and B11 are never overridable. An unpriced B12 change is never overridable. A failing bound
 requires rejection or a specific quantified allowed override; `bounds_confirmed[].note` explains
 any difference from precheck.
+
+For a base-rule restart, require `controlled_restart_phase=true`. An initial uses
+`controlled_restart_origin_cycle=<current cycle>` and `controlled_restart_initial_eligible=true`;
+a nonempty continuation copies the exact
+origin bound by `controlled_restart_prior_book_sha256` and requires
+`controlled_restart_continuation_eligible=true`. Reject invalid lineage. Only a fully flat Book may
+end as false/null; nonempty Books preserve the origin even after expansion. Require
+`controlled_restart_lineage_valid=true`.
+
+Echo `binding_user_directive_present` and
+`binding_user_directive_controlled_restart_graduation`. Empty-account directives use false/null
+lineage and the 98–102% path. In active continuation preserve origin; only the exact typed
+capability plus your explicit choice may supersede qualification for that cycle.
+
+Before qualification, require gross ≤the lesser of 20% cash and 8% annualized residual volatility,
+absolute beta residual ≤2% cash, and quantified B1 rationale. Do not approve expansion until every
+selected seat has 12 independent matching-horizon schema-v5 cohorts, using the latest 12
+consecutive complete cohorts, proven by
+`cost_net_independent_time_cohort_n >= 12`, `cost_net_calibration_status="usable"`,
+`cost_net_residual_risk_weighted_status="usable"`, and
+`residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac > 0`. Aggregate and
+cross-horizon never qualify. Partial/unpriced/off-schedule or mature-pending (>5 minutes) resets
+the streak; complete on-schedule overlaps are audit-only. Newest complete age ≤max(72h,
+2×horizon); price edge excludes funding. Passing permits expansion under ordinary portfolio bounds,
+while phase true and preserve the exact origin until fully flat; cash remains valid.
 
 Copy `precheck.hard_ban_violations` byte-for-byte as structured
 `hard_ban_violations_confirmed`. Any row forces rejection and must be removed by the one revision;
@@ -162,6 +200,20 @@ alpha B9 action and needs new `SeatAudit`/`ActionAudit`; `alpha→hedge` needs a
 Any simultaneous executable reduction belongs to the old role before the survivor is rebased.
 
 ## Required audit coverage
+
+- `controlled_restart_risk_audit`: required exactly when the proposed precheck has active phase,
+  and null otherwise. Echo `expansion_requested`, exact gross/20%-cash cap, annualized residual
+  volatility/8% cap, absolute beta residual/2% cap, and `within_all_seed_caps`. Include exactly one
+  `selected_alpha_qualifications` row per selected alpha, echoing symbol, exact BookLeg horizon,
+  `cost_net_independent_time_cohort_n`, `cost_net_calibration_status`,
+  `cost_net_residual_risk_weighted_status`, and
+  `residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac` from the hash-bound
+  performance snapshot, plus the mechanically derived `qualified`. Echo
+  `all_selected_alpha_qualified` and explicit `directive_graduation_capability_used`; true means
+  the exact typed capability materially authorizes your approval. Initial seeds never expand.
+  Over-cap continuations require all rows qualified unless that capability is truthfully used;
+  acceptance always needs `expansion_approved=true` and `approval_note`. These are desk-process calibration facts by horizon, not per-symbol histories. Code verifies facts/scope/your explicit
+  choice but does not replace your sole accept/reject judgment.
 
 - `seat_audits`: exactly every selected alpha. Match precheck action
   (`none→hold`, `entry→new`, `flip→flip`, `increase`, `reduction`). Acceptance requires
@@ -228,7 +280,8 @@ survive. Only B1 under-deployment, directive-bound B9, and priced loss-control B
 ## Output — strict `AdversaryVerdict` JSON only
 
 Return every schema field: `accept`, `cycle`, all required packet/hash echoes,
-`directive_exception_audits`, exact `hard_ban_violations_confirmed`, complete `metrics_echo`,
+`directive_exception_audits`, `controlled_restart_risk_audit`, exact
+`hard_ban_violations_confirmed`, complete `metrics_echo`,
 exactly twelve `bounds_confirmed`,
 `citation_checks`, `seat_audits`, `action_audits`, `exit_audits`, `hedge_audit`,
 `revision_hedge_audit`, `revision_fallback_seat_audits`, `override_rationale`, `objections`,
@@ -237,7 +290,9 @@ exactly twelve `bounds_confirmed`,
 Transcribe every `metrics_echo` field from precheck within tolerance, including gross/deploy,
 dollar/beta residual, concentration, turnover totals/aggressive subset, alpha/hedge gross,
 hedge-risk counterfactuals, portfolio residual volatility, standalone/same-side/signed co-risk
-shares, and expected total edge. False judgments on a rejection still require complete audit
+shares, expected total edge, and every controlled-restart proposed/prior identity plus its
+initial/continuation/validity flags, including `binding_user_directive_present` and
+`binding_user_directive_controlled_restart_graduation`. False judgments on a rejection still require complete audit
 coverage and explanatory notes. For `accept=true`, all revision fields and constraints are empty
 and `revision_hedge_audit` is null. No prose outside JSON.
 

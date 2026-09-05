@@ -38,8 +38,10 @@ To install or repair the managed block:
 uv run python scripts/install_desk_cron.py --install
 ```
 
-`--probe-only` is genuinely read-only: it neither claims a slot nor starts the proxy, refreshes
-candles, creates directories, or mutates desk state. `desk_health.py` is also token-free and
+`--probe-only` is genuinely read-only: it neither claims a slot or directive nor starts the proxy,
+refreshes candles, creates directories, recovers Reflector transactions/cooldowns, or mutates desk state.
+It reports a pending Reflector recovery as unhealthy; the next full preflight performs that
+recovery only after acquiring `logs/desk-cycle.lock`. `desk_health.py` is also token-free and
 read-only; it reports cycle, heartbeat, funding-clock and proxy-monitor age, flat-book duration,
 completion/account consistency, hash-chain validity, and duplicate/conflicting audit rows.
 
@@ -69,7 +71,11 @@ uv run python scripts/desk_health.py --state-dir live_state --log-dir logs --str
 
 Cycle and heartbeat intents use same-directory temporary files, file `fsync`, atomic replace, and
 parent-directory `fsync`. Completion binds the account snapshot and runtime provenance. Recovery
-finishes that exact durable intent or fails closed; never edit a pending transaction by hand.
+finishes that exact durable intent or fails closed. It also replays a prepared directive claim or
+finalizes the exact UUID whose schema-v2 receipt is bound by a completed manifest. An unfinished
+cycle keeps its private claim for retry; a newer canonical inbox file remains separately queued.
+Never delete or edit a pending transaction, directive claim, tombstone, or consumption receipt by
+hand.
 
 If `live_memory/scorecard-migration-v2.wal.json` exists after an interrupted schema migration,
 recover it before launching Codex:

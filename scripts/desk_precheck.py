@@ -20,12 +20,13 @@ from futures_fund.adversary_binding import specialist_reads_sha256
 from futures_fund.candle_proxy import validate_candle_audit
 from futures_fund.config import load_settings
 from futures_fund.desk_contracts import Book, SpecialistRead
+from futures_fund.directives import CONTROLLED_RESTART_GRADUATION
 from futures_fund.pending_io import resolve_pending
 from futures_fund.performance import canonical_sha256
-from futures_fund.precheck import compute_precheck
+from futures_fund.precheck import compute_precheck, load_prior_book_lineage
 from futures_fund.prompt_guard import split_managed
 from futures_fund.slippage import ExecutionRealism
-from scripts.desk_reconcile import _parse_specialist_reads
+from scripts.desk_reconcile import _load_bound_directive_claim, _parse_specialist_reads
 
 
 def _verify_specialist_digest(
@@ -68,6 +69,10 @@ def main(argv: list[str] | None = None) -> int:
         or meta.get("risk_model_sha256") != canonical_sha256(risk_model)
     ):
         raise ValueError("cycle meta evidence/risk hash mismatch")
+    directive_claim = _load_bound_directive_claim(args.state_dir, pending, meta)
+    directive_capabilities = (
+        list(directive_claim["capabilities"]) if directive_claim is not None else []
+    )
     validate_candle_audit(meta, evidence)
     book = Book.model_validate(
         json.loads((pending / args.book).read_text())
@@ -83,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
          "seat_role": p.seat_role}
         for s, p in account.positions.items()
     ]
+    prior_book_lineage = load_prior_book_lineage(
+        args.state_dir,
+        before_cycle=int(meta["cycle"]),
+    )
 
     metrics = compute_precheck(
         book,
@@ -99,6 +108,13 @@ def main(argv: list[str] | None = None) -> int:
             adverse_selection_bps=settings.execution.adverse_selection_bps,
             legging_bps_per_second=settings.execution.legging_bps_per_second,
             allow_partial_fills=settings.execution.allow_partial_fills,
+        ),
+        prior_book_lineage=prior_book_lineage,
+        binding_user_directive_present=(
+            meta.get("binding_user_directive_sha256") is not None
+        ),
+        binding_user_directive_controlled_restart_graduation=(
+            CONTROLLED_RESTART_GRADUATION in directive_capabilities
         ),
     )
     pm_region = split_managed((Path(args.agents_dir) / "pm.md").read_text())[1]
@@ -123,6 +139,28 @@ def main(argv: list[str] | None = None) -> int:
         "hedge_frac_cash": metrics.hedge_frac_cash,
         "turnover_legs_changed": metrics.turnover_legs_changed,
         "turnover_aggressive_legs_changed": metrics.turnover_aggressive_legs_changed,
+        "cold_start_reentry_eligible": metrics.cold_start_reentry_eligible,
+        "b9_aggressive_change_limit": metrics.b9_aggressive_change_limit,
+        "risk_model_available": metrics.risk_model_available,
+        "controlled_restart_origin_cycle": metrics.controlled_restart_origin_cycle,
+        "controlled_restart_phase": metrics.controlled_restart_phase,
+        "binding_user_directive_present": metrics.binding_user_directive_present,
+        "binding_user_directive_controlled_restart_graduation": (
+            metrics.binding_user_directive_controlled_restart_graduation
+        ),
+        "controlled_restart_initial_eligible": metrics.controlled_restart_initial_eligible,
+        "controlled_restart_continuation_eligible": (
+            metrics.controlled_restart_continuation_eligible
+        ),
+        "controlled_restart_lineage_valid": metrics.controlled_restart_lineage_valid,
+        "controlled_restart_prior_cycle": metrics.controlled_restart_prior_cycle,
+        "controlled_restart_prior_book_sha256": (
+            metrics.controlled_restart_prior_book_sha256
+        ),
+        "controlled_restart_prior_origin_cycle": (
+            metrics.controlled_restart_prior_origin_cycle
+        ),
+        "controlled_restart_prior_phase": metrics.controlled_restart_prior_phase,
         "turnover_risk_reductions": metrics.turnover_risk_reductions,
         "turnover_usd": metrics.turnover_usd,
         "portfolio_residual_vol_annualized_frac_cash": (

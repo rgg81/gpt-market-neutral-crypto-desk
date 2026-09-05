@@ -28,6 +28,7 @@ from futures_fund.account import load_account
 from futures_fund.candle_proxy import BinanceCandleProxy
 from futures_fund.config import load_settings
 from futures_fund.cycle_io import cycle_dir
+from futures_fund.directives import claim_next_directive
 from futures_fund.evidence import build_evidence
 from futures_fund.exchange import FuturesExchange, build_ccxt
 from futures_fund.market_data import quality_filter, scan_universe
@@ -171,15 +172,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--directive-path", default="ops/next-cycle-directive.md")
     args = ap.parse_args(argv)
 
-    directive_path = Path(args.directive_path)
-    directive_text: str | None = None
-    if directive_path.exists():
-        if not directive_path.is_file():
-            raise RuntimeError(f"binding directive path is not a file: {directive_path}")
-        directive_text = directive_path.read_text()
-        if not directive_text.strip():
-            raise RuntimeError(f"binding directive is empty: {directive_path}")
-
     settings = load_settings()
     now = datetime.now(UTC)
     cycle = _next_cycle(args.state_dir)
@@ -192,6 +184,17 @@ def main(argv: list[str] | None = None) -> int:
     schedule_status = str(watchdog_receipt["schedule_status"])
     if schedule_status in {"EARLY", "FUTURE_CLOCK", "UNKNOWN_LAST_TIMESTAMP"}:
         raise RuntimeError(f"watchdog requires stand-down before evidence: {schedule_status}")
+    # Claim the concrete inbox file before network work. Failed-cycle retries reuse this same
+    # state-owned instance; a later file at the canonical inbox remains a distinct queued command.
+    try:
+        directive_claim = claim_next_directive(
+            args.state_dir,
+            cycle=cycle,
+            now=now,
+            source_path=Path(args.directive_path),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"binding directive claim failed: {exc}") from exc
     client, exchange = _build_data_clients(settings)
     exchange.require_candle_proxy()
     rows = scan_universe(client, top_n=settings.universe_top_n)
@@ -302,9 +305,22 @@ def main(argv: list[str] | None = None) -> int:
         "expected_candle_requests": expected_candle_requests,
         "candle_data": candle_audit,
     }
-    if directive_text is not None:
-        (pending / "binding_user_directive.md").write_text(directive_text)
-        meta["binding_user_directive_sha256"] = canonical_sha256(directive_text)
+    if directive_claim is not None:
+        directive_text = str(directive_claim["text"])
+        (pending / "binding_user_directive.md").write_bytes(directive_text.encode("utf-8"))
+        meta.update({
+            "binding_user_directive_claim_id": directive_claim["claim_id"],
+            "binding_user_directive_claim_intent_sha256": (
+                directive_claim["claim_intent_sha256"]
+            ),
+            "binding_user_directive_payload_sha256": directive_claim["payload_sha256"],
+            "binding_user_directive_sha256": directive_claim["directive_sha256"],
+            "binding_user_directive_source_relpath": directive_claim["source_relpath"],
+            "binding_user_directive_capabilities": list(directive_claim["capabilities"]),
+            "binding_user_directive_capabilities_sha256": (
+                directive_claim["capabilities_sha256"]
+            ),
+        })
     (pending / "meta.json").write_text(json.dumps(meta, indent=2))
     (pending_root / "current.json").write_text(json.dumps(
         {"cycle": cycle, "dir": str(pending.resolve()), "created": now.isoformat()}, indent=2))

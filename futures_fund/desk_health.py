@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from futures_fund.config import load_settings
+from futures_fund.directives import directive_lifecycle_status
 from futures_fund.durable_io import canonical_json_sha256
 from futures_fund.heartbeat import verify_heartbeat_completion
 from futures_fund.proxy_process import probe_binance_proxy
@@ -103,6 +104,54 @@ def _slo(age: float | None, caution: float, critical: float) -> str:
     if age > caution:
         return "CAUTION"
     return "HEALTHY"
+
+
+def _directive_lifecycle_view(state: Path) -> dict:
+    """Return a content-free view of the read-only directive lifecycle inspection."""
+
+    try:
+        raw = directive_lifecycle_status(state)
+    except Exception:  # noqa: BLE001 - health reports lifecycle failures without mutating state
+        return {
+            "status": "conflict",
+            "queued_source_present": False,
+            "diagnostic": "read-only lifecycle inspection failed",
+        }
+    if not isinstance(raw, dict):
+        return {
+            "status": "conflict",
+            "queued_source_present": False,
+            "diagnostic": "read-only lifecycle inspection returned invalid data",
+        }
+
+    status = raw.get("status")
+    view: dict[str, object] = {
+        "status": status if isinstance(status, str) else "conflict",
+        "queued_source_present": raw.get("queued_source_present") is True,
+    }
+    cycle = raw.get("cycle")
+    if type(cycle) is int and cycle >= 1:
+        view["cycle"] = cycle
+    claim_id = raw.get("claim_id")
+    if (
+        isinstance(claim_id, str)
+        and len(claim_id) == 32
+        and all(character in "0123456789abcdef" for character in claim_id)
+    ):
+        view["claim_id"] = claim_id
+    payload_state = raw.get("payload_state")
+    if payload_state in {
+        "claim",
+        "tombstone",
+        "duplicate_source",
+        "missing",
+        "conflict",
+    }:
+        view["payload_state"] = payload_state
+    if raw.get("error") is not None:
+        # Never forward error strings: a future parser must not accidentally expose directive text.
+        view["diagnostic"] = "read-only lifecycle validation failed"
+    return view
 
 
 def _latest_cycle(state: Path) -> tuple[int | None, dict | None, list[int]]:
@@ -510,6 +559,42 @@ def _build_health_report_unlocked(
     }
     if any(transactions.values()):
         issues.append({"severity": "CRITICAL", "code": "RECOVERY_REQUIRED", "detail": transactions})
+
+    directive_lifecycle = _directive_lifecycle_view(state)
+    directive_status = directive_lifecycle["status"]
+    directive_payload_state = directive_lifecycle.get("payload_state")
+    if directive_status == "cleanup_pending":
+        issues.append(
+            {
+                "severity": "CRITICAL",
+                "code": "DIRECTIVE_FINALIZATION_PENDING",
+                "detail": directive_lifecycle,
+            }
+        )
+    elif directive_status == "claimed_pending" and directive_payload_state == "claim":
+        issues.append(
+            {
+                "severity": "CAUTION",
+                "code": "DIRECTIVE_CLAIM_PENDING",
+                "detail": directive_lifecycle,
+            }
+        )
+    elif directive_status != "idle":
+        issues.append(
+            {
+                "severity": "CRITICAL",
+                "code": "DIRECTIVE_LIFECYCLE_CONFLICT",
+                "detail": directive_lifecycle,
+            }
+        )
+    if directive_status != "idle" and directive_lifecycle.get("queued_source_present") is True:
+        issues.append(
+            {
+                "severity": "CAUTION",
+                "code": "DIRECTIVE_INBOX_QUEUED_BEHIND_ACTIVE",
+                "detail": directive_lifecycle,
+            }
+        )
     overall = "HEALTHY"
     if any(issue["severity"] == "CRITICAL" for issue in issues):
         overall = "CRITICAL"
@@ -574,6 +659,7 @@ def _build_health_report_unlocked(
             "account_event_head": account_events[-1]["event_id"] if account_events else None,
             "positions": len(account.get("positions") or {}),
             "transactions": transactions,
+            "directive_lifecycle": directive_lifecycle,
             "deduplication": {
                 "ledger": ledger_stats,
                 "equity": equity_stats,

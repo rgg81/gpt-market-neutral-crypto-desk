@@ -11,13 +11,31 @@ import math
 import os
 import stat
 import tempfile
+from base64 import b64decode, b64encode
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 
 from futures_fund.cycle_io import cycle_dir, save_output
-from futures_fund.desk_contracts import Book, BookLeg, ReflectionProposal, SpecialistRead
+from futures_fund.desk_contracts import (
+    Book,
+    BookLeg,
+    ReflectionProposal,
+    SpecialistRead,
+    validate_unique_reflection_edit_roles,
+)
+from futures_fund.durable_io import (
+    durable_unlink,
+    durable_write_bytes,
+    durable_write_text,
+    fsync_directory,
+)
 from futures_fund.heartbeat import verify_heartbeat_completion
+from futures_fund.precheck import (
+    _entry_execution_side,
+    _exit_execution_side,
+    _one_way_friction_usd,
+)
 from futures_fund.prompt_guard import (
     PromptGuardError,
     assert_only_region_changed,
@@ -44,6 +62,7 @@ from futures_fund.scorecard import (
     score_candidate_opportunities,
     score_specialist,
 )
+from futures_fund.slippage import ExecutionRealism
 
 SPECIALIST_ROLES = ("sentiment", "technical", "futures")
 CANONICAL_BTC_SYMBOL = "BTC/USDT:USDT"
@@ -53,7 +72,14 @@ DAILY_LEARNING_HORIZON_HOURS = 24.0
 # committed mark a few seconds before the exact decision timestamp anniversary. Treat that mark
 # as the scheduled observation without pretending the actual elapsed time was exactly 24h.
 SCHEDULED_MARK_TOLERANCE = timedelta(minutes=5)
-FORECAST_SCORE_SCHEMA_VERSION = 4
+FORECAST_SCORE_SCHEMA_VERSION = 5
+# Schema v4 introduced the correct leg-nonoverlap/time-cohort calibration contract. Preserve its
+# gross forecast evidence after v5 adds a separately fail-closed transaction-cost-net view.
+FORECAST_CALIBRATION_MIN_SCHEMA_VERSION = 4
+FORECAST_COST_NET_MIN_SCHEMA_VERSION = 5
+FORECAST_ROUND_TRIP_COST_MODEL = (
+    "origin_directional_l2_full_target_round_trip_with_fixed_book_legging_v1"
+)
 CANDIDATE_SCORE_SCHEMA_VERSION = 1
 FORECAST_EDGE_CHANGE_ABS_FRAC = 0.0025
 FORECAST_EDGE_CHANGE_REL_FRAC = 0.25
@@ -63,6 +89,60 @@ ADVERSARY_RECOVERY_WINDOW = 6
 def _marks_sha256(marks: dict[str, float]) -> str:
     encoded = json.dumps(marks, sort_keys=True, separators=(",", ":")).encode()
     return sha256(encoded).hexdigest()
+
+
+def forecast_cohort_membership_sha256(
+    origin_cycle: int,
+    forecast_horizon_hours: int,
+    symbols: list[str],
+) -> str:
+    """Hash one canonical same-origin, same-horizon alpha membership packet."""
+    payload = {
+        "origin_cycle": int(origin_cycle),
+        "forecast_horizon_hours": int(forecast_horizon_hours),
+        "symbols": symbols,
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _forecast_cohort_membership(
+    book: Book,
+    *,
+    origin_cycle: int,
+    forecast_horizon_hours: int,
+    btc_symbol: str,
+) -> dict:
+    """Derive the complete alpha cohort from the manifest-bound origin Book."""
+    symbols = sorted(
+        leg.symbol
+        for leg in book.legs
+        if leg.seat_role == "alpha"
+        and leg.symbol != btc_symbol
+        and int(leg.edge_horizon_hours) == int(forecast_horizon_hours)
+    )
+    if not symbols or len(symbols) != len(set(symbols)):
+        raise ValueError("forecast cohort membership must be non-empty and duplicate-free")
+    return {
+        "forecast_cohort_expected_symbols": symbols,
+        "forecast_cohort_expected_member_count": len(symbols),
+        "forecast_cohort_expected_symbols_sha256": forecast_cohort_membership_sha256(
+            origin_cycle,
+            forecast_horizon_hours,
+            symbols,
+        ),
+    }
+
+
+def _marks_cover_positive_finite(marks: dict[str, float], required: set[str]) -> bool:
+    if not required.issubset(marks):
+        return False
+    try:
+        values = [float(marks[symbol]) for symbol in required]
+    except (TypeError, ValueError):
+        return False
+    return all(math.isfinite(value) and value > 0.0 for value in values)
 
 
 def _as_utc(value: str | datetime) -> datetime:
@@ -250,17 +330,27 @@ def mark_recurrences_handled(memory_dir, recurrences: list[dict], *, cycle: int)
     """Record a completed Reflector consideration, including an explicit no-action result."""
     path = Path(memory_dir) / "recurrence-handled.json"
     handled = _read_json(path, {})
+    changed = False
     if not isinstance(handled, dict):
         handled = {}
+        changed = True
     for recurrence in recurrences:
         kind = str(recurrence.get("kind", ""))
         role = str(recurrence.get("role", ""))
         if kind and role:
-            handled[f"{kind}:{role}"] = {"cycle": int(cycle)}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(handled, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+            key = f"{kind}:{role}"
+            try:
+                prior_cycle = int(handled.get(key, {}).get("cycle", -1))
+            except (AttributeError, TypeError, ValueError):
+                prior_cycle = -1
+            # Crash recovery may replay an older consumed authority after a newer event was
+            # handled. Never move the cooldown clock backwards.
+            next_cycle = max(prior_cycle, int(cycle))
+            if prior_cycle != next_cycle:
+                handled[key] = {"cycle": next_cycle}
+                changed = True
+    if changed:
+        durable_write_text(path, json.dumps(handled, indent=2, sort_keys=True) + "\n")
 
 
 def persist_decision_snapshot(
@@ -331,7 +421,7 @@ def read_forecast_scorecard(
             if key[0] < 1 or not key[1]:
                 raise ValueError("invalid forecast key")
             schema_version = int(row.get("forecast_score_schema_version", 1))
-            if schema_version not in (1, 2, 3, FORECAST_SCORE_SCHEMA_VERSION):
+            if schema_version not in (1, 2, 3, 4, 5):
                 raise ValueError("unsupported forecast score schema")
             if schema_version == 1:
                 if not isinstance(row.get("sign_hit"), bool):
@@ -425,6 +515,112 @@ def read_forecast_scorecard(
                         raise ValueError("leg rows cannot self-declare statistical independence")
                     if not isinstance(row.get("leg_nonoverlap_eligible"), bool):
                         raise ValueError("leg_nonoverlap_eligible must be boolean")
+                if schema_version >= 5:
+                    expected_symbols = row.get("forecast_cohort_expected_symbols")
+                    expected_count = row.get("forecast_cohort_expected_member_count")
+                    expected_sha256 = row.get("forecast_cohort_expected_symbols_sha256")
+                    if (
+                        not isinstance(expected_symbols, list)
+                        or not expected_symbols
+                        or not all(
+                            isinstance(expected_symbol, str) and expected_symbol
+                            for expected_symbol in expected_symbols
+                        )
+                        or expected_symbols != sorted(set(expected_symbols))
+                        or btc_symbol in expected_symbols
+                        or key[1] not in expected_symbols
+                    ):
+                        raise ValueError("invalid forecast cohort expected symbols")
+                    if (
+                        type(expected_count) is not int
+                        or expected_count != len(expected_symbols)
+                    ):
+                        raise ValueError("invalid forecast cohort expected member count")
+                    horizon = float(row["forecast_horizon_hours"])
+                    if not horizon.is_integer() or expected_sha256 != (
+                        forecast_cohort_membership_sha256(
+                            key[0], int(horizon), expected_symbols
+                        )
+                    ):
+                        raise ValueError("invalid forecast cohort expected symbols hash")
+                    if row.get("round_trip_cost_model") != FORECAST_ROUND_TRIP_COST_MODEL:
+                        raise ValueError("unsupported round-trip forecast cost model")
+                    for field in ("origin_precheck_sha256", "origin_risk_model_sha256"):
+                        value = row.get(field)
+                        if value is not None and not _is_sha256(value):
+                            raise ValueError(f"invalid {field}")
+                    priced = row.get("round_trip_friction_priced")
+                    if not isinstance(priced, bool):
+                        raise ValueError("round_trip_friction_priced must be boolean")
+                    if not isinstance(
+                        row.get("round_trip_cost_exclusion_reasons"), list
+                    ) or not all(
+                        isinstance(reason, str)
+                        for reason in row["round_trip_cost_exclusion_reasons"]
+                    ):
+                        raise ValueError("invalid round_trip_cost_exclusion_reasons")
+                    cost_fields = (
+                        "round_trip_entry_friction_usd",
+                        "round_trip_exit_friction_usd",
+                        "round_trip_friction_usd",
+                        "round_trip_friction_frac",
+                        "realized_round_trip_cost_net_price_edge_frac",
+                    )
+                    if priced:
+                        if row.get("origin_precheck_sha256") is None:
+                            raise ValueError("priced round-trip forecast lacks bound precheck")
+                        if float(row["target_notional"]) <= 0.0:
+                            raise ValueError("priced round-trip forecast has nonpositive target")
+                        values = [row.get(field) for field in cost_fields]
+                        if any(
+                            value is None
+                            or not math.isfinite(float(value))
+                            or float(value) < 0.0 and field != cost_fields[-1]
+                            for field, value in zip(cost_fields, values, strict=True)
+                        ):
+                            raise ValueError("invalid priced round-trip forecast costs")
+                        entry_cost = float(row["round_trip_entry_friction_usd"])
+                        exit_cost = float(row["round_trip_exit_friction_usd"])
+                        total_cost = float(row["round_trip_friction_usd"])
+                        cost_frac = float(row["round_trip_friction_frac"])
+                        if not math.isclose(
+                            total_cost, entry_cost + exit_cost, rel_tol=0.0, abs_tol=1e-12
+                        ) or not math.isclose(
+                            cost_frac,
+                            total_cost / float(row["target_notional"]),
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        ):
+                            raise ValueError("round-trip forecast costs are inconsistent")
+                        if not math.isclose(
+                            float(row["realized_round_trip_cost_net_price_edge_frac"]),
+                            realized - cost_frac,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        ):
+                            raise ValueError("cost-net forecast edge is inconsistent")
+                        if row["round_trip_cost_exclusion_reasons"]:
+                            raise ValueError("priced round-trip forecast has exclusion reasons")
+                    else:
+                        if any(row.get(field) is not None for field in cost_fields):
+                            raise ValueError("unpriced round-trip forecast exposes cost values")
+                        if not row["round_trip_cost_exclusion_reasons"]:
+                            raise ValueError("unpriced round-trip forecast lacks an exclusion")
+                    reserve = row.get("round_trip_legging_reserve_bps")
+                    if reserve is not None and (
+                        not math.isfinite(float(reserve)) or float(reserve) < 0.0
+                    ):
+                        raise ValueError("invalid round_trip_legging_reserve_bps")
+                    expected_cost_net_eligible = expected_learning_eligible and priced
+                    if row.get("cost_net_learning_eligible") is not expected_cost_net_eligible:
+                        raise ValueError("cost_net_learning_eligible is inconsistent")
+                    reasons = row.get("cost_net_learning_exclusion_reasons")
+                    if not isinstance(reasons, list) or not all(
+                        isinstance(reason, str) for reason in reasons
+                    ):
+                        raise ValueError("invalid cost_net_learning_exclusion_reasons")
+                    if bool(reasons) is expected_cost_net_eligible:
+                        raise ValueError("cost-net eligibility/reasons are inconsistent")
             if state_dir is not None:
                 expected = _build_forecast_score_row(
                     state_dir,
@@ -963,6 +1159,144 @@ def _forecast_cohort_metadata(
     return target_metadata
 
 
+def _forecast_round_trip_cost_fields(
+    state_dir,
+    *,
+    origin_cycle: int,
+    book: Book,
+    leg: BookLeg,
+    origin_evidence: dict,
+    cadence: str,
+) -> dict:
+    """Price one standardized ex-ante round trip from immutable origin liquidity.
+
+    This is a measurement label, never a claim that the desk actually entered or exited at these
+    costs. Both crossing sides use the same manifest-bound origin L2 snapshot, full target size,
+    taker fee, displayed-depth haircut, adverse-selection reserve, and a fixed book-level legging
+    reserve. Deriving the reserve from book breadth rather than actual origin turnover keeps held
+    forecast renewals comparable with fresh entries.
+    """
+    precheck_sha256 = completed_artifact_sha256(
+        state_dir, origin_cycle, "precheck", cadence=cadence
+    )
+    risk_model_sha256 = completed_artifact_sha256(
+        state_dir, origin_cycle, "risk_model", cadence=cadence
+    )
+    result = {
+        "origin_precheck_sha256": precheck_sha256,
+        "origin_risk_model_sha256": risk_model_sha256,
+        "round_trip_cost_model": FORECAST_ROUND_TRIP_COST_MODEL,
+        "round_trip_legging_reserve_bps": None,
+        "round_trip_friction_priced": False,
+        "round_trip_entry_friction_usd": None,
+        "round_trip_exit_friction_usd": None,
+        "round_trip_friction_usd": None,
+        "round_trip_friction_frac": None,
+    }
+    reasons: list[str] = []
+    if precheck_sha256 is None:
+        reasons.append("origin_precheck_not_manifest_bound")
+        return {**result, "round_trip_cost_exclusion_reasons": reasons}
+    try:
+        origin_dir = cycle_dir(state_dir, origin_cycle, cadence=cadence)
+        precheck = _read_strict_json_object(origin_dir / "precheck.json")
+        policy_fields = {
+            "execution_latency_ms",
+            "execution_displayed_depth_fraction",
+            "execution_adverse_selection_bps",
+            "execution_legging_bps_per_second",
+            "execution_allow_partial_fills",
+        }
+        if precheck.get("execution_policy_applied") is not True or not policy_fields.issubset(
+            precheck
+        ):
+            raise ValueError("origin execution policy is not explicit")
+        if not isinstance(precheck["execution_allow_partial_fills"], bool):
+            raise ValueError("origin partial-fill policy is not boolean")
+        execution = ExecutionRealism(
+            latency_ms=float(precheck["execution_latency_ms"]),
+            displayed_depth_fraction=float(
+                precheck["execution_displayed_depth_fraction"]
+            ),
+            adverse_selection_bps=float(precheck["execution_adverse_selection_bps"]),
+            legging_bps_per_second=float(precheck["execution_legging_bps_per_second"]),
+            allow_partial_fills=precheck["execution_allow_partial_fills"],
+        )
+        legging_reserve_bps = (
+            execution.legging_bps_per_second
+            * (execution.latency_ms / 1000.0)
+            * max(len(book.legs) - 1, 0)
+        )
+        if not math.isfinite(legging_reserve_bps) or legging_reserve_bps < 0.0:
+            raise ValueError("invalid round-trip legging reserve")
+        result["round_trip_legging_reserve_bps"] = legging_reserve_bps
+    except (KeyError, OSError, TypeError, ValueError):
+        reasons.append("origin_execution_policy_unavailable")
+        return {**result, "round_trip_cost_exclusion_reasons": reasons}
+
+    required_liquidity = {
+        "mark",
+        "liquidity_mid",
+        "slippage_curve_buy_bps",
+        "slippage_curve_sell_bps",
+        "depth_usd_ask",
+        "depth_usd_bid",
+    }
+    if not required_liquidity.issubset(origin_evidence):
+        reasons.append("origin_two_sided_liquidity_unavailable")
+        return {**result, "round_trip_cost_exclusion_reasons": reasons}
+    target = float(leg.target_notional)
+    try:
+        entry = _one_way_friction_usd(
+            origin_evidence,
+            target,
+            _entry_execution_side(leg.side),
+            execution_realism=execution,
+            legging_reserve_bps=legging_reserve_bps,
+        )
+        exit_ = _one_way_friction_usd(
+            origin_evidence,
+            target,
+            _exit_execution_side(leg.side),
+            execution_realism=execution,
+            legging_reserve_bps=legging_reserve_bps,
+        )
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        reasons.append("round_trip_cost_calculation_failed")
+        return {**result, "round_trip_cost_exclusion_reasons": reasons}
+
+    def full_side_priced(values: tuple[float, float, float, float | None]) -> bool:
+        friction, executable_clip, curve_lookup_clip, fill_fraction = values
+        return bool(
+            all(math.isfinite(value) and value >= 0.0 for value in values[:3])
+            and executable_clip > 0.0
+            and curve_lookup_clip > 0.0
+            and fill_fraction is not None
+            and math.isfinite(fill_fraction)
+            and fill_fraction >= 1.0 - 1e-12
+        )
+
+    if not full_side_priced(entry):
+        reasons.append("entry_full_fill_cost_unavailable")
+    if not full_side_priced(exit_):
+        reasons.append("exit_full_fill_cost_unavailable")
+    if reasons:
+        return {**result, "round_trip_cost_exclusion_reasons": reasons}
+
+    entry_friction = float(entry[0])
+    exit_friction = float(exit_[0])
+    total_friction = entry_friction + exit_friction
+    return {
+        **result,
+        "round_trip_friction_priced": True,
+        "round_trip_entry_friction_usd": entry_friction,
+        "round_trip_exit_friction_usd": exit_friction,
+        "round_trip_friction_usd": total_friction,
+        "round_trip_friction_frac": total_friction / target,
+        "round_trip_cost_exclusion_reasons": [],
+    }
+
+
 def _build_forecast_score_row(
     state_dir,
     *,
@@ -1009,16 +1343,44 @@ def _build_forecast_score_row(
         return None
     maturity = origin_ts + timedelta(hours=float(leg.edge_horizon_hours))
     earliest_eligible_ts = maturity - SCHEDULED_MARK_TOLERANCE if policy_version >= 2 else maturity
-    eligible = next(
-        (
-            observation
-            for observation in committed_scoring_observations(state_dir, cadence=cadence)
-            if observation[1] >= earliest_eligible_ts
-            and float(observation[2].get(symbol, 0.0) or 0.0) > 0.0
-            and float(observation[2].get(btc_symbol, 0.0) or 0.0) > 0.0
-        ),
-        None,
-    )
+    cohort_membership: dict = {}
+    if policy_version >= 5:
+        cohort_membership = _forecast_cohort_membership(
+            book,
+            origin_cycle=origin_cycle,
+            forecast_horizon_hours=int(leg.edge_horizon_hours),
+            btc_symbol=btc_symbol,
+        )
+        required_marks = {
+            *cohort_membership["forecast_cohort_expected_symbols"],
+            btc_symbol,
+        }
+        eligible = next(
+            (
+                observation
+                for observation in committed_scoring_observations(
+                    state_dir, cadence=cadence
+                )
+                if observation[0] > origin_cycle
+                and observation[1] >= earliest_eligible_ts
+                and _marks_cover_positive_finite(observation[2], required_marks)
+            ),
+            None,
+        )
+    else:
+        # Preserve the exact v1-v4 per-leg observation contract for immutable replay.
+        eligible = next(
+            (
+                observation
+                for observation in committed_scoring_observations(
+                    state_dir, cadence=cadence
+                )
+                if observation[1] >= earliest_eligible_ts
+                and float(observation[2].get(symbol, 0.0) or 0.0) > 0.0
+                and float(observation[2].get(btc_symbol, 0.0) or 0.0) > 0.0
+            ),
+            None,
+        )
     if eligible is None:
         return None
     outcome_cycle, outcome_ts, outcome_marks, outcome_artifact_sha256 = eligible
@@ -1036,7 +1398,15 @@ def _build_forecast_score_row(
         if completed_artifact_is_bound(state_dir, origin_cycle, "risk_model", cadence=cadence)
         else {}
     )
-    residual_vols = risk_model.get("residual_vol_annualized") or {}
+    residual_vols = (
+        (
+            risk_model.get("residual_vol_ewma_shrunk_annualized")
+            or risk_model.get("residual_vol_annualized")
+            or {}
+        )
+        if policy_version >= 5
+        else (risk_model.get("residual_vol_annualized") or {})
+    )
     legacy_row = {
         "origin_cycle": origin_cycle,
         "symbol": leg.symbol,
@@ -1099,13 +1469,18 @@ def _build_forecast_score_row(
     learning_eligible = on_horizon and cohort["decision_learning_eligible"]
     if policy_version >= 3:
         learning_eligible = learning_eligible and leg_nonoverlap_eligible
-    return {
+    row = {
         **legacy_row,
         "forecast_score_schema_version": policy_version,
         "label_policy": (
             "scheduled_horizon_with_nonoverlapping_renewal_cohorts"
             if policy_version <= 3
             else "scheduled_horizon_with_leg_nonoverlap_and_time_cohort_calibration"
+            if policy_version == 4
+            else (
+                "scheduled_horizon_with_leg_nonoverlap_time_cohorts_and_"
+                "origin_round_trip_cost"
+            )
         ),
         "scheduled_maturity_ts": maturity.isoformat(),
         "scheduled_mark_tolerance_minutes": (SCHEDULED_MARK_TOLERANCE.total_seconds() / 60.0),
@@ -1119,6 +1494,33 @@ def _build_forecast_score_row(
         **cohort,
         "learning_eligible": learning_eligible,
         "learning_exclusion_reasons": exclusion_reasons,
+    }
+    if policy_version < 5:
+        return row
+    cost_fields = _forecast_round_trip_cost_fields(
+        state_dir,
+        origin_cycle=origin_cycle,
+        book=book,
+        leg=leg,
+        origin_evidence=origin_row or {},
+        cadence=cadence,
+    )
+    friction_frac = cost_fields["round_trip_friction_frac"]
+    cost_net_edge = selected_edge - float(friction_frac) if friction_frac is not None else None
+    cost_net_eligible = bool(
+        learning_eligible
+        and cost_fields["round_trip_friction_priced"] is True
+        and cost_net_edge is not None
+    )
+    cost_net_exclusions = list(exclusion_reasons)
+    cost_net_exclusions.extend(cost_fields["round_trip_cost_exclusion_reasons"])
+    return {
+        **row,
+        **cohort_membership,
+        **cost_fields,
+        "realized_round_trip_cost_net_price_edge_frac": cost_net_edge,
+        "cost_net_learning_eligible": cost_net_eligible,
+        "cost_net_learning_exclusion_reasons": cost_net_exclusions,
     }
 
 
@@ -1488,15 +1890,20 @@ def _actual_funding_for_score_window(
     )
 
 
-def _legacy_pm_gate_declaration(book: Book) -> dict | None:
+_LEGACY_PM_GATE_DECLARATION_CYCLES = frozenset({51, 52, 53})
+
+
+def _legacy_pm_gate_declaration(book: Book, *, cycle: int) -> dict | None:
     """Bind explicit pre-candidate-schema PM prose without inventing candidate rows.
 
     Only artifacts that truly omitted ``candidate_reviews`` qualify. New production output cannot
     bypass the structured contract by emitting an empty list plus prose. The small marker set is a
-    versioned adapter for the desk's already-committed c51-c53 wording; it recognizes only an
-    explicit PM claim that the active managed entry policy caused the no-entry result.
+    versioned adapter exclusively for the desk's already-committed c51-c53 wording; it recognizes
+    only an explicit PM claim that the active managed entry policy caused the no-entry result.
     """
-    if "candidate_reviews" in book.model_fields_set:
+    if cycle not in _LEGACY_PM_GATE_DECLARATION_CYCLES or (
+        "candidate_reviews" in book.model_fields_set
+    ):
         return None
     fields = {
         "turnover_justification": book.turnover_justification,
@@ -1520,7 +1927,8 @@ def _legacy_pm_gate_declaration(book: Book) -> dict | None:
     ).hexdigest()
     return {
         "kind": "legacy_manifest_bound_explicit_pm_gate_declaration",
-        "adapter_version": 1,
+        "adapter_version": 2,
+        "source_cycle": cycle,
         "declaration_sha256": declaration_sha256,
         "matched_markers": matches,
     }
@@ -1626,7 +2034,7 @@ def _pm_gate_inactive_recurrences(
                 ],
             }
         else:
-            causal_evidence = _legacy_pm_gate_declaration(book)
+            causal_evidence = _legacy_pm_gate_declaration(book, cycle=cycle)
             if causal_evidence is None:
                 continue
         qualifying.append(
@@ -1672,6 +2080,89 @@ def _pm_gate_inactive_recurrences(
             ),
         )
     ]
+
+
+def _recurrence_payload(
+    state_dir,
+    memory_dir,
+    records: list[ScoreRecord],
+    *,
+    through_cycle: int,
+    decision_cycle: int,
+    cadence: str,
+    k: int,
+    window: int,
+    active_calibration_roles: set[str] | None,
+) -> list[dict]:
+    """Build feedback using separate outcome and decision clocks.
+
+    Score-derived signals depend on the immutable score rows. The PM gate signal is state-only, so
+    its trailing window ends at the latest completed prior cycle even when that cycle has no mature
+    outcome yet. Cooldown is measured at the current decision that may consume the feedback, not
+    at whichever older origin happened to produce the newest score.
+    """
+    calibration_records = [
+        item
+        for item in records
+        if score_record_is_manifest_bound(state_dir, item, cadence=cadence)
+        and daily_score_is_learning_eligible(item)
+    ]
+    detected = detect_recurrences(calibration_records, k=k, window=window)
+    detected.extend(_adversary_recovery_recurrences(calibration_records))
+    detected.extend(
+        _pm_gate_inactive_recurrences(
+            state_dir,
+            through_cycle=through_cycle,
+            cadence=cadence,
+            k=k,
+        )
+    )
+    recurrences = _filter_recurrences(
+        detected,
+        memory_dir=memory_dir,
+        # Preserve this private helper's established keyword while supplying the decision clock.
+        scored_cycle=decision_cycle,
+        active_calibration_roles=active_calibration_roles,
+    )
+    return [recurrence.model_dump(mode="json") for recurrence in recurrences]
+
+
+def refresh_recurrences(
+    state_dir,
+    memory_dir,
+    *,
+    through_cycle: int,
+    decision_cycle: int,
+    cadence: str = "rebal",
+    k: int = 3,
+    window: int = 6,
+    active_calibration_roles: set[str] | None = None,
+) -> list[dict]:
+    """Rebuild the current packet without manufacturing a score observation."""
+    if through_cycle < 0 or decision_cycle < 0:
+        raise ValueError("recurrence clocks must be non-negative")
+    pending = _resolve_pending_dir(memory_dir)
+    pending.mkdir(parents=True, exist_ok=True)
+    # Consume once even when no score origin matures in this decision cycle.
+    (pending / "reflection.json").unlink(missing_ok=True)
+    records = _read_scorecard(
+        Path(memory_dir) / "scorecard.jsonl",
+        state_dir=state_dir,
+        cadence=cadence,
+    )
+    payload = _recurrence_payload(
+        state_dir,
+        memory_dir,
+        records,
+        through_cycle=through_cycle,
+        decision_cycle=decision_cycle,
+        cadence=cadence,
+        k=k,
+        window=window,
+        active_calibration_roles=active_calibration_roles,
+    )
+    (pending / "recurrences.json").write_text(json.dumps(payload, indent=2))
+    return payload
 
 
 def _build_score_record(
@@ -1831,9 +2322,19 @@ def score_previous_cycle(
     active_calibration_roles: set[str] | None = None,
     outcome_observation_cycle: int | None = None,
     outcome_scoring_marks_sha256: str = "",
+    recurrence_through_cycle: int | None = None,
+    recurrence_decision_cycle: int | None = None,
 ) -> dict:
     if btc_symbol != CANONICAL_BTC_SYMBOL:
         raise ValueError(f"daily score benchmark must be {CANONICAL_BTC_SYMBOL}")
+    recurrence_through = (
+        scored_cycle if recurrence_through_cycle is None else int(recurrence_through_cycle)
+    )
+    recurrence_decision = (
+        scored_cycle if recurrence_decision_cycle is None else int(recurrence_decision_cycle)
+    )
+    if recurrence_through < 0 or recurrence_decision < 0:
+        raise ValueError("recurrence clocks must be non-negative")
     pending = _resolve_pending_dir(memory_dir)
     pending.mkdir(parents=True, exist_ok=True)
     rec_path = pending / "recurrences.json"
@@ -1948,29 +2449,17 @@ def score_previous_cycle(
         )
     records = [by_cycle[c] for c in sorted(by_cycle)]
     _write_scorecard(sc_path, records)
-    calibration_records = [
-        item
-        for item in records
-        if score_record_is_manifest_bound(state_dir, item, cadence=cadence)
-        and daily_score_is_learning_eligible(item)
-    ]
-    detected = detect_recurrences(calibration_records, k=k, window=window)
-    detected.extend(_adversary_recovery_recurrences(calibration_records))
-    detected.extend(
-        _pm_gate_inactive_recurrences(
-            state_dir,
-            through_cycle=scored_cycle,
-            cadence=cadence,
-            k=k,
-        )
-    )
-    recs = _filter_recurrences(
-        detected,
-        memory_dir=memory_dir,
-        scored_cycle=scored_cycle,
+    payload = _recurrence_payload(
+        state_dir,
+        memory_dir,
+        records,
+        through_cycle=recurrence_through,
+        decision_cycle=recurrence_decision,
+        cadence=cadence,
+        k=k,
+        window=window,
         active_calibration_roles=active_calibration_roles,
     )
-    payload = [r.model_dump(mode="json") for r in recs]
     rec_path.write_text(json.dumps(payload, indent=2))
     return {
         "scored_cycle": scored_cycle,
@@ -1985,6 +2474,9 @@ REFLECTOR_HEADS_SCHEMA_VERSION = 1
 REFLECTOR_HEADS_NAME = "reflector-heads-v1.json"
 REFLECTOR_HEAD_ANCHOR_NAME = "reflector-head-anchor-v1.json"
 REFLECTION_AUTHORITY_DIR = "reflector-authority-v1"
+REFLECTION_APPLY_TRANSACTION_SUFFIX = "-apply-transaction.json"
+REFLECTION_APPLY_TRANSACTION_SCHEMA_VERSION = 1
+REFLECTION_CONSUMPTION_SCHEMA_VERSION = 2
 _HEAD_SOURCE_BOOTSTRAP = "audited_legacy_bootstrap"
 _HEAD_SOURCE_REFLECTION = "reflection"
 _HEX_CHARS = frozenset("0123456789abcdef")
@@ -2006,6 +2498,15 @@ def reflection_authority_path(state_dir, source_cycle: int) -> Path:
 
 def reflection_authority_consumption_path(state_dir, source_cycle: int) -> Path:
     return Path(state_dir) / REFLECTION_AUTHORITY_DIR / f"cycle-{int(source_cycle)}-consumed.json"
+
+
+def reflection_apply_transaction_path(state_dir, source_cycle: int) -> Path:
+    """Return the durable write-ahead intent for one managed-prompt apply."""
+    return (
+        Path(state_dir)
+        / REFLECTION_AUTHORITY_DIR
+        / f"cycle-{int(source_cycle)}{REFLECTION_APPLY_TRANSACTION_SUFFIX}"
+    )
 
 
 def _sha256_bytes(content: bytes) -> str:
@@ -2217,8 +2718,12 @@ def write_reflection_authority_consumption(
     source_cycle: int,
     recurrences_sha256: str,
     outcome: str,
+    proposal: dict,
+    agents_dir=None,
+    anchor_path=None,
+    apply_transaction_sha256: str | None = None,
 ) -> dict:
-    """Mark one authority packet consumed after apply/no-action completes successfully."""
+    """Bind one authenticated proposal to the exact verified post-apply desk state."""
     if outcome not in {"head_applied", "no_head_change"}:
         raise ValueError("invalid reflection authority consumption outcome")
     authority = validate_reflection_authority(
@@ -2227,16 +2732,69 @@ def write_reflection_authority_consumption(
         recurrences_sha256=recurrences_sha256,
     )
     memory_dir = Path(memory_dir)
+    state_dir = Path(state_dir)
     heads_path = memory_dir / REFLECTOR_HEADS_NAME
     journal_path = memory_dir / "reflector-journal.md"
+    anchor_path = (
+        Path(anchor_path)
+        if anchor_path is not None
+        else reflector_head_anchor_path(state_dir)
+    )
+    agents_dir = _resolve_recovery_agents_dir(memory_dir, agents_dir)
+    canonical_proposal, proposal_sha256, omitted_roles = _canonical_consumption_proposal(
+        proposal, authority
+    )
+    has_edits = bool(canonical_proposal["edits"])
+    if (outcome == "head_applied") is not has_edits:
+        raise ValueError("reflection consumption outcome conflicts with its canonical proposal")
+    _load_reflector_heads(agents_dir, journal_path, heads_path, anchor_path)
+    journal = journal_path.read_bytes() if journal_path.exists() else b""
+    _validate_consumption_head_events(
+        journal,
+        source_cycle=source_cycle,
+        proposal=canonical_proposal,
+        proposal_sha256=proposal_sha256,
+        outcome=outcome,
+    )
+    transaction_path = reflection_apply_transaction_path(state_dir, source_cycle)
+    if outcome == "head_applied":
+        transaction = _load_reflection_apply_transaction(
+            transaction_path,
+            state_dir=state_dir,
+            memory_dir=memory_dir,
+            agents_dir=agents_dir,
+            anchor_path=anchor_path,
+        )
+        transaction_digest = transaction["transaction_sha256"]
+        if apply_transaction_sha256 is not None and (
+            apply_transaction_sha256 != transaction_digest
+        ):
+            raise ValueError("reflection consumption names a different apply transaction")
+        if (
+            transaction["source_cycle"] != source_cycle
+            or transaction["proposal_sha256"] != proposal_sha256
+            or transaction["recurrences_sha256"] != recurrences_sha256
+        ):
+            raise ValueError("reflection apply transaction conflicts with consumption")
+        apply_transaction_sha256 = transaction_digest
+    elif apply_transaction_sha256 is not None:
+        raise ValueError("no-head-change consumption cannot name an apply transaction")
+    prompt_hashes = {
+        role: _sha256_bytes((agents_dir / f"{role}.md").read_bytes()) for role in _ALL_ROLES
+    }
     payload = {
         "authority_receipt_sha256": authority["receipt_sha256"],
+        "apply_transaction_sha256": apply_transaction_sha256,
+        "no_action_reason": canonical_proposal["no_action_reason"],
+        "omitted_roles": omitted_roles,
         "outcome": outcome,
+        "post_anchor_file_sha256": _sha256_bytes(anchor_path.read_bytes()),
         "post_heads_file_sha256": _sha256_bytes(heads_path.read_bytes()),
-        "post_journal_sha256": _sha256_bytes(
-            journal_path.read_bytes() if journal_path.exists() else b""
-        ),
-        "schema_version": REFLECTOR_HEADS_SCHEMA_VERSION,
+        "post_journal_sha256": _sha256_bytes(journal),
+        "post_prompt_file_sha256": prompt_hashes,
+        "proposal": canonical_proposal,
+        "proposal_sha256": proposal_sha256,
+        "schema_version": REFLECTION_CONSUMPTION_SCHEMA_VERSION,
         "source_cycle": source_cycle,
     }
     consumption = {
@@ -2252,7 +2810,312 @@ def write_reflection_authority_consumption(
     return consumption
 
 
-def reflection_authority_recovery_status(state_dir, memory_dir, source_cycle: int) -> dict | None:
+def _canonical_consumption_proposal(
+    proposal: dict, authority: dict
+) -> tuple[dict, str, list[str]]:
+    validated = ReflectionProposal.model_validate(proposal)
+    validate_unique_reflection_edit_roles(validated.edits)
+    canonical = validated.model_dump(mode="json")
+    edited_roles = {edit["role"] for edit in canonical["edits"]}
+    surfaced_roles = {recurrence["role"] for recurrence in authority["recurrences"]}
+    if not edited_roles.issubset(surfaced_roles):
+        raise ValueError("canonical reflection proposal edits an unauthorized role")
+    omitted_roles = sorted(surfaced_roles - edited_roles)
+    reason = canonical["no_action_reason"]
+    if (not canonical["edits"] or omitted_roles) and not reason.strip():
+        raise ValueError("reflection no-action/omitted-role reason must be nonblank")
+    return canonical, _sha256_bytes(_canonical_json_bytes(canonical)), omitted_roles
+
+
+def _validate_consumption_head_events(
+    journal: bytes,
+    *,
+    source_cycle: int,
+    proposal: dict,
+    proposal_sha256: str,
+    outcome: str,
+) -> None:
+    events: list[dict] = []
+    for line in journal.decode().splitlines():
+        if not line.startswith("- head_event_v1: "):
+            continue
+        try:
+            event = json.loads(line.removeprefix("- head_event_v1: "))
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid reflector head event while binding consumption") from exc
+        if int(event.get("source_cycle", -1)) == source_cycle:
+            events.append(event)
+    expected_roles = sorted(edit["role"] for edit in proposal["edits"])
+    event_roles = sorted(str(event.get("role", "")) for event in events)
+    if outcome == "head_applied":
+        if event_roles != expected_roles or any(
+            event.get("proposal_sha256") != proposal_sha256 for event in events
+        ):
+            raise ValueError("head_applied consumption does not match its head-event proposal")
+    elif events:
+        raise ValueError("no_head_change consumption conflicts with an applied head event")
+
+
+def _resolve_recovery_agents_dir(memory_dir: Path, agents_dir) -> Path:
+    if agents_dir is not None:
+        return Path(agents_dir)
+    candidates = (memory_dir.parent / "agents", memory_dir / "agents")
+    for candidate in candidates:
+        if all((candidate / f"{role}.md").exists() for role in _ALL_ROLES):
+            return candidate
+    raise ValueError("agents_dir is required to validate proposal-bound reflection consumption")
+
+
+def _load_reflection_authority_consumption_record(
+    state_dir: Path,
+    memory_dir: Path,
+    source_cycle: int,
+) -> tuple[dict, dict]:
+    """Authenticate a consumption independently of whether a later head superseded its files."""
+    authority_path = reflection_authority_path(state_dir, source_cycle)
+    try:
+        authority_raw = json.loads(authority_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("consumption has no valid reflection authority") from exc
+    authority = validate_reflection_authority(
+        state_dir,
+        source_cycle=source_cycle,
+        recurrences_sha256=str(authority_raw.get("recurrences_sha256", "")),
+    )
+    consumption_path = reflection_authority_consumption_path(state_dir, source_cycle)
+    try:
+        consumption = json.loads(consumption_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid reflection authority consumption") from exc
+    payload = {key: value for key, value in consumption.items() if key != "consumption_sha256"}
+    legacy_fields = {
+        "authority_receipt_sha256",
+        "consumption_sha256",
+        "outcome",
+        "post_heads_file_sha256",
+        "post_journal_sha256",
+        "schema_version",
+        "source_cycle",
+    }
+    proposal_bound_fields = {
+        "authority_receipt_sha256",
+        "apply_transaction_sha256",
+        "consumption_sha256",
+        "no_action_reason",
+        "omitted_roles",
+        "outcome",
+        "post_anchor_file_sha256",
+        "post_heads_file_sha256",
+        "post_journal_sha256",
+        "post_prompt_file_sha256",
+        "proposal",
+        "proposal_sha256",
+        "schema_version",
+        "source_cycle",
+    }
+    common_valid = bool(
+        consumption.get("authority_receipt_sha256") == authority["receipt_sha256"]
+        and consumption.get("source_cycle") == source_cycle
+        and consumption.get("outcome") in {"head_applied", "no_head_change"}
+        and _is_sha256(consumption.get("consumption_sha256"))
+        and consumption["consumption_sha256"] == _sha256_bytes(_canonical_json_bytes(payload))
+        and _is_sha256(consumption.get("post_heads_file_sha256"))
+        and _is_sha256(consumption.get("post_journal_sha256"))
+    )
+    if set(consumption) == legacy_fields:
+        if consumption.get("schema_version") != REFLECTOR_HEADS_SCHEMA_VERSION or not common_valid:
+            raise ValueError("legacy reflection authority consumption mismatch")
+        return authority, consumption
+    if set(consumption) != proposal_bound_fields or not common_valid:
+        raise ValueError("proposal-bound reflection authority consumption mismatch")
+    canonical_proposal, proposal_sha256, omitted_roles = _canonical_consumption_proposal(
+        consumption["proposal"], authority
+    )
+    prompt_hashes = consumption.get("post_prompt_file_sha256")
+    outcome = consumption["outcome"]
+    if (
+        consumption.get("schema_version") != REFLECTION_CONSUMPTION_SCHEMA_VERSION
+        or consumption.get("proposal") != canonical_proposal
+        or consumption.get("proposal_sha256") != proposal_sha256
+        or consumption.get("no_action_reason") != canonical_proposal["no_action_reason"]
+        or consumption.get("omitted_roles") != omitted_roles
+        or not _is_sha256(consumption.get("post_anchor_file_sha256"))
+        or not isinstance(prompt_hashes, dict)
+        or set(prompt_hashes) != set(_ALL_ROLES)
+        or any(not _is_sha256(value) for value in prompt_hashes.values())
+        or (outcome == "head_applied") is not bool(canonical_proposal["edits"])
+        or (
+            outcome == "head_applied"
+            and not _is_sha256(consumption.get("apply_transaction_sha256"))
+        )
+        or (
+            outcome == "no_head_change"
+            and consumption.get("apply_transaction_sha256") is not None
+        )
+    ):
+        raise ValueError("proposal-bound reflection authority consumption mismatch")
+    journal_path = memory_dir / "reflector-journal.md"
+    journal = journal_path.read_bytes() if journal_path.exists() else b""
+    _validate_consumption_head_events(
+        journal,
+        source_cycle=source_cycle,
+        proposal=canonical_proposal,
+        proposal_sha256=proposal_sha256,
+        outcome=outcome,
+    )
+    return authority, consumption
+
+
+def reflection_consumption_replay_status(
+    state_dir,
+    memory_dir,
+    *,
+    source_cycle: int,
+    recurrences_sha256: str,
+    proposal: dict,
+) -> dict | None:
+    """Recognize an exact replay of an already-consumed proposal without writing.
+
+    A no-head-change decision has no journal head event, so journal monotonicity alone cannot make
+    its authority single-use. Authenticate the immutable consumption before an apply can publish
+    a transaction. Schema-v2 consumptions retain the canonical proposal and can be replayed
+    idempotently; legacy receipts deliberately cannot authorize another attempt because they did
+    not retain enough information to prove proposal equality.
+    """
+    state_dir = Path(state_dir)
+    memory_dir = Path(memory_dir)
+    path = reflection_authority_consumption_path(state_dir, source_cycle)
+    if not path.exists():
+        return None
+    authority, consumption = _load_reflection_authority_consumption_record(
+        state_dir, memory_dir, source_cycle
+    )
+    if authority["recurrences_sha256"] != recurrences_sha256:
+        raise ValueError("consumed reflection authority has a different recurrence packet")
+    if consumption.get("schema_version") != REFLECTION_CONSUMPTION_SCHEMA_VERSION:
+        raise ValueError(
+            "reflection authority was already consumed by a legacy receipt; "
+            "proposal replay is not provable"
+        )
+    canonical_proposal, proposal_sha256, _omitted_roles = _canonical_consumption_proposal(
+        proposal, authority
+    )
+    expected_outcome = "head_applied" if canonical_proposal["edits"] else "no_head_change"
+    if (
+        consumption["proposal"] != canonical_proposal
+        or consumption["proposal_sha256"] != proposal_sha256
+        or consumption["outcome"] != expected_outcome
+    ):
+        raise ValueError(
+            "reflection authority is already consumed by a different canonical proposal"
+        )
+    return {
+        "outcome": expected_outcome,
+        "proposal_sha256": proposal_sha256,
+        "source_cycle": source_cycle,
+    }
+
+
+def read_only_reflection_probe_issues(
+    state_dir,
+    memory_dir,
+    agents_dir,
+    *,
+    anchor_path=None,
+) -> list[str]:
+    """Report recovery work without performing it.
+
+    This is the unlocked host health-probe surface. It must never call a recovery helper or a
+    durable writer: a pending transaction or consumed-but-unhandled authority is reported as an
+    issue for the next lock-owning full preflight to recover.
+    """
+    state_dir = Path(state_dir)
+    memory_dir = Path(memory_dir)
+    agents_dir = Path(agents_dir)
+    anchor_path = (
+        Path(anchor_path)
+        if anchor_path is not None
+        else reflector_head_anchor_path(state_dir)
+    )
+    journal_path = memory_dir / "reflector-journal.md"
+    issues = audit_managed_region_provenance(
+        agents_dir,
+        journal_path,
+        reflector_heads_path(journal_path),
+        anchor_path,
+    )
+    authority_dir = state_dir / REFLECTION_AUTHORITY_DIR
+    for path in sorted(authority_dir.glob(f"cycle-*{REFLECTION_APPLY_TRANSACTION_SUFFIX}")):
+        issues.append(f"pending reflection apply recovery: {path.name}")
+
+    handled_path = memory_dir / "recurrence-handled.json"
+    try:
+        handled = json.loads(handled_path.read_text()) if handled_path.exists() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        issues.append(f"invalid recurrence-handled.json: {exc}")
+        handled = {}
+    if not isinstance(handled, dict):
+        issues.append("invalid recurrence-handled.json structure")
+        handled = {}
+
+    for path in sorted(authority_dir.glob("cycle-*-consumed.json")):
+        try:
+            source_cycle = int(
+                path.name.removeprefix("cycle-").removesuffix("-consumed.json")
+            )
+            authority, _consumption = _load_reflection_authority_consumption_record(
+                state_dir, memory_dir, source_cycle
+            )
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            issues.append(f"invalid reflection consumption {path.name}: {exc}")
+            continue
+        missing_keys: list[str] = []
+        for recurrence in authority["recurrences"]:
+            key = f"{recurrence['kind']}:{recurrence['role']}"
+            try:
+                handled_cycle = int(handled.get(key, {}).get("cycle", -1))
+            except (AttributeError, TypeError, ValueError):
+                handled_cycle = -1
+            if handled_cycle < source_cycle:
+                missing_keys.append(key)
+        if missing_keys:
+            issues.append(
+                f"consumed reflection cycle {source_cycle} has unhandled recurrence(s): "
+                + ", ".join(sorted(missing_keys))
+            )
+    return issues
+
+
+def reconcile_consumed_reflection_handled(state_dir, memory_dir) -> list[int]:
+    """Replay every authenticated immutable consumption into the monotonic cooldown ledger."""
+    state_dir = Path(state_dir)
+    memory_dir = Path(memory_dir)
+    authority_dir = state_dir / REFLECTION_AUTHORITY_DIR
+    recovered: list[int] = []
+    for path in sorted(authority_dir.glob("cycle-*-consumed.json")):
+        name = path.name
+        try:
+            source_cycle = int(name.removeprefix("cycle-").removesuffix("-consumed.json"))
+        except ValueError as exc:
+            raise ValueError(f"invalid reflection consumption filename: {name}") from exc
+        authority, _consumption = _load_reflection_authority_consumption_record(
+            state_dir, memory_dir, source_cycle
+        )
+        mark_recurrences_handled(memory_dir, authority["recurrences"], cycle=source_cycle)
+        recovered.append(source_cycle)
+    if recovered:
+        fsync_directory(memory_dir)
+    return recovered
+
+
+def reflection_authority_recovery_status(
+    state_dir,
+    memory_dir,
+    source_cycle: int,
+    *,
+    agents_dir=None,
+    anchor_path=None,
+) -> dict | None:
     """Classify a prior incomplete attempt's immutable Reflector authorization."""
     path = reflection_authority_path(state_dir, source_cycle)
     if not path.exists():
@@ -2264,6 +3127,7 @@ def reflection_authority_recovery_status(state_dir, memory_dir, source_cycle: in
         source_cycle=source_cycle,
         recurrences_sha256=digest,
     )
+    state_dir = Path(state_dir)
     memory_dir = Path(memory_dir)
     heads_path = memory_dir / REFLECTOR_HEADS_NAME
     journal_path = memory_dir / "reflector-journal.md"
@@ -2276,29 +3140,97 @@ def reflection_authority_recovery_status(state_dir, memory_dir, source_cycle: in
             consumption = json.loads(consumption_path.read_text())
         except json.JSONDecodeError as exc:
             raise ValueError("invalid reflection authority consumption") from exc
-        payload = {key: value for key, value in consumption.items() if key != "consumption_sha256"}
-        if (
-            set(consumption)
-            != {
-                "authority_receipt_sha256",
-                "consumption_sha256",
-                "outcome",
-                "post_heads_file_sha256",
-                "post_journal_sha256",
-                "schema_version",
-                "source_cycle",
-            }
-            or consumption.get("authority_receipt_sha256") != receipt["receipt_sha256"]
+        payload = {
+            key: value for key, value in consumption.items() if key != "consumption_sha256"
+        }
+        legacy_fields = {
+            "authority_receipt_sha256",
+            "consumption_sha256",
+            "outcome",
+            "post_heads_file_sha256",
+            "post_journal_sha256",
+            "schema_version",
+            "source_cycle",
+        }
+        proposal_bound_fields = {
+            "authority_receipt_sha256",
+            "apply_transaction_sha256",
+            "consumption_sha256",
+            "no_action_reason",
+            "omitted_roles",
+            "outcome",
+            "post_anchor_file_sha256",
+            "post_heads_file_sha256",
+            "post_journal_sha256",
+            "post_prompt_file_sha256",
+            "proposal",
+            "proposal_sha256",
+            "schema_version",
+            "source_cycle",
+        }
+        common_invalid = (
+            consumption.get("authority_receipt_sha256") != receipt["receipt_sha256"]
             or consumption.get("source_cycle") != source_cycle
-            or consumption.get("schema_version") != REFLECTOR_HEADS_SCHEMA_VERSION
             or consumption.get("outcome") not in {"head_applied", "no_head_change"}
             or consumption.get("consumption_sha256")
             != _sha256_bytes(_canonical_json_bytes(payload))
             or consumption.get("post_heads_file_sha256") != current_heads_sha
             or consumption.get("post_journal_sha256") != current_journal_sha
+        )
+        if set(consumption) == legacy_fields:
+            if (
+                consumption.get("schema_version") != REFLECTOR_HEADS_SCHEMA_VERSION
+                or common_invalid
+            ):
+                raise ValueError("legacy reflection authority consumption mismatch")
+            return {"status": "consumed", "receipt": receipt, "consumption": consumption}
+        if set(consumption) != proposal_bound_fields:
+            raise ValueError("invalid reflection authority consumption structure")
+        agents_dir = _resolve_recovery_agents_dir(memory_dir, agents_dir)
+        anchor_path = (
+            Path(anchor_path)
+            if anchor_path is not None
+            else reflector_head_anchor_path(state_dir)
+        )
+        try:
+            canonical_proposal, proposal_sha256, omitted_roles = (
+                _canonical_consumption_proposal(consumption["proposal"], receipt)
+            )
+            prompt_hashes = {
+                role: _sha256_bytes((agents_dir / f"{role}.md").read_bytes())
+                for role in _ALL_ROLES
+            }
+            _load_reflector_heads(agents_dir, journal_path, heads_path, anchor_path)
+            _validate_consumption_head_events(
+                current_journal,
+                source_cycle=source_cycle,
+                proposal=canonical_proposal,
+                proposal_sha256=proposal_sha256,
+                outcome=str(consumption["outcome"]),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError("proposal-bound reflection consumption poststate is invalid") from exc
+        if (
+            consumption.get("schema_version") != REFLECTION_CONSUMPTION_SCHEMA_VERSION
+            or common_invalid
+            or consumption.get("proposal") != canonical_proposal
+            or consumption.get("proposal_sha256") != proposal_sha256
+            or consumption.get("no_action_reason") != canonical_proposal["no_action_reason"]
+            or consumption.get("omitted_roles") != omitted_roles
+            or consumption.get("post_anchor_file_sha256")
+            != _sha256_bytes(anchor_path.read_bytes())
+            or consumption.get("post_prompt_file_sha256") != prompt_hashes
+            or (
+                consumption.get("outcome") == "head_applied"
+                and not _is_sha256(consumption.get("apply_transaction_sha256"))
+            )
+            or (
+                consumption.get("outcome") == "no_head_change"
+                and consumption.get("apply_transaction_sha256") is not None
+            )
         ):
-            raise ValueError("reflection authority consumption mismatch")
-        return {"status": "consumed", "receipt": receipt}
+            raise ValueError("proposal-bound reflection authority consumption mismatch")
+        return {"status": "consumed", "receipt": receipt, "consumption": consumption}
     applied_events = []
     for line in current_journal.decode().splitlines():
         if not line.startswith("- head_event_v1: "):
@@ -2356,6 +3288,389 @@ def _build_anchor(heads: dict, heads_content: bytes, prior: dict | None) -> dict
         "schema_version": REFLECTOR_HEADS_SCHEMA_VERSION,
     }
     return _seal_anchor(payload)
+
+
+def _transaction_snapshot_fields(
+    key: str,
+    snapshot: tuple[bool, bytes, int | None],
+    post_content: bytes,
+) -> dict:
+    pre_exists, pre_content, pre_mode = snapshot
+    post_mode = pre_mode if pre_exists and pre_mode is not None else 0o600
+    return {
+        "key": key,
+        "post_bytes_b64": b64encode(post_content).decode("ascii"),
+        "post_mode": post_mode,
+        "post_sha256": _sha256_bytes(post_content),
+        "pre_bytes_b64": b64encode(pre_content).decode("ascii"),
+        "pre_exists": pre_exists,
+        "pre_mode": pre_mode,
+        "pre_sha256": _sha256_bytes(pre_content) if pre_exists else None,
+    }
+
+
+def _seal_reflection_apply_transaction(payload: dict) -> dict:
+    return {
+        **payload,
+        "transaction_sha256": _sha256_bytes(_canonical_json_bytes(payload)),
+    }
+
+
+def _transaction_bytes(transaction: dict) -> bytes:
+    return json.dumps(transaction, indent=2, sort_keys=True).encode() + b"\n"
+
+
+def _transaction_target_paths(
+    transaction: dict,
+    *,
+    memory_dir: Path,
+    agents_dir: Path,
+    anchor_path: Path,
+    journal_path: Path | None = None,
+) -> dict[str, Path]:
+    journal_path = journal_path if journal_path is not None else memory_dir / "reflector-journal.md"
+    targets = {
+        "anchor": anchor_path,
+        "heads": reflector_heads_path(journal_path),
+        "journal": journal_path,
+    }
+    for edit in transaction["proposal"]["edits"]:
+        role = edit["role"]
+        targets[f"prompt:{role}"] = agents_dir / f"{role}.md"
+    return targets
+
+
+def _decode_transaction_bytes(value: object, *, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"reflection apply transaction {field} is not base64 text")
+    try:
+        return b64decode(value, validate=True)
+    except Exception as exc:  # noqa: BLE001 - normalize malformed base64 to a closed validation
+        raise ValueError(f"reflection apply transaction {field} is invalid base64") from exc
+
+
+def _load_reflection_apply_transaction(
+    path: Path,
+    *,
+    state_dir: Path,
+    memory_dir: Path,
+    agents_dir: Path,
+    anchor_path: Path,
+    journal_path: Path | None = None,
+) -> dict:
+    try:
+        transaction = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"missing or invalid reflection apply transaction: {path}") from exc
+    fields = {
+        "authority_receipt_sha256",
+        "files",
+        "proposal",
+        "proposal_sha256",
+        "recurrences_sha256",
+        "schema_version",
+        "source_cycle",
+        "transaction_sha256",
+    }
+    if not isinstance(transaction, dict) or set(transaction) != fields:
+        raise ValueError("invalid reflection apply transaction structure")
+    payload = {key: value for key, value in transaction.items() if key != "transaction_sha256"}
+    source_cycle = transaction.get("source_cycle")
+    if (
+        transaction.get("schema_version") != REFLECTION_APPLY_TRANSACTION_SCHEMA_VERSION
+        or not isinstance(source_cycle, int)
+        or isinstance(source_cycle, bool)
+        or source_cycle < 1
+        or path != reflection_apply_transaction_path(state_dir, source_cycle)
+        or not _is_sha256(transaction.get("transaction_sha256"))
+        or transaction["transaction_sha256"] != _sha256_bytes(_canonical_json_bytes(payload))
+    ):
+        raise ValueError("reflection apply transaction self-digest mismatch")
+    authority = validate_reflection_authority(
+        state_dir,
+        source_cycle=source_cycle,
+        recurrences_sha256=str(transaction.get("recurrences_sha256", "")),
+    )
+    canonical_proposal, proposal_sha256, _omitted = _canonical_consumption_proposal(
+        transaction.get("proposal"), authority
+    )
+    if (
+        not canonical_proposal["edits"]
+        or transaction["proposal"] != canonical_proposal
+        or transaction.get("proposal_sha256") != proposal_sha256
+        or transaction.get("authority_receipt_sha256") != authority["receipt_sha256"]
+    ):
+        raise ValueError("reflection apply transaction authority/proposal mismatch")
+    targets = _transaction_target_paths(
+        transaction,
+        memory_dir=memory_dir,
+        agents_dir=agents_dir,
+        anchor_path=anchor_path,
+        journal_path=journal_path,
+    )
+    records = transaction.get("files")
+    if not isinstance(records, list) or [record.get("key") for record in records] != sorted(
+        targets
+    ):
+        raise ValueError("reflection apply transaction target set/order mismatch")
+    record_fields = {
+        "key",
+        "post_bytes_b64",
+        "post_mode",
+        "post_sha256",
+        "pre_bytes_b64",
+        "pre_exists",
+        "pre_mode",
+        "pre_sha256",
+    }
+    for record in records:
+        if not isinstance(record, dict) or set(record) != record_fields:
+            raise ValueError("invalid reflection apply transaction file record")
+        pre = _decode_transaction_bytes(record["pre_bytes_b64"], field="pre_bytes_b64")
+        post = _decode_transaction_bytes(record["post_bytes_b64"], field="post_bytes_b64")
+        pre_exists = record["pre_exists"]
+        pre_mode = record["pre_mode"]
+        post_mode = record["post_mode"]
+        if (
+            not isinstance(pre_exists, bool)
+            or (pre_exists and (not isinstance(pre_mode, int) or not 0 <= pre_mode <= 0o7777))
+            or (
+                not pre_exists
+                and (pre_mode is not None or pre or record["pre_sha256"] is not None)
+            )
+            or not isinstance(post_mode, int)
+            or not 0 <= post_mode <= 0o7777
+            or not _is_sha256(record["post_sha256"])
+            or record["post_sha256"] != _sha256_bytes(post)
+            or (
+                pre_exists
+                and (
+                    not _is_sha256(record["pre_sha256"])
+                    or record["pre_sha256"] != _sha256_bytes(pre)
+                )
+            )
+        ):
+            raise ValueError("reflection apply transaction file record mismatch")
+    return transaction
+
+
+def _transaction_record_bytes(record: dict, state: str) -> bytes:
+    return _decode_transaction_bytes(record[f"{state}_bytes_b64"], field=f"{state}_bytes_b64")
+
+
+def _transaction_state_matches(path: Path, record: dict, state: str) -> bool:
+    if state == "pre" and not record["pre_exists"]:
+        return not path.exists()
+    if not path.exists():
+        return False
+    content = path.read_bytes()
+    return (
+        _sha256_bytes(content) == record[f"{state}_sha256"]
+        and content == _transaction_record_bytes(record, state)
+        and stat.S_IMODE(path.stat().st_mode) == record[f"{state}_mode"]
+    )
+
+
+def _restore_reflection_transaction_prestate(
+    transaction: dict,
+    *,
+    memory_dir: Path,
+    agents_dir: Path,
+    anchor_path: Path,
+    journal_path: Path | None = None,
+) -> None:
+    targets = _transaction_target_paths(
+        transaction,
+        memory_dir=memory_dir,
+        agents_dir=agents_dir,
+        anchor_path=anchor_path,
+        journal_path=journal_path,
+    )
+    records = {record["key"]: record for record in transaction["files"]}
+    divergent = [
+        key
+        for key, path in sorted(targets.items())
+        if not _transaction_state_matches(path, records[key], "pre")
+        and not _transaction_state_matches(path, records[key], "post")
+    ]
+    if divergent:
+        raise ValueError(
+            "reflection apply transaction has divergent target(s); refusing rollback: "
+            + ", ".join(divergent)
+        )
+    for key in sorted(targets):
+        path = targets[key]
+        record = records[key]
+        if _transaction_state_matches(path, record, "pre"):
+            continue
+        if record["pre_exists"]:
+            durable_write_bytes(
+                path,
+                _transaction_record_bytes(record, "pre"),
+                mode=int(record["pre_mode"]),
+            )
+        else:
+            durable_unlink(path)
+    if not all(
+        _transaction_state_matches(path, records[key], "pre")
+        for key, path in targets.items()
+    ):
+        raise ValueError("reflection apply transaction prestate restoration failed")
+
+
+def _validate_reflection_transaction_poststate(
+    transaction: dict,
+    *,
+    state_dir: Path,
+    memory_dir: Path,
+    agents_dir: Path,
+    anchor_path: Path,
+    journal_path: Path | None = None,
+) -> bool:
+    journal_path = journal_path if journal_path is not None else memory_dir / "reflector-journal.md"
+    heads_path = reflector_heads_path(journal_path)
+    targets = _transaction_target_paths(
+        transaction,
+        memory_dir=memory_dir,
+        agents_dir=agents_dir,
+        anchor_path=anchor_path,
+        journal_path=journal_path,
+    )
+    records = {record["key"]: record for record in transaction["files"]}
+    if not all(
+        _transaction_state_matches(path, records[key], "post")
+        for key, path in targets.items()
+    ):
+        return False
+    try:
+        _load_reflector_heads(
+            agents_dir,
+            journal_path,
+            heads_path,
+            anchor_path,
+        )
+        _validate_consumption_head_events(
+            journal_path.read_bytes(),
+            source_cycle=transaction["source_cycle"],
+            proposal=transaction["proposal"],
+            proposal_sha256=transaction["proposal_sha256"],
+            outcome="head_applied",
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _publish_reflection_apply_transaction(path: Path, transaction: dict) -> None:
+    encoded = _transaction_bytes(transaction)
+    if path.exists():
+        if path.read_bytes() != encoded:
+            raise ValueError(f"conflicting reflection apply transaction: {path}")
+        return
+    durable_write_bytes(path, encoded, mode=0o400)
+
+
+def recover_reflection_apply_transactions(
+    state_dir,
+    memory_dir,
+    agents_dir=None,
+    *,
+    source_cycle: int | None = None,
+    anchor_path=None,
+) -> list[dict]:
+    """Recover every interrupted managed-prompt apply before any head audit or scoring.
+
+    An immutable consumption forbids rollback: its complete poststate must validate. Without a
+    consumption, a completely valid poststate is forward-completed; every other state is restored
+    byte-for-byte to the intent's prestate. The intent is removed only after consumption/handled
+    finalization or after verified rollback, so each operation is idempotent across repeated loss.
+    """
+    state_dir = Path(state_dir)
+    memory_dir = Path(memory_dir)
+    agents_dir = _resolve_recovery_agents_dir(memory_dir, agents_dir)
+    anchor_path = (
+        Path(anchor_path)
+        if anchor_path is not None
+        else reflector_head_anchor_path(state_dir)
+    )
+    if source_cycle is None:
+        authority_dir = state_dir / REFLECTION_AUTHORITY_DIR
+        paths = sorted(authority_dir.glob(f"cycle-*{REFLECTION_APPLY_TRANSACTION_SUFFIX}"))
+    else:
+        candidate = reflection_apply_transaction_path(state_dir, source_cycle)
+        paths = [candidate] if candidate.exists() else []
+    recovered: list[dict] = []
+    for path in paths:
+        transaction = _load_reflection_apply_transaction(
+            path,
+            state_dir=state_dir,
+            memory_dir=memory_dir,
+            agents_dir=agents_dir,
+            anchor_path=anchor_path,
+        )
+        cycle = int(transaction["source_cycle"])
+        consumption_path = reflection_authority_consumption_path(state_dir, cycle)
+        post_valid = _validate_reflection_transaction_poststate(
+            transaction,
+            state_dir=state_dir,
+            memory_dir=memory_dir,
+            agents_dir=agents_dir,
+            anchor_path=anchor_path,
+        )
+        if consumption_path.exists():
+            if not post_valid:
+                raise ValueError(
+                    "consumed reflection apply transaction lacks its complete valid poststate"
+                )
+            status = reflection_authority_recovery_status(
+                state_dir,
+                memory_dir,
+                cycle,
+                agents_dir=agents_dir,
+                anchor_path=anchor_path,
+            )
+            if status is None or status["status"] != "consumed":
+                raise ValueError("reflection apply consumption could not be authenticated")
+            if (
+                status.get("consumption", {}).get("apply_transaction_sha256")
+                != transaction["transaction_sha256"]
+            ):
+                raise ValueError("reflection consumption names a different durable transaction")
+            outcome = "consumed_poststate_finalized"
+        elif post_valid:
+            write_reflection_authority_consumption(
+                state_dir,
+                memory_dir,
+                source_cycle=cycle,
+                recurrences_sha256=transaction["recurrences_sha256"],
+                outcome="head_applied",
+                proposal=transaction["proposal"],
+                agents_dir=agents_dir,
+                anchor_path=anchor_path,
+                apply_transaction_sha256=transaction["transaction_sha256"],
+            )
+            outcome = "complete_poststate_forward_completed"
+        else:
+            _restore_reflection_transaction_prestate(
+                transaction,
+                memory_dir=memory_dir,
+                agents_dir=agents_dir,
+                anchor_path=anchor_path,
+            )
+            durable_unlink(path)
+            recovered.append({"source_cycle": cycle, "outcome": "partial_prestate_restored"})
+            continue
+        authority = validate_reflection_authority(
+            state_dir,
+            source_cycle=cycle,
+            recurrences_sha256=transaction["recurrences_sha256"],
+        )
+        mark_recurrences_handled(memory_dir, authority["recurrences"], cycle=cycle)
+        fsync_directory(memory_dir)
+        durable_unlink(path)
+        recovered.append({"source_cycle": cycle, "outcome": outcome})
+    reconcile_consumed_reflection_handled(state_dir, memory_dir)
+    return recovered
 
 
 def _bootstrap_head(region: str) -> dict:
@@ -2775,30 +4090,50 @@ def scored_cycles(memory_dir, *, state_dir=None, cadence: str = "rebal") -> set[
 
 
 def validate_edit_citations(
-    edit: dict, cycles: set[int], current_cycle: int | None = None
+    edit: dict,
+    cycles: set[int],
+    current_cycle: int | None = None,
+    *,
+    authorized_state_evidence: set[str] | None = None,
 ) -> str | None:
     """Deterministic evidence-integrity guard (2026-07 review: the Reflector cited per-cycle
     scores for cycles that had NO ScoreRecord — fabricated evidence tuned live decision prompts).
 
     The fabrication mode is a claim about a PAST cycle's measured score that doesn't exist. A
     reference to the CURRENT cycle (the note's "[cN]" date tag) or a FUTURE cycle (a `retire_if:
-    ... by cM` target) legitimately has no scorecard record yet — those are not evidence claims.
-    So only a cited cycle STRICTLY BEFORE `current_cycle` must exist in scorecard.jsonl. When
-    `current_cycle` is None, every cited cycle must exist (strict legacy behaviour). Returns a
-    refusal reason, or None when clean."""
+    ... by cM` target) legitimately has no scorecard record yet — those are not past claims. So
+    only a cited cycle STRICTLY BEFORE `current_cycle` must normally exist in scorecard.jsonl.
+
+    The one narrow exception is an evidence-list row copied exactly from a sealed, same-role
+    state-only recurrence supplied by the caller. This lets `pm_gate_inactive` cite the newest
+    completed cycle before its forward score matures without granting a cycle-wide exemption.
+    Region text, reason, and retire_if never receive that exception, and paraphrased evidence does
+    not receive it. When `current_cycle` is None, every cited cycle is past (strict legacy
+    behaviour). Returns a refusal reason, or None when clean."""
     import re
 
-    text = " ".join(
-        [
-            str(edit.get("region_text", "")),
-            str(edit.get("reason", "")),
-            " ".join(str(e) for e in edit.get("evidence", [])),
-        ]
+    def past_citations(text: str) -> set[int]:
+        cited = {
+            int(match)
+            for match in re.findall(
+                r"\bc(?:ycle\s*)?(\d{1,4})\b", text, flags=re.IGNORECASE
+            )
+        }
+        if current_cycle is not None:
+            cited = {cycle for cycle in cited if cycle < current_cycle}
+        return cited
+
+    ordinary_text = " ".join(
+        str(edit.get(field, "")) for field in ("region_text", "reason", "retire_if")
     )
-    cited = {int(m) for m in re.findall(r"\bc(?:ycle\s*)?(\d{1,4})\b", text, flags=re.IGNORECASE)}
-    if current_cycle is not None:
-        cited = {c for c in cited if c < current_cycle}  # only PAST-score claims are checkable
-    missing = sorted(c for c in cited if c not in cycles)
+    missing = {cycle for cycle in past_citations(ordinary_text) if cycle not in cycles}
+    authorized_rows = authorized_state_evidence or set()
+    for raw_row in edit.get("evidence", []):
+        row = str(raw_row)
+        row_missing = {cycle for cycle in past_citations(row) if cycle not in cycles}
+        if row_missing and row not in authorized_rows:
+            missing.update(row_missing)
+    missing = sorted(missing)
     if missing:
         return (
             f"cites past cycle(s) {missing} with no ScoreRecord in scorecard.jsonl — "
@@ -2855,12 +4190,17 @@ def apply_reflection(
     """Apply a reflection proposal to the agent prompts, guarded to the managed region.
 
     `allowed_roles` (when not None) restricts edits to roles the scorecard surfaced a
-    recurrence for — a hallucinated edit to an unmentioned role is skipped. At most one
-    edit per role (last wins). `known_cycles` (when not None) enables the evidence-integrity
+    recurrence for — a hallucinated edit to an unmentioned role is skipped. Duplicate role edits
+    invalidate the whole proposal. `known_cycles` (when not None) enables the evidence-integrity
     guard: an edit citing a PAST cycle with no ScoreRecord is refused (fabricated evidence).
     `current_cycle` scopes that guard to past-score claims only (the note's own [cN] tag and a
     future retire_if target are legitimately unscored). Every applied head is bound to that source
     cycle, the canonical proposal, and the complete canonical surfaced-recurrence packet."""
+    # Validate before even resolving/loading journal state. The explicit helper is intentional:
+    # Pydantic model instances created through ``model_construct`` can bypass model validators.
+    validated_proposal = ReflectionProposal.model_validate(proposal)
+    validate_unique_reflection_edit_roles(validated_proposal.edits)
+    canonical_proposal = validated_proposal.model_dump(mode="json")
     agents_dir = Path(agents_dir)
     journal_path = Path(journal_path)
     heads_path = reflector_heads_path(journal_path)
@@ -2870,48 +4210,12 @@ def apply_reflection(
         else journal_path.with_name(REFLECTOR_HEAD_ANCHOR_NAME)
     )
     heads = _load_reflector_heads(agents_dir, journal_path, heads_path, anchor_path)
-    prior_anchor = _load_reflector_anchor(anchor_path, heads, heads_path.read_bytes())
-    canonical_proposal = ReflectionProposal.model_validate(proposal).model_dump(mode="json")
-    applied: list[str] = []
-    skipped: list[tuple[str, str]] = []
-    # dedupe per role (last edit wins) so a role is edited at most once per cycle
-    edits_by_role: dict = {}
-    order: list = []
-    for edit in canonical_proposal["edits"]:
-        role = edit.get("role")
-        if role not in order:
-            order.append(role)
-        edits_by_role[role] = edit
-    prompt_updates: dict[Path, bytes] = {}
-    applied_edits: list[tuple[str, dict, str]] = []
-    for role in order:
-        edit = edits_by_role[role]
-        path = agents_dir / f"{role}.md"
-        if role not in _ALL_ROLES or not path.exists():
-            skipped.append((role, "unknown role or missing file"))
-            continue
-        if allowed_roles is not None and role not in allowed_roles:
-            skipped.append((role, "no surfaced recurrence for this role"))
-            continue
-        if known_cycles is not None:
-            refusal = validate_edit_citations(edit, known_cycles, current_cycle=current_cycle)
-            if refusal:
-                skipped.append((role, refusal))
-                continue
-        old = path.read_text()
-        try:
-            new = splice_managed(old, edit.get("region_text", ""))
-            assert_only_region_changed(old, new)
-        except PromptGuardError as e:
-            skipped.append((role, str(e)))
-            continue
-        _prefix, region, _suffix = split_managed(new)
-        prompt_updates[path] = new.encode()
-        applied_edits.append((role, edit, region.strip()))
-        applied.append(role)
-    if not applied:
-        return {"applied": applied, "skipped": skipped}
+    heads_bytes = heads_path.read_bytes()
+    prior_anchor = _load_reflector_anchor(anchor_path, heads, heads_bytes)
 
+    # Authenticate the complete recurrence packet before it can grant even the narrowly scoped
+    # state-evidence citation exception. Explicit no-action proposals are authenticated too: they
+    # consume the same one-shot authority and cooldown as an edit.
     if not isinstance(current_cycle, int) or isinstance(current_cycle, bool) or current_cycle < 1:
         raise ValueError("an applied reflection requires a positive source cycle")
     if not isinstance(surfaced_recurrences, list) or any(
@@ -2929,10 +4233,24 @@ def apply_reflection(
     recurrences_sha256 = _sha256_bytes(_canonical_json_bytes(canonical_recurrences))
     if not _is_sha256(sealed_recurrences_sha256) or sealed_recurrences_sha256 != recurrences_sha256:
         raise ValueError("surfaced recurrence packet does not match its desk_score seal")
-    generation = int(heads["generation"]) + 1
     old_journal = journal_path.read_bytes() if journal_path.exists() else b""
     if old_journal and not old_journal.endswith(b"\n"):
         raise ValueError("reflector journal is not newline-terminated")
+    replay = reflection_consumption_replay_status(
+        anchor_path.parent,
+        journal_path.parent,
+        source_cycle=current_cycle,
+        recurrences_sha256=recurrences_sha256,
+        proposal=canonical_proposal,
+    )
+    if replay is not None:
+        return {
+            "already_consumed": True,
+            "applied": [],
+            "consumed_outcome": replay["outcome"],
+            "proposal_sha256": replay["proposal_sha256"],
+            "skipped": [],
+        }
     prior_source_cycles: list[int] = []
     for line in old_journal.decode().splitlines():
         if not line.startswith("- head_event_v1: "):
@@ -2946,13 +4264,72 @@ def apply_reflection(
         raise ValueError(
             "reflection source cycle was already handled or predates the latest head event"
         )
-    validate_reflection_authority(
+    authority = validate_reflection_authority(
         anchor_path.parent,
         source_cycle=current_cycle,
         recurrences_sha256=recurrences_sha256,
-        expected_heads_file_sha256=_sha256_bytes(heads_path.read_bytes()),
+        expected_heads_file_sha256=_sha256_bytes(heads_bytes),
         expected_journal_sha256=_sha256_bytes(old_journal),
     )
+    authorized_state_evidence_by_role: dict[str, set[str]] = {}
+    for recurrence in canonical_recurrences:
+        if recurrence["kind"] == "pm_gate_inactive" and recurrence["role"] == "pm":
+            authorized_state_evidence_by_role.setdefault("pm", set()).update(
+                recurrence["evidence"]
+            )
+
+    edited_roles = {edit["role"] for edit in canonical_proposal["edits"]}
+    omitted_roles = surfaced_roles - edited_roles
+    if (not canonical_proposal["edits"] or omitted_roles) and not canonical_proposal[
+        "no_action_reason"
+    ].strip():
+        names = ", ".join(sorted(omitted_roles))
+        raise ValueError(
+            "an explicit no-action/omitted-role reflection requires a nonempty "
+            f"no_action_reason for surfaced role(s): {names or 'none'}"
+        )
+
+    applied: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    prompt_updates: dict[Path, bytes] = {}
+    applied_edits: list[tuple[str, dict, str]] = []
+    for edit in canonical_proposal["edits"]:
+        role = edit["role"]
+        path = agents_dir / f"{role}.md"
+        if role not in _ALL_ROLES or not path.exists():
+            skipped.append((role, "unknown role or missing file"))
+            continue
+        if allowed_roles is not None and role not in allowed_roles:
+            skipped.append((role, "no surfaced recurrence for this role"))
+            continue
+        if known_cycles is not None:
+            refusal = validate_edit_citations(
+                edit,
+                known_cycles,
+                current_cycle=current_cycle,
+                authorized_state_evidence=authorized_state_evidence_by_role.get(role, set()),
+            )
+            if refusal:
+                # A malformed evidence claim is not an intentional no-action decision. Refuse the
+                # whole attempt so the host cannot consume and cool down its one-shot recurrence.
+                raise ValueError(f"{role}: {refusal}")
+        old = path.read_text()
+        try:
+            new = splice_managed(old, edit.get("region_text", ""))
+            assert_only_region_changed(old, new)
+        except PromptGuardError as e:
+            skipped.append((role, str(e)))
+            continue
+        _prefix, region, _suffix = split_managed(new)
+        prompt_updates[path] = new.encode()
+        applied_edits.append((role, edit, region.strip()))
+        applied.append(role)
+    if skipped:
+        details = "; ".join(f"{role}: {reason}" for role, reason in skipped)
+        raise ValueError(f"reflection proposal contains unapplied edits: {details}")
+    if not applied:
+        return {"applied": applied, "skipped": skipped}
+    generation = int(heads["generation"]) + 1
     new_journal = bytearray(old_journal)
     roles = json.loads(json.dumps(heads["roles"]))
     for role, edit, region in applied_edits:
@@ -2991,22 +4368,55 @@ def apply_reflection(
     )
     new_heads_content = _heads_bytes(new_heads)
     new_anchor = _build_anchor(new_heads, new_heads_content, prior_anchor)
-    prompt_snapshots = {path: _optional_file_snapshot(path) for path in prompt_updates}
-    journal_snapshot = _optional_file_snapshot(journal_path)
-    heads_snapshot = _optional_file_snapshot(heads_path)
-    anchor_snapshot = _optional_file_snapshot(anchor_path)
+    post_files: dict[str, tuple[Path, bytes]] = {
+        "anchor": (anchor_path, _anchor_bytes(new_anchor)),
+        "heads": (heads_path, new_heads_content),
+        "journal": (journal_path, bytes(new_journal)),
+    }
+    for path, content in prompt_updates.items():
+        post_files[f"prompt:{path.stem}"] = (path, content)
+    transaction_payload = {
+        "authority_receipt_sha256": authority["receipt_sha256"],
+        "files": [
+            _transaction_snapshot_fields(key, _optional_file_snapshot(path), content)
+            for key, (path, content) in sorted(post_files.items())
+        ],
+        "proposal": canonical_proposal,
+        "proposal_sha256": proposal_sha256,
+        "recurrences_sha256": recurrences_sha256,
+        "schema_version": REFLECTION_APPLY_TRANSACTION_SCHEMA_VERSION,
+        "source_cycle": current_cycle,
+    }
+    transaction = _seal_reflection_apply_transaction(transaction_payload)
+    transaction_path = reflection_apply_transaction_path(anchor_path.parent, current_cycle)
+    _publish_reflection_apply_transaction(transaction_path, transaction)
+    records = {record["key"]: record for record in transaction["files"]}
+    write_order = sorted(key for key in post_files if key.startswith("prompt:")) + [
+        "journal",
+        "heads",
+        "anchor",
+    ]
     try:
-        for path, content in prompt_updates.items():
-            _atomic_write_bytes(path, content)
-        _atomic_write_bytes(journal_path, bytes(new_journal))
-        _atomic_write_bytes(heads_path, new_heads_content)
-        _atomic_write_bytes(anchor_path, _anchor_bytes(new_anchor))
-        _load_reflector_heads(agents_dir, journal_path, heads_path, anchor_path)
-    except BaseException:
-        for path, snapshot in prompt_snapshots.items():
-            _restore_file_snapshot(path, snapshot)
-        _restore_file_snapshot(journal_path, journal_snapshot)
-        _restore_file_snapshot(heads_path, heads_snapshot)
-        _restore_file_snapshot(anchor_path, anchor_snapshot)
+        for key in write_order:
+            path, content = post_files[key]
+            durable_write_bytes(path, content, mode=int(records[key]["post_mode"]))
+        if not _validate_reflection_transaction_poststate(
+            transaction,
+            state_dir=anchor_path.parent,
+            memory_dir=journal_path.parent,
+            agents_dir=agents_dir,
+            anchor_path=anchor_path,
+            journal_path=journal_path,
+        ):
+            raise ValueError("reflection apply transaction poststate validation failed")
+    except Exception:
+        _restore_reflection_transaction_prestate(
+            transaction,
+            memory_dir=journal_path.parent,
+            agents_dir=agents_dir,
+            anchor_path=anchor_path,
+            journal_path=journal_path,
+        )
+        durable_unlink(transaction_path)
         raise
     return {"applied": applied, "skipped": skipped}

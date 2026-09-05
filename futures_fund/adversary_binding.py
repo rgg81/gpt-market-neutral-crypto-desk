@@ -22,7 +22,9 @@ from futures_fund.desk_contracts import (
 from futures_fund.precheck import (
     DEPLOY_MAX,
     MAX_PAYBACK_FUNDING_INTERVALS,
+    PRECHECK_SCHEMA_VERSION,
     PrecheckMetrics,
+    missing_required_precheck_fields,
     precheck_sha256,
 )
 
@@ -48,6 +50,39 @@ _ECHO_FIELDS = (
     "max_position_co_risk_cluster_risk_share",
     "portfolio_expected_total_edge_usd_per_8h",
 )
+
+_SCHEMA6_ECHO_FIELDS = (
+    "cold_start_reentry_eligible",
+    "b9_aggressive_change_limit",
+    "risk_model_available",
+)
+_SCHEMA6_REQUIRED_ECHO_FIELDS = set(_SCHEMA6_ECHO_FIELDS)
+
+_SCHEMA7_ECHO_FIELDS = (
+    "controlled_restart_origin_cycle",
+    "controlled_restart_phase",
+    "controlled_restart_initial_eligible",
+    "controlled_restart_continuation_eligible",
+    "controlled_restart_lineage_valid",
+    "controlled_restart_prior_cycle",
+    "controlled_restart_prior_book_sha256",
+    "controlled_restart_prior_origin_cycle",
+    "controlled_restart_prior_phase",
+)
+_SCHEMA7_REQUIRED_ECHO_FIELDS = set(_SCHEMA7_ECHO_FIELDS)
+
+_SCHEMA8_ECHO_FIELDS = ("binding_user_directive_present",)
+_SCHEMA8_REQUIRED_ECHO_FIELDS = set(_SCHEMA8_ECHO_FIELDS)
+
+_SCHEMA9_ECHO_FIELDS = (
+    "binding_user_directive_controlled_restart_graduation",
+)
+_SCHEMA9_REQUIRED_ECHO_FIELDS = set(_SCHEMA9_ECHO_FIELDS)
+
+_CONTROLLED_RESTART_GROSS_CAP_FRAC_CASH = 0.20
+_CONTROLLED_RESTART_RESIDUAL_VOL_CAP_FRAC_CASH = 0.08
+_CONTROLLED_RESTART_BETA_RESIDUAL_CAP_ABS = 0.02
+_CONTROLLED_RESTART_PERFORMANCE_MIN_SCHEMA_VERSION = 11
 
 
 class AdversaryBindingError(ValueError):
@@ -86,6 +121,173 @@ def _verify_directive_binding(
     if actual is None or not hmac.compare_digest(actual, expected_directive_sha256):
         raise AdversaryBindingError(
             "adversary binding_user_directive_sha256 does not match the dispatched directive"
+        )
+
+
+def _verify_controlled_restart_risk_audit(
+    verdict: AdversaryVerdict,
+    precheck: PrecheckMetrics,
+    book: Book | None,
+    performance_snapshot: dict | None,
+) -> None:
+    """Bind restart expansion provenance without choosing or vetoing a trade."""
+    audit = verdict.controlled_restart_risk_audit
+    if not precheck.controlled_restart_phase:
+        if audit is not None:
+            raise AdversaryBindingError(
+                "controlled_restart_risk_audit must be absent outside an active phase"
+            )
+        return
+    if audit is None:
+        raise AdversaryBindingError(
+            "active controlled restart requires controlled_restart_risk_audit"
+        )
+    if book is None or performance_snapshot is None:
+        raise AdversaryBindingError(
+            "restart-risk audit requires the reviewed Book and performance snapshot"
+        )
+    if precheck.schema_version >= 9 and (
+        "directive_graduation_capability_used" not in audit.model_fields_set
+    ):
+        raise AdversaryBindingError(
+            "current restart-risk audit omits directive graduation capability usage"
+        )
+    try:
+        performance_schema = int(performance_snapshot.get("schema_version", 0))
+        by_horizon = performance_snapshot["pm_forecast_performance"]["by_horizon_hours"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AdversaryBindingError("restart-risk audit has no shaped performance packet") from exc
+    if performance_schema < _CONTROLLED_RESTART_PERFORMANCE_MIN_SCHEMA_VERSION:
+        raise AdversaryBindingError(
+            "restart-risk audit requires latest-12 cost-net performance schema v11+"
+        )
+
+    expected_gross_cap = round(
+        _CONTROLLED_RESTART_GROSS_CAP_FRAC_CASH * precheck.cash, 2
+    )
+    expected_abs_beta = abs(precheck.beta_residual)
+    expected_expansion = bool(
+        precheck.gross > expected_gross_cap
+        or precheck.portfolio_residual_vol_annualized_frac_cash
+        > _CONTROLLED_RESTART_RESIDUAL_VOL_CAP_FRAC_CASH
+        or expected_abs_beta > _CONTROLLED_RESTART_BETA_RESIDUAL_CAP_ABS
+    )
+    numeric_facts = {
+        "gross_usd": precheck.gross,
+        "gross_seed_cap_usd": expected_gross_cap,
+        "residual_vol_annualized_frac_cash": (
+            precheck.portfolio_residual_vol_annualized_frac_cash
+        ),
+        "residual_vol_seed_cap_frac_cash": (
+            _CONTROLLED_RESTART_RESIDUAL_VOL_CAP_FRAC_CASH
+        ),
+        "absolute_beta_residual": expected_abs_beta,
+        "beta_residual_seed_cap_abs": _CONTROLLED_RESTART_BETA_RESIDUAL_CAP_ABS,
+    }
+    for field, expected in numeric_facts.items():
+        if not math.isclose(
+            float(getattr(audit, field)), float(expected), rel_tol=0.0, abs_tol=ECHO_ABS_TOL
+        ):
+            raise AdversaryBindingError(
+                f"controlled_restart_risk_audit.{field} does not match precheck facts"
+            )
+    if (
+        audit.expansion_requested != expected_expansion
+        or audit.within_all_seed_caps != (not expected_expansion)
+    ):
+        raise AdversaryBindingError(
+            "controlled_restart_risk_audit expansion/seed-cap facts do not match precheck"
+        )
+    if audit.expansion_approved and not expected_expansion:
+        raise AdversaryBindingError("restart expansion cannot be approved when none was requested")
+    if audit.directive_graduation_capability_used:
+        if not precheck.binding_user_directive_controlled_restart_graduation:
+            raise AdversaryBindingError(
+                "restart-risk audit claims a directive graduation capability absent from the "
+                "hash-bound typed directive scope"
+            )
+        if not expected_expansion:
+            raise AdversaryBindingError(
+                "directive graduation capability cannot be used without requested expansion"
+            )
+
+    expected_legs = {leg.symbol: leg for leg in book.legs if leg.seat_role == "alpha"}
+    actual_rows = {row.symbol: row for row in audit.selected_alpha_qualifications}
+    if set(actual_rows) != set(expected_legs):
+        raise AdversaryBindingError(
+            "restart-risk audit must exactly cover every selected alpha seat"
+        )
+    derived_qualifications: list[bool] = []
+    for symbol, leg in expected_legs.items():
+        row = actual_rows[symbol]
+        try:
+            bucket = by_horizon[str(leg.edge_horizon_hours)]
+            expected_n = bucket["cost_net_independent_time_cohort_n"]
+            expected_status = bucket["cost_net_calibration_status"]
+            expected_risk_status = bucket["cost_net_residual_risk_weighted_status"]
+            expected_value = bucket[
+                "residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"
+            ]
+        except (KeyError, TypeError) as exc:
+            raise AdversaryBindingError(
+                f"restart-risk audit lacks a performance bucket for {symbol}"
+            ) from exc
+        if (
+            type(expected_n) is not int
+            or not isinstance(expected_status, str)
+            or not isinstance(expected_risk_status, str)
+            or (
+                expected_value is not None
+                and (
+                    not isinstance(expected_value, (int, float))
+                    or isinstance(expected_value, bool)
+                    or not math.isfinite(float(expected_value))
+                )
+            )
+        ):
+            raise AdversaryBindingError(
+                f"restart-risk audit performance bucket for {symbol} is malformed"
+            )
+        value_matches = (
+            row.residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac
+            == expected_value
+        )
+        if (
+            row.edge_horizon_hours != leg.edge_horizon_hours
+            or row.cost_net_independent_time_cohort_n != expected_n
+            or row.cost_net_calibration_status != expected_status
+            or row.cost_net_residual_risk_weighted_status != expected_risk_status
+            or not value_matches
+        ):
+            raise AdversaryBindingError(
+                f"restart-risk audit for {symbol} does not echo its exact-horizon bucket"
+            )
+        qualified = bool(
+            expected_n >= 12
+            and expected_status == "usable"
+            and expected_risk_status == "usable"
+            and expected_value is not None
+            and float(expected_value) > 0.0
+        )
+        if row.qualified != qualified:
+            raise AdversaryBindingError(
+                f"restart-risk audit has an incorrect derived qualification for {symbol}"
+            )
+        derived_qualifications.append(qualified)
+    expected_all_qualified = bool(derived_qualifications) and all(derived_qualifications)
+    if audit.all_selected_alpha_qualified != expected_all_qualified:
+        raise AdversaryBindingError(
+            "restart-risk audit all-selected qualification is not derived from its seat rows"
+        )
+
+    # The facts and typed directive scope above are deterministic provenance.  The accept/reject
+    # choice is not: an accepted expansion must agree with the sole GPT Adversary's explicit
+    # approval, but code never derives that decision from qualification or starter-cap facts.
+    if verdict.accept and expected_expansion and not (
+        audit.expansion_approved and audit.approval_note.strip()
+    ):
+        raise AdversaryBindingError(
+            "accepted restart expansion conflicts with the Adversary's explicit non-approval"
         )
 
 
@@ -288,6 +490,17 @@ def verify_precheck_artifact(
     if artifact.cycle != cycle:
         raise AdversaryBindingError(
             f"{label} is for cycle {artifact.cycle}, current cycle is {cycle}"
+        )
+    if artifact.schema_version > PRECHECK_SCHEMA_VERSION:
+        raise AdversaryBindingError(
+            f"{label} uses unsupported future schema v{artifact.schema_version}; "
+            f"maximum supported is v{PRECHECK_SCHEMA_VERSION}"
+        )
+    missing_fields = missing_required_precheck_fields(artifact)
+    if missing_fields:
+        raise AdversaryBindingError(
+            f"{label} omits required explicit schema-v{artifact.schema_version} provenance: "
+            + ", ".join(missing_fields)
         )
     canonical = precheck_sha256(artifact)
     if not hmac.compare_digest(artifact.sha256, canonical):
@@ -1032,6 +1245,20 @@ def verify_verdict_binding(
             "historical precheck cannot authorize newly claimed objective hard-ban facts"
         )
     _verify_directive_binding(verdict, binding_user_directive_sha256)
+    if precheck.schema_version >= 8 and precheck.binding_user_directive_present != (
+        binding_user_directive_sha256 is not None
+    ):
+        raise AdversaryBindingError(
+            "precheck binding_user_directive_present does not match dispatched cycle meta"
+        )
+    if (
+        precheck.schema_version >= 9
+        and precheck.binding_user_directive_controlled_restart_graduation
+        and binding_user_directive_sha256 is None
+    ):
+        raise AdversaryBindingError(
+            "typed controlled-restart graduation scope lacks a bound user directive"
+        )
     if specialist_reads is not None:
         expected_reads_sha256 = specialist_reads_sha256(specialist_reads)
         if verdict.specialist_reads_sha256 is None or not hmac.compare_digest(
@@ -1055,11 +1282,73 @@ def verify_verdict_binding(
             "verdict carries a performance snapshot hash without a bound packet"
         )
 
-    for field in _ECHO_FIELDS:
+    if precheck.schema_version >= 6:
+        missing_echo_fields = sorted(
+            _SCHEMA6_REQUIRED_ECHO_FIELDS - verdict.metrics_echo.model_fields_set
+        )
+        if missing_echo_fields:
+            raise AdversaryBindingError(
+                "current adversary metrics_echo omits required precheck provenance: "
+                + ", ".join(missing_echo_fields)
+            )
+
+    if precheck.schema_version >= 7:
+        missing_echo_fields = sorted(
+            _SCHEMA7_REQUIRED_ECHO_FIELDS - verdict.metrics_echo.model_fields_set
+        )
+        if missing_echo_fields:
+            raise AdversaryBindingError(
+                "current adversary metrics_echo omits required restart lineage: "
+                + ", ".join(missing_echo_fields)
+            )
+
+    if precheck.schema_version >= 8:
+        missing_echo_fields = sorted(
+            _SCHEMA8_REQUIRED_ECHO_FIELDS - verdict.metrics_echo.model_fields_set
+        )
+        if missing_echo_fields:
+            raise AdversaryBindingError(
+                "current adversary metrics_echo omits required directive provenance: "
+                + ", ".join(missing_echo_fields)
+            )
+
+    if precheck.schema_version >= 9:
+        missing_echo_fields = sorted(
+            _SCHEMA9_REQUIRED_ECHO_FIELDS - verdict.metrics_echo.model_fields_set
+        )
+        if missing_echo_fields:
+            raise AdversaryBindingError(
+                "current adversary metrics_echo omits required typed directive scope: "
+                + ", ".join(missing_echo_fields)
+            )
+
+    echo_fields = (
+        _ECHO_FIELDS
+        + (_SCHEMA6_ECHO_FIELDS if precheck.schema_version >= 6 else ())
+        + (_SCHEMA7_ECHO_FIELDS if precheck.schema_version >= 7 else ())
+        + (_SCHEMA8_ECHO_FIELDS if precheck.schema_version >= 8 else ())
+        + (_SCHEMA9_ECHO_FIELDS if precheck.schema_version >= 9 else ())
+    )
+    for field in echo_fields:
         echoed = getattr(verdict.metrics_echo, field)
         actual = getattr(precheck, field)
         if field in {
             "turnover_legs_changed",
+            "turnover_aggressive_legs_changed",
+            "cold_start_reentry_eligible",
+            "b9_aggressive_change_limit",
+            "risk_model_available",
+            "controlled_restart_origin_cycle",
+            "controlled_restart_phase",
+            "controlled_restart_initial_eligible",
+            "controlled_restart_continuation_eligible",
+            "controlled_restart_lineage_valid",
+            "controlled_restart_prior_cycle",
+            "controlled_restart_prior_book_sha256",
+            "controlled_restart_prior_origin_cycle",
+            "controlled_restart_prior_phase",
+            "binding_user_directive_present",
+            "binding_user_directive_controlled_restart_graduation",
             "hedge_risk_reducing",
             "hedge_change_risk_reducing",
         }:
@@ -1096,6 +1385,14 @@ def verify_verdict_binding(
         raise AdversaryBindingError(
             "accepted book contains objective hard-ban violations: " + ", ".join(symbols)
         )
+    if (
+        verdict.accept
+        and precheck.schema_version >= 7
+        and not precheck.controlled_restart_lineage_valid
+    ):
+        raise AdversaryBindingError(
+            "accepted book cannot carry invalid controlled-restart lineage"
+        )
     if verdict.accept and failing and not verdict.override_rationale.strip():
         raise AdversaryBindingError(
             "accepting failing precheck bounds requires override_rationale: " + ", ".join(failing)
@@ -1122,6 +1419,10 @@ def verify_verdict_binding(
                 "new rejected precheck requires v2 typed revision constraints with exact "
                 "horizon/thesis fields: " + ", ".join(legacy_typed)
             )
+    if precheck.schema_version >= 8:
+        _verify_controlled_restart_risk_audit(
+            verdict, precheck, book, performance_snapshot
+        )
     if sentiment_reads is not None or book is not None:
         if sentiment_reads is None or book is None:
             raise AdversaryBindingError(
@@ -1181,6 +1482,90 @@ def verify_revision_binding(
     """
     if verdict.accept:
         raise AdversaryBindingError("revision binding requires a rejected original verdict")
+    if original_precheck.schema_version >= 7:
+        prior_fields = (
+            "controlled_restart_prior_cycle",
+            "controlled_restart_prior_book_sha256",
+            "controlled_restart_prior_origin_cycle",
+            "controlled_restart_prior_phase",
+        )
+        if final_precheck.schema_version < 7 or any(
+            getattr(final_precheck, field) != getattr(original_precheck, field)
+            for field in prior_fields
+        ):
+            raise AdversaryBindingError(
+                "PM revision precheck changed the manifest-bound prior restart lineage"
+            )
+        if not final_precheck.controlled_restart_lineage_valid:
+            raise AdversaryBindingError(
+                "PM revision has invalid controlled-restart lineage"
+            )
+        lineage_unchanged = (
+            final_book.controlled_restart_origin_cycle
+            == original_book.controlled_restart_origin_cycle
+            and final_book.controlled_restart_phase
+            == original_book.controlled_restart_phase
+        )
+        safe_explicit_end = bool(
+            original_book.controlled_restart_phase
+            and not final_book.controlled_restart_phase
+            and final_book.controlled_restart_origin_cycle is None
+            and not final_book.legs
+        )
+        if not (lineage_unchanged or safe_explicit_end):
+            raise AdversaryBindingError(
+                "PM revision changed controlled-restart lineage outside the reviewed original"
+            )
+    if original_precheck.schema_version >= 8:
+        if (
+            final_precheck.schema_version < 8
+            or final_precheck.binding_user_directive_present
+            != original_precheck.binding_user_directive_present
+        ):
+            raise AdversaryBindingError(
+                "PM revision changed binding user-directive provenance"
+            )
+        if original_precheck.schema_version >= 9 and (
+            final_precheck.schema_version < 9
+            or final_precheck.binding_user_directive_controlled_restart_graduation
+            != original_precheck.binding_user_directive_controlled_restart_graduation
+        ):
+            raise AdversaryBindingError(
+                "PM revision changed typed user-directive capability scope"
+            )
+        if final_precheck.controlled_restart_phase:
+            audit = verdict.controlled_restart_risk_audit
+            if audit is None:
+                raise AdversaryBindingError(
+                    "active restart revision lacks the original restart-risk audit"
+                )
+            audited_horizons = {
+                row.symbol: row.edge_horizon_hours
+                for row in audit.selected_alpha_qualifications
+            }
+            final_alpha = [leg for leg in final_book.legs if leg.seat_role == "alpha"]
+            if any(
+                audited_horizons.get(leg.symbol) != leg.edge_horizon_hours
+                for leg in final_alpha
+            ):
+                raise AdversaryBindingError(
+                    "PM revision added or changed an active restart seat/horizon outside the "
+                    "original restart-risk audit"
+                )
+            final_expansion = bool(
+                final_precheck.gross
+                > round(_CONTROLLED_RESTART_GROSS_CAP_FRAC_CASH * final_precheck.cash, 2)
+                or final_precheck.portfolio_residual_vol_annualized_frac_cash
+                > _CONTROLLED_RESTART_RESIDUAL_VOL_CAP_FRAC_CASH
+                or abs(final_precheck.beta_residual)
+                > _CONTROLLED_RESTART_BETA_RESIDUAL_CAP_ABS
+            )
+            if final_expansion:
+                if not (audit.expansion_approved and audit.approval_note.strip()):
+                    raise AdversaryBindingError(
+                        "controlled-restart revision expansion exceeds the Adversary's original "
+                        "explicit approval"
+                    )
     if final_precheck.schema_version >= 5 and final_precheck.hard_ban_violations:
         symbols = sorted({row.symbol for row in final_precheck.hard_ban_violations})
         raise AdversaryBindingError(

@@ -21,6 +21,7 @@ import json
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
 from futures_fund.adversary_binding import (
@@ -42,6 +43,15 @@ from futures_fund.desk_cycle import (
     _verify_fresh_execution_economics,
     reconcile_book,
 )
+from futures_fund.directives import (
+    CONTROLLED_RESTART_GRADUATION,
+    build_directive_commit_expectation,
+    build_directive_receipt,
+    claim_next_directive,
+    directive_lifecycle_status,
+    finalize_cycle_directive,
+    parse_directive_capabilities,
+)
 from futures_fund.exchange import FuturesExchange
 from futures_fund.funding_history import (
     collect_funding_events,
@@ -56,7 +66,12 @@ from futures_fund.performance import (
     canonical_sha256,
 )
 from futures_fund.pnl_attribution import build_cycle_pnl, latest_closing_equity
-from futures_fund.precheck import PrecheckMetrics, compute_precheck
+from futures_fund.precheck import (
+    PrecheckMetrics,
+    PriorBookLineage,
+    compute_precheck,
+    load_prior_book_lineage,
+)
 from futures_fund.prompt_guard import split_managed
 from futures_fund.reconcile_commit import (
     recover_reconcile_transaction,
@@ -74,6 +89,85 @@ from scripts.desk_watchdog import build_watchdog_receipt
 def _halt(reason: str) -> int:
     print(json.dumps({"halt": f"{reason} — prior book stands"}))
     return 1
+
+
+_DIRECTIVE_META_FIELDS = {
+    "binding_user_directive_claim_id",
+    "binding_user_directive_claim_intent_sha256",
+    "binding_user_directive_payload_sha256",
+    "binding_user_directive_sha256",
+    "binding_user_directive_source_relpath",
+    "binding_user_directive_capabilities",
+    "binding_user_directive_capabilities_sha256",
+}
+
+
+def _load_bound_directive_claim(
+    state_dir: str | Path,
+    pending: Path,
+    meta: dict,
+) -> dict | None:
+    """Authenticate pending directive bytes against the exact active state-owned claim."""
+
+    artifact_path = pending / "binding_user_directive.md"
+    meta_fields = {key for key in meta if key.startswith("binding_user_directive_")}
+    directive_sha256 = meta.get("binding_user_directive_sha256")
+    lifecycle = directive_lifecycle_status(state_dir)
+    if directive_sha256 is None:
+        if meta_fields or artifact_path.exists() or artifact_path.is_symlink():
+            raise ValueError("unbound user directive artifact or claim provenance is present")
+        if lifecycle.get("status") != "idle":
+            raise ValueError(
+                "cycle meta omits the active directive claim: "
+                f"{lifecycle.get('status')}"
+            )
+        # A new canonical inbox file may arrive after evidence was sealed. It belongs to the next
+        # cycle and must not retroactively change the current decision packet.
+        return None
+    if meta_fields != _DIRECTIVE_META_FIELDS:
+        missing = sorted(_DIRECTIVE_META_FIELDS - meta_fields)
+        extra = sorted(meta_fields - _DIRECTIVE_META_FIELDS)
+        raise ValueError(
+            f"binding user directive claim field set mismatch: missing={missing}, extra={extra}"
+        )
+    if (
+        lifecycle.get("status") != "claimed_pending"
+        or lifecycle.get("payload_state") != "claim"
+        or lifecycle.get("cycle") != int(meta["cycle"])
+        or lifecycle.get("claim_id") != meta["binding_user_directive_claim_id"]
+    ):
+        raise ValueError(f"binding user directive has no exact active claim: {lifecycle}")
+    claim = claim_next_directive(state_dir, cycle=int(meta["cycle"]))
+    if claim is None:
+        raise ValueError("binding user directive active claim disappeared")
+    if artifact_path.is_symlink() or not artifact_path.is_file():
+        raise ValueError("meta binds a missing or symlinked user directive artifact")
+    try:
+        payload = artifact_path.read_bytes()
+        directive_text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("pending binding user directive is not strict UTF-8") from exc
+    capabilities = list(parse_directive_capabilities(directive_text))
+    expected = {
+        "binding_user_directive_claim_id": claim["claim_id"],
+        "binding_user_directive_claim_intent_sha256": claim["claim_intent_sha256"],
+        "binding_user_directive_payload_sha256": claim["payload_sha256"],
+        "binding_user_directive_sha256": claim["directive_sha256"],
+        "binding_user_directive_source_relpath": claim["source_relpath"],
+        "binding_user_directive_capabilities": list(claim["capabilities"]),
+        "binding_user_directive_capabilities_sha256": claim["capabilities_sha256"],
+    }
+    if any(meta.get(key) != value for key, value in expected.items()):
+        raise ValueError("binding user directive meta does not match its exact active claim")
+    if (
+        directive_text != claim["text"]
+        or sha256(payload).hexdigest() != claim["payload_sha256"]
+        or canonical_sha256(directive_text) != claim["directive_sha256"]
+        or capabilities != list(claim["capabilities"])
+        or canonical_sha256(capabilities) != claim["capabilities_sha256"]
+    ):
+        raise ValueError("binding user directive artifact does not match its exact active claim")
+    return claim
 
 
 def _verify_watchdog_receipt(state_dir: str, meta: dict) -> dict:
@@ -220,6 +314,7 @@ def _verify_decision_chain(
     performance_snapshot: dict | None = None,
     entry_gate_policy_sha256: str | None = None,
     execution_realism: ExecutionRealism | None = None,
+    prior_book_lineage: PriorBookLineage | None = None,
 ) -> VerifiedDecisionChain:
     """Validate accepted and once-revised artifact chains before the paper account is mutated."""
     book.validate_production_contract()
@@ -233,6 +328,14 @@ def _verify_decision_chain(
         "risk_model": risk_model,
         "meta_sha256": canonical_sha256(meta),
         "execution_realism": execution_realism,
+        "prior_book_lineage": prior_book_lineage,
+        "binding_user_directive_present": (
+            meta.get("binding_user_directive_sha256") is not None
+        ),
+        "binding_user_directive_controlled_restart_graduation": (
+            CONTROLLED_RESTART_GRADUATION
+            in meta.get("binding_user_directive_capabilities", [])
+        ),
     }
     final_precheck = PrecheckMetrics.model_validate_json((pending / "precheck.json").read_text())
     expected_final = compute_precheck(book, evidence, **compute_args)
@@ -371,8 +474,21 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — never proceed past an ambiguous PAPER generation
         return _halt(f"unfinished reconcile recovery failed: {exc}")
     if recovery.get("recovered"):
+        try:
+            recovery["directive_claim_finalization"] = finalize_cycle_directive(
+                args.state_dir, int(recovery["cycle"])
+            )
+        except Exception as exc:  # noqa: BLE001 - completed receipt remains retryable
+            print(json.dumps({
+                "halt": (
+                    "reconcile completed but one-shot directive finalization remains pending: "
+                    f"{exc}; run desk_recover.py"
+                )
+            }))
+            return 1
         print(json.dumps(recovery, indent=2))
         return 0
+    directive_claim: dict | None = None
     try:
         recover_heartbeat_transaction(args.state_dir)
     except Exception as exc:  # noqa: BLE001 — account/audit halves must recover together
@@ -401,15 +517,7 @@ def main(argv: list[str] | None = None) -> int:
             or meta.get("scoring_marks_sha256") != canonical_sha256(scoring_marks)
         ):
             raise ValueError("evidence/risk/scoring meta hash mismatch")
-        directive_path = pending / "binding_user_directive.md"
-        directive_sha256 = meta.get("binding_user_directive_sha256")
-        if directive_sha256 is not None:
-            if not directive_path.is_file():
-                raise ValueError("meta binds a missing user directive artifact")
-            if directive_sha256 != canonical_sha256(directive_path.read_text()):
-                raise ValueError("binding user directive hash mismatch")
-        elif directive_path.exists():
-            raise ValueError("unbound user directive artifact is present")
+        directive_claim = _load_bound_directive_claim(args.state_dir, pending, meta)
         validate_candle_audit(meta, evidence)
         decision_start_provenance = load_bound_decision_start_provenance(
             pending,
@@ -501,6 +609,10 @@ def main(argv: list[str] | None = None) -> int:
         account, base_account_sha256 = load_account_with_sha256(
             args.state_dir, default_cash=float(meta["cash"])
         )
+        prior_book_lineage = load_prior_book_lineage(
+            args.state_dir,
+            before_cycle=cycle,
+        )
     except Exception as exc:  # noqa: BLE001 — malformed persisted state must be a named HALT
         return _halt(f"invalid persisted PAPER account: {exc}")
     if (
@@ -522,6 +634,7 @@ def main(argv: list[str] | None = None) -> int:
             performance_snapshot=performance_snapshot,
             entry_gate_policy_sha256=entry_gate_policy["sha256"],
             execution_realism=execution_realism,
+            prior_book_lineage=prior_book_lineage,
         )
     except Exception as exc:  # noqa: BLE001 — any unbound artifact means no authorized decision
         return _halt(f"decision-chain validation failed: {exc}")
@@ -698,6 +811,11 @@ def main(argv: list[str] | None = None) -> int:
     artifacts["risk_model"] = risk_model
     artifacts["scoring_marks"] = scoring_marks
     artifacts["meta"] = meta
+    if directive_claim is not None:
+        artifacts["binding_user_directive"] = build_directive_receipt(
+            directive_claim,
+            cycle=cycle,
+        )
     artifacts["entry_gate_policy"] = entry_gate_policy
     artifacts["precheck"] = final_precheck.model_dump(mode="json")
     if decision_chain.original_precheck is not None:
@@ -732,8 +850,13 @@ def main(argv: list[str] | None = None) -> int:
             equity=report.equity,
             ledger=pnl,
             runtime_provenance=decision_start_provenance,
+            directive_expectation=build_directive_commit_expectation(
+                directive_claim,
+                cycle=cycle,
+            ),
         )
         recover_reconcile_transaction(args.state_dir)
+        directive_finalization = finalize_cycle_directive(args.state_dir, cycle)
     except Exception as exc:  # noqa: BLE001 — durable intent remains replayable after a crash
         print(json.dumps({
             "halt": f"durable reconcile commit interrupted: {exc}; run desk_recover.py",
@@ -752,6 +875,7 @@ def main(argv: list[str] | None = None) -> int:
         "funding_settled_cycle": round(report.funding_settled_cycle, 4),
         "decision_age_seconds": round(report.decision_age_seconds, 1),
         "specialist_failed": report.specialist_failed,
+        "directive_claim_finalization": directive_finalization,
     }, indent=2))
     return 0
 

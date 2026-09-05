@@ -49,6 +49,12 @@ bypass either receipt; never seek a new specialist digest or reinterpret a chang
   original only when a matching `revision_fallback_seat_audits` row covers that exact side and
   action. Its price, calibration, invalidation, age/requalification, and specialist echoes remain
   binding.
+- Preserve controlled-restart phase/origin, `binding_user_directive_present`, and
+  `binding_user_directive_controlled_restart_graduation` provenance. An active final Book may use
+  only selected alpha symbol/horizon pairs already covered by the original
+  `controlled_restart_risk_audit`; it cannot turn a rejection into an unaudited expansion or claim
+  typed scope the original audit did not use. A fully flat final Book may explicitly end the phase
+  as false/null.
 - If a hedge or its surrounding alpha-beta context may change, match the exact
   `revision_hedge_audit` and typed constraint. A hedge always has zero price edge, horizon 24,
   blank alpha thesis fields, and must reduce beta against both the alpha-only and carried-BTC

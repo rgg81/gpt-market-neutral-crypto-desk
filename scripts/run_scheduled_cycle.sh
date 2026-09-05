@@ -104,9 +104,9 @@ probe_preflight() {
         export PYTHONDONTWRITEBYTECODE=1
         "${VENV_PYTHON}" scripts/ensure_binance_proxy.py --probe-only
         "${VENV_PYTHON}" scripts/reflector_apply.py \
-            --memory-dir live_memory --agents-dir agents --check-existing
+            --memory-dir live_memory --agents-dir agents --probe-existing
     )
-    echo "PROBE_OK read_only=true model=${MODEL} effort=${EFFORT} schedule=00:07Z daily"
+    echo "PROBE_OK read_only=true recovery_pending=false model=${MODEL} effort=${EFFORT} schedule=00:07Z daily"
 }
 
 if [[ "${1:-}" == "--check" || "${1:-}" == "--probe-only" ]]; then

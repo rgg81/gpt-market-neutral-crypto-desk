@@ -3,9 +3,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from futures_fund.config import Settings
+from futures_fund.directives import (
+    CONTROLLED_RESTART_GRADUATION,
+    claim_next_directive,
+    parse_directive_capabilities,
+)
 from futures_fund.performance import canonical_sha256
 from scripts import desk_evidence
-from scripts.desk_reconcile import _verify_watchdog_receipt
+from scripts.desk_reconcile import _load_bound_directive_claim, _verify_watchdog_receipt
 from scripts.desk_watchdog import build_watchdog_receipt, last_cycle_ts
 
 
@@ -15,6 +20,89 @@ class _Client:
 
     def load_markets(self):
         self.load_markets_calls += 1
+
+
+def test_directive_capability_requires_exact_first_line_typed_header():
+    unrelated = "exclude XRP; discuss controlled_restart_graduation only in prose"
+    assert parse_directive_capabilities(unrelated) == ()
+    scoped = (
+        '<!-- desk-directive-capabilities: ["controlled_restart_graduation"] -->\n'
+        "Explicitly authorize graduation for this cycle.\n"
+    )
+    assert parse_directive_capabilities(scoped) == (CONTROLLED_RESTART_GRADUATION,)
+
+    with pytest.raises(ValueError, match="unknown"):
+        parse_directive_capabilities(
+            '<!-- desk-directive-capabilities: ["unknown_scope"] -->\nInstruction'
+        )
+    with pytest.raises(ValueError, match="malformed"):
+        parse_directive_capabilities(
+            '<!-- desk-directive-capabilities: controlled_restart_graduation -->\nInstruction'
+        )
+
+
+def _directive_meta(claim: dict) -> dict:
+    return {
+        "cycle": claim["cycle"],
+        "binding_user_directive_claim_id": claim["claim_id"],
+        "binding_user_directive_claim_intent_sha256": claim["claim_intent_sha256"],
+        "binding_user_directive_payload_sha256": claim["payload_sha256"],
+        "binding_user_directive_sha256": claim["directive_sha256"],
+        "binding_user_directive_source_relpath": claim["source_relpath"],
+        "binding_user_directive_capabilities": claim["capabilities"],
+        "binding_user_directive_capabilities_sha256": claim["capabilities_sha256"],
+    }
+
+
+def test_pending_directive_binds_the_exact_active_claim_and_all_fields(tmp_path):
+    state = tmp_path / "state"
+    source = tmp_path / "ops" / "next-cycle-directive.md"
+    source.parent.mkdir()
+    payload = b"Keep this exact claimed instance.\r\n"
+    source.write_bytes(payload)
+    claim = claim_next_directive(state, cycle=1, source_path=source)
+    assert claim is not None
+    pending = tmp_path / "memory" / "pending" / "1"
+    pending.mkdir(parents=True)
+    (pending / "binding_user_directive.md").write_bytes(payload)
+    meta = _directive_meta(claim)
+
+    # A new source is a queued second instance and does not invalidate or replace this claim.
+    queued = "Queue this for the next cycle, even if its contents later repeat.\n"
+    source.write_text(queued)
+    loaded = _load_bound_directive_claim(state, pending, meta)
+    assert loaded is not None and loaded["claim_id"] == claim["claim_id"]
+    assert source.read_text() == queued
+
+    incomplete = dict(meta)
+    incomplete.pop("binding_user_directive_claim_intent_sha256")
+    with pytest.raises(ValueError, match="claim field set mismatch"):
+        _load_bound_directive_claim(state, pending, incomplete)
+
+
+def test_cycle_meta_cannot_omit_an_existing_active_claim(tmp_path):
+    state = tmp_path / "state"
+    source = tmp_path / "ops" / "next-cycle-directive.md"
+    source.parent.mkdir()
+    source.write_text("This claimed instruction must not disappear from the decision packet.\n")
+    assert claim_next_directive(state, cycle=1, source_path=source) is not None
+    pending = tmp_path / "memory" / "pending" / "1"
+    pending.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="omits the active directive claim"):
+        _load_bound_directive_claim(state, pending, {"cycle": 1})
+
+
+def test_post_evidence_queued_source_does_not_retroactively_bind_current_cycle(tmp_path):
+    state = tmp_path / "state"
+    source = tmp_path / "ops" / "next-cycle-directive.md"
+    source.parent.mkdir()
+    source.write_text("This arrived only after the no-directive evidence packet was sealed.\n")
+    pending = tmp_path / "memory" / "pending" / "1"
+    pending.mkdir(parents=True)
+
+    assert _load_bound_directive_claim(state, pending, {"cycle": 1}) is None
+    assert source.is_file()
 
 
 def test_universe_scan_and_evidence_share_one_public_client(monkeypatch):
@@ -112,6 +200,13 @@ def test_evidence_stands_down_early_before_any_market_data_request(tmp_path, mon
         "_build_data_clients",
         lambda _settings: (_ for _ in ()).throw(
             AssertionError("EARLY evidence must not fetch market data")
+        ),
+    )
+    monkeypatch.setattr(
+        desk_evidence,
+        "claim_next_directive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("EARLY evidence must not claim a directive")
         ),
     )
 

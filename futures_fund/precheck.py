@@ -14,11 +14,13 @@ number on the proposed book before fills.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from futures_fund.desk_contracts import Book, ObjectiveHardBanViolation, SeatRole
 from futures_fund.risk_context import position_correlation_context
@@ -34,7 +36,8 @@ MAX_LEG_FRAC_GROSS = 0.35  # B4 single-leg concentration
 HEDGE_FRAC_CASH_MAX = 0.50  # B5 BTC hedge leg vs cash
 LEG_BETA_USD_FRAC_MAX = 0.60  # B6 per-leg |notional x beta| vs cash (the c4 root-cause bound)
 STATED_TOL = 0.05  # B7 |stated - computed| tolerance on each stated_* metric
-MAX_LEGS_CHANGED = 2  # B9 turnover cap
+MAX_LEGS_CHANGED = 2  # ordinary B9 aggressive-turnover cap
+COLD_START_MAX_LEGS_CHANGED = 4  # exact-flat, all-non-BTC-alpha re-entry cap
 EST_SLIPPAGE_BPS_MAX = 75.0  # B10 ceiling for held seats and loss-control actions
 AGGRESSIVE_ALPHA_EST_SLIPPAGE_BPS_MAX = 50.0  # B10 fresh-entry-quality 2k screen
 POST_CRASH_SHORT_MOMENTUM_PCT = -40.0
@@ -44,6 +47,7 @@ LOW_DEPTH_MAX_AGGRESSIVE_NOTIONAL = 1_500.0
 NOTIONAL_NOOP_ABS_TOL = 0.01  # sub-cent target noise is a no-op; every executable resize is costed
 MAX_PAYBACK_FUNDING_INTERVALS = 10.0  # B12 maximum normalized 8h events to repay friction
 TAKER_FEE_BPS = 5.0  # matches FeeSettings.taker_bps
+PRECHECK_SCHEMA_VERSION = 9
 
 # Preserve the historical pure-function behavior for callers that do not provide an execution
 # policy. Production callers pass ``settings.execution`` explicitly; the policy and every reserve
@@ -55,6 +59,148 @@ _LEGACY_EXECUTION_REALISM = ExecutionRealism(
     legging_bps_per_second=0.0,
     allow_partial_fills=False,
 )
+
+
+class PriorBookLineage(BaseModel):
+    """Minimal manifest-proven prior Book state needed for restart continuity.
+
+    The full prior Book is deliberately not an input to arithmetic. Production loaders first
+    verify the newest completion manifest and exact raw ``book.json`` hash, then reduce it to this
+    immutable provenance record. Historical Books parse as an ended/non-restart lineage.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    cycle: int = Field(ge=1)
+    book_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    controlled_restart_origin_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_phase: bool = False
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> PriorBookLineage:
+        if self.controlled_restart_phase != (
+            self.controlled_restart_origin_cycle is not None
+        ):
+            raise ValueError("prior controlled-restart phase/origin is inconsistent")
+        return self
+
+
+def load_prior_book_lineage(
+    state_dir: str | Path,
+    *,
+    before_cycle: int,
+    cadence: str = "rebal",
+) -> PriorBookLineage | None:
+    """Load only the newest prior completion and prove its exact Book through its manifest.
+
+    A corrupt newest completion is an integrity failure, never permission to search backward for
+    a more convenient lineage. A desk with no prior completed cycle has no lineage.
+    """
+
+    from futures_fund.durable_io import canonical_json_sha256
+    from futures_fund.reconcile_commit import (  # local import keeps pure callers lightweight
+        completed_artifact_sha256,
+        cycle_is_complete,
+    )
+
+    root = Path(state_dir) / cadence / "cycle"
+    candidates = (
+        sorted(
+            (
+                int(path.name)
+                for path in root.iterdir()
+                if path.is_dir()
+                and path.name.isdigit()
+                and int(path.name) < before_cycle
+                and (path / "complete.json").is_file()
+            ),
+            reverse=True,
+        )
+        if root.exists()
+        else []
+    )
+    if not candidates:
+        return None
+    prior_cycle = candidates[0]
+    if not cycle_is_complete(
+        state_dir, prior_cycle, cadence=cadence, require_manifest=True
+    ):
+        raise ValueError(
+            f"latest prior completion {prior_cycle} lacks an intact required manifest"
+        )
+    book_sha256 = completed_artifact_sha256(
+        state_dir, prior_cycle, "book", cadence=cadence
+    )
+    if book_sha256 is None:
+        raise ValueError(
+            f"latest prior completion {prior_cycle} has no intact manifest-bound Book"
+        )
+    book_path = root / str(prior_cycle) / "book.json"
+    try:
+        raw_book = json.loads(book_path.read_text())
+        if not isinstance(raw_book, dict):
+            raise TypeError("book is not an object")
+        if canonical_json_sha256(raw_book) != book_sha256:
+            raise ValueError("book changed after manifest verification")
+        prior_book = Book.model_validate(raw_book)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"latest prior manifest-bound Book {prior_cycle} is unreadable"
+        ) from exc
+    if prior_book.controlled_restart_phase:
+        precheck_sha = completed_artifact_sha256(
+            state_dir, prior_cycle, "precheck", cadence=cadence
+        )
+        if precheck_sha is None:
+            raise ValueError(
+                f"active prior restart {prior_cycle} lacks a manifest-bound precheck"
+            )
+        precheck_path = root / str(prior_cycle) / "precheck.json"
+        try:
+            raw_precheck = json.loads(precheck_path.read_text())
+            if not isinstance(raw_precheck, dict):
+                raise TypeError("precheck is not an object")
+            if canonical_json_sha256(raw_precheck) != precheck_sha:
+                raise ValueError("precheck changed after manifest verification")
+            prior_precheck = PrecheckMetrics.model_validate(raw_precheck)
+            if prior_precheck.schema_version < 7:
+                raise ValueError("active restart precheck predates authenticated lineage")
+            if prior_precheck.schema_version > PRECHECK_SCHEMA_VERSION:
+                raise ValueError("active restart precheck uses an unsupported future schema")
+            missing_fields = missing_required_precheck_fields(prior_precheck)
+            if missing_fields:
+                raise ValueError(
+                    "active restart precheck omits required explicit provenance: "
+                    + ", ".join(missing_fields)
+                )
+            if not hmac.compare_digest(
+                prior_precheck.sha256, precheck_sha256(prior_precheck)
+            ):
+                raise ValueError("active restart precheck has an invalid internal hash")
+            if (
+                prior_precheck.cycle != prior_cycle
+                or prior_precheck.controlled_restart_phase
+                != prior_book.controlled_restart_phase
+                or prior_precheck.controlled_restart_origin_cycle
+                != prior_book.controlled_restart_origin_cycle
+                or not prior_precheck.controlled_restart_lineage_valid
+                or not (
+                    prior_precheck.controlled_restart_initial_eligible
+                    or prior_precheck.controlled_restart_continuation_eligible
+                )
+            ):
+                raise ValueError(
+                    "active restart Book does not match a valid initial/continuation precheck"
+                )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"latest prior active-restart precheck {prior_cycle} is unauthenticated"
+            ) from exc
+    return PriorBookLineage(
+        cycle=prior_cycle,
+        book_sha256=book_sha256,
+        controlled_restart_origin_cycle=prior_book.controlled_restart_origin_cycle,
+        controlled_restart_phase=prior_book.controlled_restart_phase,
+    )
 
 
 def _slip_bps_for(
@@ -331,6 +477,21 @@ class PrecheckMetrics(BaseModel):
     legs_resized: list[str] = Field(default_factory=list)
     turnover_legs_changed: int = 0  # added + dropped + flipped + executable resizes
     turnover_aggressive_legs_changed: int = 0  # added + flipped + same-side increases
+    cold_start_reentry_eligible: bool = False
+    b9_aggressive_change_limit: Literal[2, 4] = MAX_LEGS_CHANGED
+    controlled_restart_origin_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_phase: bool = False
+    controlled_restart_initial_eligible: bool = False
+    controlled_restart_continuation_eligible: bool = False
+    controlled_restart_lineage_valid: bool = True
+    controlled_restart_prior_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_prior_book_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    controlled_restart_prior_origin_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_prior_phase: bool = False
+    binding_user_directive_present: bool = False
+    binding_user_directive_controlled_restart_graduation: bool = False
     turnover_risk_reductions: int = 0  # dropped + same-side decreases
     turnover_usd: float = 0.0  # sum |proposed - held| notional deltas
     turnover_claim_errors: list[str] = Field(default_factory=list)
@@ -374,12 +535,49 @@ class PrecheckMetrics(BaseModel):
     sha256: str = ""
 
 
+_REQUIRED_EXPLICIT_PRECHECK_FIELDS_BY_SCHEMA: tuple[tuple[int, frozenset[str]], ...] = (
+    (
+        7,
+        frozenset(
+            {
+                "controlled_restart_origin_cycle",
+                "controlled_restart_phase",
+                "controlled_restart_initial_eligible",
+                "controlled_restart_continuation_eligible",
+                "controlled_restart_lineage_valid",
+                "controlled_restart_prior_cycle",
+                "controlled_restart_prior_book_sha256",
+                "controlled_restart_prior_origin_cycle",
+                "controlled_restart_prior_phase",
+            }
+        ),
+    ),
+    (8, frozenset({"binding_user_directive_present"})),
+    (9, frozenset({"binding_user_directive_controlled_restart_graduation"})),
+)
+
+
+def missing_required_precheck_fields(metrics: PrecheckMetrics) -> tuple[str, ...]:
+    """Return provenance fields omitted by an artifact claiming their schema version.
+
+    This is deliberately separate from :func:`precheck_sha256`: historical schema-v1..v8 hashes
+    remain a digest of their original raw field set, while each schema is still required to carry
+    the provenance fields introduced by that schema.
+    """
+
+    required = set()
+    for minimum_schema, fields in _REQUIRED_EXPLICIT_PRECHECK_FIELDS_BY_SCHEMA:
+        if metrics.schema_version >= minimum_schema:
+            required.update(fields)
+    return tuple(sorted(required - metrics.model_fields_set))
+
+
 def precheck_sha256(metrics: PrecheckMetrics) -> str:
     """Return the canonical content hash for a precheck, excluding its hash field."""
-    # For historical schema-v1/v2/v3 artifacts, recursively preserve exactly the keys that were
+    # For historical schema-v1..v8 artifacts, recursively preserve exactly the keys that were
     # present in the immutable JSON. Pydantic supplies defaults for every field added later;
     # hashing those defaults would make an old content-addressed artifact change retroactively.
-    payload = metrics.model_dump(mode="json", exclude_unset=metrics.schema_version < 5)
+    payload = metrics.model_dump(mode="json", exclude_unset=metrics.schema_version < 9)
     payload.pop("sha256", None)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -399,8 +597,18 @@ def compute_precheck(
     risk_model: dict | None = None,
     meta_sha256: str = "",
     execution_realism: ExecutionRealism | None = None,
+    prior_book_lineage: PriorBookLineage | None = None,
+    binding_user_directive_present: bool = False,
+    binding_user_directive_controlled_restart_graduation: bool = False,
 ) -> PrecheckMetrics:
     """Compute every auditable number on the PROPOSED book. Pure function of its inputs."""
+    if prior_book_lineage is not None and prior_book_lineage.cycle >= cycle:
+        raise ValueError("prior manifest-bound Book must precede the current cycle")
+    if (
+        binding_user_directive_controlled_restart_graduation
+        and not binding_user_directive_present
+    ):
+        raise ValueError("controlled-restart graduation capability requires a bound directive")
     execution_policy_applied = execution_realism is not None
     execution_policy = execution_realism or _LEGACY_EXECUTION_REALISM
     marks = {e["symbol"]: float(e["mark"]) for e in evidence}
@@ -427,6 +635,9 @@ def compute_precheck(
         seen.add(lg.symbol)
     unpriced = sorted({lg.symbol for lg in book.legs if lg.symbol not in marks})
 
+    # The cold-start allowance is fail-closed: ``None`` is unknown inventory, not proof of a flat
+    # book. Production supplies an explicit list from the paper account, including any dust row.
+    predecision_inventory_empty = current_book is not None and len(current_book) == 0
     held = {c["symbol"]: c for c in (current_book or [])}
     longs = sum(lg.target_notional for lg in book.legs if lg.side == "long")
     shorts = sum(lg.target_notional for lg in book.legs if lg.side == "short")
@@ -724,6 +935,78 @@ def compute_precheck(
             max_position_co_risk_cluster_risk_share = correlation_context[
                 "max_position_co_risk_cluster_risk_share"
             ]
+
+    # Four fresh entries are permitted only for an explicitly flat paper account, an all-alpha
+    # non-BTC proposal, and a complete proposed-book residual covariance packet. A missing or
+    # invalid risk model is unknown risk (not measured zero) and retains the ordinary B9 cap.
+    cold_start_reentry_eligible = bool(
+        predecision_inventory_empty
+        and book.legs
+        and all(lg.seat_role == "alpha" and lg.symbol != btc_symbol for lg in book.legs)
+        and risk_available
+    )
+    b9_aggressive_change_limit = (
+        COLD_START_MAX_LEGS_CHANGED if cold_start_reentry_eligible else MAX_LEGS_CHANGED
+    )
+
+    # Controlled restart is a GPT-authored lifecycle assertion with deterministic provenance.
+    # These facts do not create a new bound or accept/reject a Book. They let the Adversary decide
+    # whether a B1 starter-risk override is genuinely initial, a valid continuation, or an
+    # invented/changed/reactivated lineage. An active lineage ends only with an explicitly
+    # false/null, fully flat proposed Book, so clearing metadata cannot launder a risk expansion.
+    prior_restart_active = bool(
+        prior_book_lineage is not None and prior_book_lineage.controlled_restart_phase
+    )
+    fully_flat_explicit_end = bool(
+        not book.legs
+        and not book.controlled_restart_phase
+        and book.controlled_restart_origin_cycle is None
+    )
+    controlled_restart_initial_eligible = bool(
+        book.controlled_restart_phase
+        and book.controlled_restart_origin_cycle == cycle
+        and cold_start_reentry_eligible
+        and not binding_user_directive_present
+        and not prior_restart_active
+    )
+    controlled_restart_continuation_eligible = bool(
+        book.controlled_restart_phase
+        and book.legs
+        and current_book is not None
+        and len(current_book) > 0
+        and prior_restart_active
+        and prior_book_lineage is not None
+        and book.controlled_restart_origin_cycle
+        == prior_book_lineage.controlled_restart_origin_cycle
+    )
+    if prior_restart_active:
+        # An authenticated active lineage cannot be replaced from an empty account. With live
+        # inventory it may continue exactly; from either state it may end only explicitly flat.
+        if predecision_inventory_empty:
+            controlled_restart_lineage_valid = fully_flat_explicit_end
+        elif current_book is not None and len(current_book) > 0:
+            controlled_restart_lineage_valid = bool(
+                controlled_restart_continuation_eligible or fully_flat_explicit_end
+            )
+        else:
+            controlled_restart_lineage_valid = fully_flat_explicit_end
+    elif predecision_inventory_empty and binding_user_directive_present:
+        # The distinct directive cold-start path may carry a non-empty 98--102% Book, but it is
+        # ordinary false/null lineage and can never masquerade as a controlled seed.
+        controlled_restart_lineage_valid = bool(
+            not book.controlled_restart_phase
+            and book.controlled_restart_origin_cycle is None
+        )
+    elif predecision_inventory_empty:
+        controlled_restart_lineage_valid = bool(
+            controlled_restart_initial_eligible or fully_flat_explicit_end
+        )
+    else:
+        # Ordinary non-empty (or unknown) inventory with no active prior must remain false/null.
+        controlled_restart_lineage_valid = bool(
+            not book.controlled_restart_phase
+            and book.controlled_restart_origin_cycle is None
+        )
 
     # B10 has two deliberately different scopes. Every priced selected seat (and a dropped seat
     # whose exit still crosses the book) remains subject to the absolute 75bp ceiling. An
@@ -1316,10 +1599,13 @@ def compute_precheck(
         ),
         _b(
             "B9",
-            "aggressive changes (added+flipped+same-side increases)",
+            (
+                "aggressive changes (added+flipped+same-side increases); four only for an "
+                "exact-flat, all-non-BTC-alpha re-entry with complete residual covariance"
+            ),
             float(n_aggressive),
-            f"<= {MAX_LEGS_CHANGED}",
-            n_aggressive <= MAX_LEGS_CHANGED,
+            f"<= {b9_aggressive_change_limit}",
+            n_aggressive <= b9_aggressive_change_limit,
         ),
         _b(
             "B10",
@@ -1356,7 +1642,7 @@ def compute_precheck(
     ]
 
     metrics = PrecheckMetrics(
-        schema_version=5,
+        schema_version=PRECHECK_SCHEMA_VERSION,
         cycle=cycle,
         cash=round(cash, 2),
         gross=round(gross, 2),
@@ -1391,6 +1677,35 @@ def compute_precheck(
         turnover_legs_changed=n_changed,
         turnover_usd=round(turnover_usd, 2),
         turnover_aggressive_legs_changed=n_aggressive,
+        cold_start_reentry_eligible=cold_start_reentry_eligible,
+        b9_aggressive_change_limit=b9_aggressive_change_limit,
+        controlled_restart_origin_cycle=book.controlled_restart_origin_cycle,
+        controlled_restart_phase=book.controlled_restart_phase,
+        controlled_restart_initial_eligible=controlled_restart_initial_eligible,
+        controlled_restart_continuation_eligible=(
+            controlled_restart_continuation_eligible
+        ),
+        controlled_restart_lineage_valid=controlled_restart_lineage_valid,
+        controlled_restart_prior_cycle=(
+            prior_book_lineage.cycle if prior_book_lineage is not None else None
+        ),
+        controlled_restart_prior_book_sha256=(
+            prior_book_lineage.book_sha256 if prior_book_lineage is not None else None
+        ),
+        controlled_restart_prior_origin_cycle=(
+            prior_book_lineage.controlled_restart_origin_cycle
+            if prior_book_lineage is not None
+            else None
+        ),
+        controlled_restart_prior_phase=(
+            prior_book_lineage.controlled_restart_phase
+            if prior_book_lineage is not None
+            else False
+        ),
+        binding_user_directive_present=binding_user_directive_present,
+        binding_user_directive_controlled_restart_graduation=(
+            binding_user_directive_controlled_restart_graduation
+        ),
         turnover_risk_reductions=n_risk_reductions,
         turnover_claim_errors=turnover_claim_errors,
         unpriced_symbols=unpriced,

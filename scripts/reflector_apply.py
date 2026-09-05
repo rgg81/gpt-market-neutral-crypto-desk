@@ -14,18 +14,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import stat
 import subprocess
 import sys
 import traceback
 from pathlib import Path
 
+from futures_fund.durable_io import fsync_directory
 from futures_fund.reflection import (
     apply_reflection,
     audit_managed_region_provenance,
     bootstrap_reflector_heads,
     mark_recurrences_handled,
-    reflection_authority_consumption_path,
+    read_only_reflection_probe_issues,
+    recover_reflection_apply_transactions,
     reflector_head_anchor_path,
     reflector_heads_path,
     scored_cycles,
@@ -64,32 +65,6 @@ def _git_paths_clean(root: Path, path: Path) -> bool:
     return unstaged.returncode == 0 and staged.returncode == 0
 
 
-def _snapshot_files(agents_dir: Path) -> dict[Path, bytes]:
-    return {path: path.read_bytes() for path in agents_dir.glob("*.md") if path.is_file()}
-
-
-def _restore_files(snapshot: dict[Path, bytes]) -> None:
-    for path, content in snapshot.items():
-        path.write_bytes(content)
-
-
-def _snapshot_optional(path: Path) -> tuple[bool, bytes, int | None]:
-    if not path.exists():
-        return False, b"", None
-    return True, path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
-
-
-def _restore_optional(path: Path, snapshot: tuple[bool, bytes, int | None]) -> None:
-    existed, content, mode = snapshot
-    if existed:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-        if mode is not None:
-            path.chmod(mode)
-    else:
-        path.unlink(missing_ok=True)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Apply a reflection proposal to the agent prompts.")
     ap.add_argument("--memory-dir", default="live_memory")
@@ -108,10 +83,60 @@ def main(argv: list[str] | None = None) -> int:
             "one-time audited migration: bind reviewed active regions to reflector-heads-v1.json"
         ),
     )
+    mode.add_argument(
+        "--probe-existing",
+        action="store_true",
+        help=(
+            "read-only managed-region audit; report recovery work instead of performing it"
+        ),
+    )
     args = ap.parse_args(argv)
     journal_path = Path(args.memory_dir) / JOURNAL_NAME
     heads_path = reflector_heads_path(journal_path)
     anchor_path = reflector_head_anchor_path(args.state_dir)
+    if args.probe_existing:
+        try:
+            issues = read_only_reflection_probe_issues(
+                args.state_dir,
+                args.memory_dir,
+                args.agents_dir,
+                anchor_path=anchor_path,
+            )
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            issues = [f"read-only reflection probe failed: {exc}"]
+        if issues:
+            print(
+                json.dumps(
+                    {
+                        "managed_region_probe": "FAILED",
+                        "read_only": True,
+                        "issues": issues,
+                    },
+                    indent=2,
+                )
+            )
+            return 1
+        print(
+            json.dumps(
+                {"managed_region_probe": "OK", "read_only": True, "recovery_pending": False},
+                indent=2,
+            )
+        )
+        return 0
+    try:
+        recover_reflection_apply_transactions(
+            args.state_dir,
+            args.memory_dir,
+            args.agents_dir,
+            anchor_path=anchor_path,
+        )
+    except (OSError, ValueError) as exc:
+        print(
+            json.dumps(
+                {"reflection_apply_recovery": "FAILED", "error": str(exc)}, indent=2
+            )
+        )
+        return 1
     if args.bootstrap_heads:
         try:
             result = bootstrap_reflector_heads(
@@ -145,14 +170,6 @@ def main(argv: list[str] | None = None) -> int:
         print("no reflection.json; nothing to apply")
         return 0
     current_cycle = int(resolved_meta["cycle"])
-    consumption_path = reflection_authority_consumption_path(args.state_dir, current_cycle)
-    handled_path = Path(args.memory_dir) / "recurrence-handled.json"
-    prompt_snapshot: dict[Path, bytes] = {}
-    journal_snapshot = _snapshot_optional(journal_path)
-    heads_snapshot = _snapshot_optional(heads_path)
-    anchor_snapshot = _snapshot_optional(anchor_path)
-    consumption_snapshot = _snapshot_optional(consumption_path)
-    handled_snapshot = _snapshot_optional(handled_path)
     try:
         proposal = json.loads(proposal_path.read_text())
         rec_path = pending / "recurrences.json"
@@ -164,7 +181,6 @@ def main(argv: list[str] | None = None) -> int:
         # own [cN] date tag and a future retire_if target are legitimately unscored.
         git_root = _git_root(agents_dir)
         git_clean = bool(git_root and _git_paths_clean(git_root, agents_dir))
-        prompt_snapshot = _snapshot_files(agents_dir)
         res = apply_reflection(
             proposal,
             agents_dir,
@@ -176,6 +192,39 @@ def main(argv: list[str] | None = None) -> int:
             sealed_recurrences_sha256=recurrences_seal,
             anchor_path=anchor_path,
         )
+        if res.get("already_consumed"):
+            print(json.dumps(res, indent=2))
+            return 0
+        if res["skipped"]:
+            details = "; ".join(f"{role}: {reason}" for role, reason in res["skipped"])
+            raise ValueError(
+                "reflection proposal contained unapplied edits; authority remains retryable: "
+                + details
+            )
+        write_reflection_authority_consumption(
+            args.state_dir,
+            args.memory_dir,
+            source_cycle=current_cycle,
+            recurrences_sha256=recurrences_seal,
+            outcome="head_applied" if res["applied"] else "no_head_change",
+            proposal=proposal,
+            agents_dir=agents_dir,
+            anchor_path=anchor_path,
+        )
+        if res["applied"]:
+            # Consumption makes the verified poststate immutable. Finalization reconstructs the
+            # cooldown and removes the write-ahead intent; a crash at either boundary is replayed
+            # before the next head audit or score step.
+            recover_reflection_apply_transactions(
+                args.state_dir,
+                args.memory_dir,
+                agents_dir,
+                source_cycle=current_cycle,
+                anchor_path=anchor_path,
+            )
+        else:
+            mark_recurrences_handled(args.memory_dir, recs, cycle=current_cycle)
+            fsync_directory(args.memory_dir)
         if res["applied"]:
             roles = ", ".join(res["applied"])
             if git_root and git_clean:
@@ -185,39 +234,41 @@ def main(argv: list[str] | None = None) -> int:
                     "Auto-generated by the GPT self-learning loop; managed-region-only, "
                     "guard-verified."
                 )
-                # --only commits the listed working-tree paths without sweeping unrelated staged
-                # changes. A dirty agents/ tree is journal-only instead of being mixed in.
-                subprocess.run(
+                # Git is a secondary audit mirror. The journal/head/anchor transaction is already
+                # authoritative, so a Git failure cannot roll back a consumed desk decision.
+                completed = subprocess.run(
                     [
                         "git", "-C", str(git_root), "commit", "-q", "--only",
                         "-m", msg, "--", str(relative),
                     ],
-                    check=True,
+                    check=False,
                 )
-                res["audit"] = "journal+git"
+                res["audit"] = (
+                    "journal+git"
+                    if completed.returncode == 0
+                    else "journal-only (Git audit commit failed)"
+                )
             elif git_root:
                 res["audit"] = "journal-only (agents tree was dirty before reflection)"
             else:
                 res["audit"] = "journal-only (no Git worktree)"
-        write_reflection_authority_consumption(
-            args.state_dir,
-            args.memory_dir,
-            source_cycle=current_cycle,
-            recurrences_sha256=recurrences_seal,
-            outcome="head_applied" if res["applied"] else "no_head_change",
-        )
-        # Mark handled only after every requested audit action succeeds. If a Git/audit failure
-        # triggers rollback, the event remains retryable rather than being silently cooled down.
-        mark_recurrences_handled(args.memory_dir, recs, cycle=current_cycle)
         print(json.dumps(res, indent=2))
     except Exception:  # noqa: BLE001 — fail-soft; do not block the cycle
-        _restore_files(prompt_snapshot)
-        _restore_optional(journal_path, journal_snapshot)
-        _restore_optional(heads_path, heads_snapshot)
-        _restore_optional(anchor_path, anchor_snapshot)
-        _restore_optional(consumption_path, consumption_snapshot)
-        _restore_optional(handled_path, handled_snapshot)
-        print("reflector_apply failed (fail-soft); reverted agent edits", file=sys.stderr)
+        recovery_pending = False
+        try:
+            recover_reflection_apply_transactions(
+                args.state_dir,
+                args.memory_dir,
+                agents_dir,
+                source_cycle=current_cycle,
+                anchor_path=anchor_path,
+            )
+        except Exception:  # noqa: BLE001 - retain the original traceback and recovery intent
+            recovery_pending = True
+            print("reflector_apply recovery also failed", file=sys.stderr)
+            traceback.print_exc()
+        status = "recovery remains pending" if recovery_pending else "transaction recovered"
+        print(f"reflector_apply failed (fail-soft); {status}", file=sys.stderr)
         traceback.print_exc()
     return 0
 

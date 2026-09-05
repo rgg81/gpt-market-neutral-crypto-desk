@@ -7,7 +7,7 @@ import pytest
 
 from futures_fund.account import PaperAccount
 from futures_fund.cycle_io import cycle_dir, save_output
-from futures_fund.desk_contracts import ReflectionProposal
+from futures_fund.desk_contracts import ReflectionProposal, ReflectorEdit
 from futures_fund.durable_io import canonical_json_sha256
 from futures_fund.prompt_guard import BEGIN, END, splice_managed, split_managed
 from futures_fund.reconcile_commit import (
@@ -24,16 +24,19 @@ from futures_fund.reflection import (
     audit_managed_region_provenance,
     bootstrap_reflector_heads,
     canonical_daily_score_observation,
+    forecast_cohort_membership_sha256,
     mark_recurrences_handled,
     persist_decision_snapshot,
     read_candidate_scorecard,
     read_forecast_scorecard,
+    reflection_authority_consumption_path,
     reflector_heads_path,
     score_mature_leg_forecasts,
     score_previous_cycle,
     score_record_is_manifest_bound,
     scored_cycles,
     write_reflection_authority,
+    write_reflection_authority_consumption,
 )
 from futures_fund.scorecard import BookScore, Recurrence, ScoreRecord
 from futures_fund.state_transaction import current_account_sha256
@@ -111,6 +114,10 @@ def _commit_seeded_cycle(
     entry_gate_policy = directory / "entry_gate_policy.json"
     if entry_gate_policy.exists():
         artifacts["entry_gate_policy"] = json.loads(entry_gate_policy.read_text())
+    for optional_name in ("precheck", "risk_model"):
+        optional_path = directory / f"{optional_name}.json"
+        if optional_path.exists():
+            artifacts[optional_name] = json.loads(optional_path.read_text())
     timestamp = datetime.fromisoformat(
         scoring_marks["as_of_ts"]
         if scoring_marks is not None
@@ -141,6 +148,8 @@ def _seed_gate_cycle(
     timestamp: str,
     structured: bool,
     explicit_empty_candidates: bool = False,
+    managed_region: str = "\n- active managed entry calibration\n",
+    valid_policy_hash: bool = True,
 ) -> None:
     symbol = "A/USDT:USDT"
     btc = "BTC/USDT:USDT"
@@ -234,13 +243,13 @@ def _seed_gate_cycle(
             "funding_settled_cycle": 0.0,
         },
     )
-    managed_region = "\n- active managed entry calibration\n"
+    managed_sha256 = sha256(
+        json.dumps(managed_region, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     policy = {
         "source": "agents/pm.md",
         "managed_region": managed_region,
-        "sha256": sha256(
-            json.dumps(managed_region, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "sha256": managed_sha256 if valid_policy_hash else "0" * 64,
     }
     save_output(state_dir, cycle, "entry_gate_policy", policy, cadence="rebal")
     _commit_seeded_cycle(
@@ -255,16 +264,16 @@ def _seed_gate_cycle(
 
 def test_pm_gate_inactive_accepts_only_explicit_bound_legacy_gate_declarations(tmp_path):
     state = str(tmp_path / "state")
-    for cycle in (1, 2, 3):
+    for offset, cycle in enumerate((51, 52, 53), start=1):
         _seed_gate_cycle(
             state,
             cycle,
-            timestamp=f"2026-08-0{cycle}T00:07:00+00:00",
+            timestamp=f"2026-08-0{offset}T00:07:00+00:00",
             structured=False,
         )
 
     recurrence = _pm_gate_inactive_recurrences(
-        state, through_cycle=3, cadence="rebal"
+        state, through_cycle=53, cadence="rebal"
     )
 
     assert len(recurrence) == 1
@@ -280,16 +289,146 @@ def test_pm_gate_inactive_accepts_only_explicit_bound_legacy_gate_declarations(t
 
 def test_new_empty_candidate_ledger_cannot_use_the_legacy_gate_adapter(tmp_path):
     state = str(tmp_path / "state")
+    for offset, cycle in enumerate((51, 52, 53), start=1):
+        _seed_gate_cycle(
+            state,
+            cycle,
+            timestamp=f"2026-08-0{offset}T00:07:00+00:00",
+            structured=False,
+            explicit_empty_candidates=cycle == 52,
+        )
+
+    assert _pm_gate_inactive_recurrences(state, through_cycle=53, cadence="rebal") == []
+
+
+@pytest.mark.parametrize("cycles", [(50, 51, 52), (52, 53, 54)])
+def test_legacy_gate_adapter_is_restricted_to_exact_historical_cycles(tmp_path, cycles):
+    state = str(tmp_path / "state")
+    for offset, cycle in enumerate(cycles, start=1):
+        _seed_gate_cycle(
+            state,
+            cycle,
+            timestamp=f"2026-08-0{offset}T00:07:00+00:00",
+            structured=False,
+        )
+
+    assert (
+        _pm_gate_inactive_recurrences(
+            state,
+            through_cycle=max(cycles),
+            cadence="rebal",
+        )
+        == []
+    )
+
+
+def test_structured_gate_causal_evidence_remains_valid_after_legacy_adapter_window(tmp_path):
+    state = str(tmp_path / "state")
+    for offset, cycle in enumerate((54, 55, 56), start=1):
+        _seed_gate_cycle(
+            state,
+            cycle,
+            timestamp=f"2026-08-0{offset}T00:07:00+00:00",
+            structured=True,
+        )
+
+    recurrence = _pm_gate_inactive_recurrences(
+        state,
+        through_cycle=56,
+        cadence="rebal",
+    )
+    assert len(recurrence) == 1
+    assert all("structured_pm_candidate_reviews" in row for row in recurrence[0].evidence)
+
+
+@pytest.mark.parametrize(
+    "cycle_three_kwargs",
+    [
+        {"managed_region": "\n- a different active managed entry calibration\n"},
+        {"valid_policy_hash": False},
+    ],
+    ids=("policy-generation-changed", "declared-policy-hash-invalid"),
+)
+def test_pm_gate_recurrence_refuses_policy_generation_or_hash_breaks(
+    tmp_path, cycle_three_kwargs
+):
+    state = str(tmp_path / "state")
+    for cycle in (1, 2):
+        _seed_gate_cycle(
+            state,
+            cycle,
+            timestamp=f"2026-08-0{cycle}T00:07:00+00:00",
+            structured=True,
+        )
+    _seed_gate_cycle(
+        state,
+        3,
+        timestamp="2026-08-03T00:07:00+00:00",
+        structured=True,
+        **cycle_three_kwargs,
+    )
+
+    assert _pm_gate_inactive_recurrences(state, through_cycle=3, cadence="rebal") == []
+
+
+def test_score_scan_uses_latest_unscored_gate_cycle_and_current_decision_for_cooldown(tmp_path):
+    state = str(tmp_path / "state")
+    memory = str(tmp_path / "memory")
     for cycle in (1, 2, 3):
         _seed_gate_cycle(
             state,
             cycle,
             timestamp=f"2026-08-0{cycle}T00:07:00+00:00",
-            structured=False,
-            explicit_empty_candidates=cycle == 2,
+            structured=True,
+        )
+    # At decision c4 the c1 handling event has completed its three-cycle cooldown. Measuring from
+    # the newest mature outcome origin (c2) would incorrectly suppress the recurrence.
+    mark_recurrences_handled(
+        memory,
+        [{"kind": "pm_gate_inactive", "role": "pm"}],
+        cycle=1,
+    )
+
+    result = score_eligible_completed_cycles(
+        state,
+        memory,
+        btc_symbol="BTC/USDT:USDT",
+        active_calibration_roles={"pm"},
+        decision_cycle=4,
+    )
+
+    assert result["scored_cycles"] == [1, 2]
+    assert result["unscored_waiting_for_committed_marks"] == [3]
+    payload = json.loads((Path(memory) / "pending" / "recurrences.json").read_text())
+    gate = [item for item in payload if item["kind"] == "pm_gate_inactive"]
+    assert len(gate) == 1
+    assert [row.split(":", 1)[0] for row in gate[0]["evidence"]] == ["c1", "c2", "c3"]
+
+
+def test_state_only_gate_surfaces_before_any_outcome_score_matures(tmp_path):
+    state = str(tmp_path / "state")
+    memory = str(tmp_path / "memory")
+    for cycle in (1, 2, 3):
+        _seed_gate_cycle(
+            state,
+            cycle,
+            timestamp="2026-08-01T00:07:00+00:00",
+            structured=True,
         )
 
-    assert _pm_gate_inactive_recurrences(state, through_cycle=3, cadence="rebal") == []
+    result = score_eligible_completed_cycles(
+        state,
+        memory,
+        btc_symbol="BTC/USDT:USDT",
+        active_calibration_roles={"pm"},
+        decision_cycle=4,
+    )
+
+    assert result["scored_cycles"] == []
+    assert result["unscored_waiting_for_committed_marks"] == [1, 2, 3]
+    assert not (Path(memory) / "scorecard.jsonl").exists()
+    payload = json.loads((Path(memory) / "pending" / "recurrences.json").read_text())
+    assert [item["kind"] for item in payload] == ["pm_gate_inactive"]
 
 
 def test_structured_gate_candidates_are_scored_at_the_bound_scheduled_horizon(tmp_path):
@@ -979,7 +1118,7 @@ def test_leg_forecast_waits_for_declared_horizon_and_first_mature_mark_is_immuta
     path = Path(mem) / "forecast-scorecard.jsonl"
     first = path.read_text()
     row = json.loads(first)
-    assert row["forecast_score_schema_version"] == 4
+    assert row["forecast_score_schema_version"] == 5
     assert row["evaluation_horizon_hours"] == pytest.approx(168.0)
     assert row["realized_selected_edge_frac"] == pytest.approx(0.05)
     assert row["selected_side_profitable"] is True
@@ -990,6 +1129,12 @@ def test_leg_forecast_waits_for_declared_horizon_and_first_mature_mark_is_immuta
     assert row["outcome_observation_cycle"] == 2
     assert len(row["outcome_scoring_marks_sha256"]) == 64
     assert row["origin_standalone_vol_usd"] is None
+    assert row["round_trip_friction_priced"] is False
+    assert row["realized_round_trip_cost_net_price_edge_frac"] is None
+    assert row["cost_net_learning_eligible"] is False
+    assert "origin_precheck_not_manifest_bound" in row[
+        "cost_net_learning_exclusion_reasons"
+    ]
 
     forged = {
         **row,
@@ -1113,6 +1258,476 @@ def test_forecast_tolerance_and_accuracy_are_distinct_from_seat_profitability(tm
     # The PM predicted a loss and a loss occurred: direction right, selected seat unprofitable.
     assert row["directional_forecast_hit"] is True
     assert row["sign_hit"] is True
+
+
+@pytest.mark.parametrize(
+    ("side", "expected_entry", "expected_exit", "expected_selected_edge"),
+    [("long", 1.6, 2.6, 0.02), ("short", 2.6, 1.6, -0.02)],
+)
+def test_forecast_v5_prices_manifest_bound_full_round_trip(
+    tmp_path, side, expected_entry, expected_exit, expected_selected_edge
+):
+    st = str(tmp_path / "st")
+    mem = str(tmp_path / "mem")
+    origin = "2026-08-01T00:07:00+00:00"
+    outcome = "2026-08-02T00:07:00+00:00"
+    book = {
+        "legs": [{
+            "symbol": "A",
+            "side": side,
+            "seat_role": "alpha",
+            "target_notional": 1_000.0,
+            "expected_price_edge_frac": 0.01,
+            "edge_horizon_hours": 24,
+            "rationale": "forecast",
+        }],
+    }
+    _seed_cycle(
+        st,
+        1,
+        marks={"A": 100.0, "BTC/USDT:USDT": 100.0},
+        betas={"A": 0.0, "BTC/USDT:USDT": 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book=book,
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin},
+    )
+    directory = cycle_dir(st, 1, cadence="rebal")
+    evidence = json.loads((directory / "evidence.json").read_text())
+    evidence[0].update({
+        "liquidity_mid": 100.0,
+        "slippage_curve_buy_bps": {"2k": 10.0},
+        "slippage_curve_sell_bps": {"2k": 20.0},
+        "depth_usd_ask": 10_000.0,
+        "depth_usd_bid": 10_000.0,
+    })
+    save_output(st, 1, "evidence", evidence, cadence="rebal")
+    save_output(
+        st,
+        1,
+        "precheck",
+        {
+            "execution_policy_applied": True,
+            "execution_latency_ms": 500.0,
+            "execution_displayed_depth_fraction": 0.5,
+            "execution_adverse_selection_bps": 1.0,
+            "execution_legging_bps_per_second": 0.25,
+            "execution_allow_partial_fills": True,
+        },
+        cadence="rebal",
+    )
+    save_output(
+        st,
+        1,
+        "risk_model",
+        {
+            "residual_vol_ewma_shrunk_annualized": {"A": 0.2},
+            "residual_vol_annualized": {"A": 0.9},
+        },
+        cadence="rebal",
+    )
+    _commit_seeded_cycle(st, 1)
+    _seed_cycle(
+        st,
+        2,
+        marks={"A": 102.0, "BTC/USDT:USDT": 100.0},
+        betas={"A": 0.0, "BTC/USDT:USDT": 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 2, "decision_ts": outcome},
+    )
+    _commit_seeded_cycle(
+        st,
+        2,
+        {"as_of_ts": outcome, "marks": {"A": 102.0, "BTC/USDT:USDT": 100.0}},
+    )
+
+    result = score_mature_leg_forecasts(
+        st, mem, through_cycle=2, btc_symbol="BTC/USDT:USDT"
+    )
+    assert result["new_forecast_scores"] == 1
+    path = Path(mem) / "forecast-scorecard.jsonl"
+    original = path.read_text()
+    row = read_forecast_scorecard(path, state_dir=st)[0]
+    assert row["forecast_score_schema_version"] == 5
+    assert row["origin_standalone_vol_usd"] == pytest.approx(200.0)
+    assert len(row["origin_precheck_sha256"]) == 64
+    assert len(row["origin_risk_model_sha256"]) == 64
+    assert row["round_trip_friction_priced"] is True
+    assert row["round_trip_legging_reserve_bps"] == 0.0
+    assert row["round_trip_entry_friction_usd"] == pytest.approx(expected_entry)
+    assert row["round_trip_exit_friction_usd"] == pytest.approx(expected_exit)
+    assert row["round_trip_friction_usd"] == pytest.approx(4.2)
+    assert row["round_trip_friction_frac"] == pytest.approx(0.0042)
+    assert row["realized_selected_edge_frac"] == pytest.approx(expected_selected_edge)
+    assert row["realized_round_trip_cost_net_price_edge_frac"] == pytest.approx(
+        expected_selected_edge - 0.0042
+    )
+    assert row["cost_net_learning_eligible"] is True
+    assert row["cost_net_learning_exclusion_reasons"] == []
+
+    forged = {**row, "round_trip_friction_frac": 0.0}
+    path.write_text(json.dumps(forged) + "\n")
+    with pytest.raises(ValueError, match="invalid forecast score row"):
+        read_forecast_scorecard(path, state_dir=st)
+    path.write_text(original)
+
+
+def test_forecast_v5_missing_full_side_depth_is_cost_net_ineligible(tmp_path):
+    st = str(tmp_path / "st")
+    mem = str(tmp_path / "mem")
+    origin = "2026-08-01T00:07:00+00:00"
+    outcome = "2026-08-02T00:07:00+00:00"
+    _seed_cycle(
+        st,
+        1,
+        marks={"A": 100.0, "BTC/USDT:USDT": 100.0},
+        betas={"A": 0.0, "BTC/USDT:USDT": 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": [{
+            "symbol": "A", "side": "long", "seat_role": "alpha",
+            "target_notional": 1_000.0, "expected_price_edge_frac": 0.01,
+            "edge_horizon_hours": 24, "rationale": "forecast",
+        }]},
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin},
+    )
+    directory = cycle_dir(st, 1, cadence="rebal")
+    evidence = json.loads((directory / "evidence.json").read_text())
+    evidence[0].update({
+        "liquidity_mid": 100.0,
+        "slippage_curve_buy_bps": {"2k": 10.0},
+        "slippage_curve_sell_bps": {"2k": 20.0},
+        "depth_usd_ask": 10_000.0,
+        "depth_usd_bid": 100.0,
+    })
+    save_output(st, 1, "evidence", evidence, cadence="rebal")
+    save_output(st, 1, "precheck", {
+        "execution_policy_applied": True,
+        "execution_latency_ms": 500.0,
+        "execution_displayed_depth_fraction": 0.5,
+        "execution_adverse_selection_bps": 1.0,
+        "execution_legging_bps_per_second": 0.25,
+        "execution_allow_partial_fills": True,
+    }, cadence="rebal")
+    _commit_seeded_cycle(st, 1)
+    _seed_cycle(
+        st, 2, marks={"A": 102.0, "BTC/USDT:USDT": 100.0},
+        betas={"A": 0.0, "BTC/USDT:USDT": 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []}, adversary={"accept": True},
+        report={"cycle": 2, "decision_ts": outcome},
+    )
+    _commit_seeded_cycle(
+        st, 2, {"as_of_ts": outcome, "marks": {"A": 102.0, "BTC/USDT:USDT": 100.0}}
+    )
+
+    score_mature_leg_forecasts(st, mem, through_cycle=2, btc_symbol="BTC/USDT:USDT")
+    row = read_forecast_scorecard(
+        Path(mem) / "forecast-scorecard.jsonl", state_dir=st
+    )[0]
+    assert row["learning_eligible"] is True
+    assert row["round_trip_friction_priced"] is False
+    assert row["realized_round_trip_cost_net_price_edge_frac"] is None
+    assert row["cost_net_learning_eligible"] is False
+    assert "exit_full_fill_cost_unavailable" in row["cost_net_learning_exclusion_reasons"]
+
+
+def test_forecast_v5_waits_for_complete_origin_horizon_membership(tmp_path):
+    state = str(tmp_path / "state")
+    memory = str(tmp_path / "memory")
+    btc = "BTC/USDT:USDT"
+    origin_ts = "2026-08-01T00:07:00+00:00"
+    legs = [
+        {
+            "symbol": symbol,
+            "side": "long",
+            "seat_role": "alpha",
+            "target_notional": 1_000.0,
+            "expected_price_edge_frac": 0.01,
+            "edge_horizon_hours": 24,
+            "rationale": "same-horizon cohort",
+        }
+        for symbol in ("A", "B")
+    ]
+    _seed_cycle(
+        state,
+        1,
+        marks={"A": 100.0, "B": 100.0, btc: 100.0},
+        betas={"A": 0.0, "B": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": legs},
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin_ts},
+    )
+    _commit_seeded_cycle(state, 1)
+
+    scheduled_ts = "2026-08-02T00:07:00+00:00"
+    incomplete_marks = {"A": 101.0, btc: 100.0}
+    _seed_cycle(
+        state,
+        2,
+        marks=incomplete_marks,
+        betas={"A": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 2, "decision_ts": scheduled_ts},
+    )
+    _commit_seeded_cycle(
+        state,
+        2,
+        {"as_of_ts": scheduled_ts, "marks": incomplete_marks},
+    )
+    result = score_mature_leg_forecasts(
+        state, memory, through_cycle=2, btc_symbol=btc
+    )
+    assert result["new_forecast_scores"] == 0
+    assert result["pending_forecasts"] == 2
+    assert not (Path(memory) / "forecast-scorecard.jsonl").exists()
+
+    late_ts = "2026-08-03T00:07:00+00:00"
+    complete_marks = {"A": 102.0, "B": 98.0, btc: 100.0}
+    _seed_cycle(
+        state,
+        3,
+        marks=complete_marks,
+        betas={"A": 0.0, "B": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 3, "decision_ts": late_ts},
+    )
+    _commit_seeded_cycle(
+        state,
+        3,
+        {"as_of_ts": late_ts, "marks": complete_marks},
+    )
+    result = score_mature_leg_forecasts(
+        state, memory, through_cycle=3, btc_symbol=btc
+    )
+    assert result["new_forecast_scores"] == 2
+    rows = read_forecast_scorecard(
+        Path(memory) / "forecast-scorecard.jsonl", state_dir=state
+    )
+    assert {row["symbol"] for row in rows} == {"A", "B"}
+    assert {row["outcome_observation_cycle"] for row in rows} == {3}
+    assert {row["horizon_status"] for row in rows} == {"off_horizon_late"}
+    assert not any(row["learning_eligible"] for row in rows)
+    assert not any(row["cost_net_learning_eligible"] for row in rows)
+    assert all(row["forecast_cohort_expected_symbols"] == ["A", "B"] for row in rows)
+
+
+@pytest.mark.parametrize("invalid_mark", [0.0, None, float("nan"), float("inf")])
+def test_forecast_v5_shared_selector_requires_every_mark_positive_and_finite(
+    tmp_path, monkeypatch, invalid_mark
+):
+    import futures_fund.reflection as reflection
+
+    state = str(tmp_path / "state")
+    btc = "BTC/USDT:USDT"
+    origin_ts = "2026-08-01T00:07:00+00:00"
+    _seed_cycle(
+        state,
+        1,
+        marks={"A": 100.0, "B": 100.0, btc: 100.0},
+        betas={"A": 0.0, "B": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={
+            "legs": [
+                {
+                    "symbol": symbol,
+                    "side": "long",
+                    "seat_role": "alpha",
+                    "target_notional": 1_000.0,
+                    "expected_price_edge_frac": 0.01,
+                    "edge_horizon_hours": 24,
+                    "rationale": "same-horizon cohort",
+                }
+                for symbol in ("A", "B")
+            ]
+        },
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin_ts},
+    )
+    _commit_seeded_cycle(state, 1)
+    observations = [
+        (
+            2,
+            datetime.fromisoformat("2026-08-02T00:07:00+00:00"),
+            {"A": 101.0, "B": invalid_mark, btc: 100.0},
+            "a" * 64,
+        ),
+        (
+            3,
+            datetime.fromisoformat("2026-08-03T00:07:00+00:00"),
+            {"A": 102.0, "B": 98.0, btc: 100.0},
+            "b" * 64,
+        ),
+    ]
+    monkeypatch.setattr(
+        reflection,
+        "committed_scoring_observations",
+        lambda *_args, **_kwargs: observations,
+    )
+
+    rows = [
+        reflection._build_forecast_score_row(
+            state,
+            origin_cycle=1,
+            symbol=symbol,
+            btc_symbol=btc,
+            cadence="rebal",
+        )
+        for symbol in ("A", "B")
+    ]
+    assert all(row is not None for row in rows)
+    assert {row["outcome_observation_cycle"] for row in rows if row is not None} == {3}
+
+
+def test_forecast_v5_full_on_time_membership_is_bound_and_shared(tmp_path):
+    state = str(tmp_path / "state")
+    memory = str(tmp_path / "memory")
+    btc = "BTC/USDT:USDT"
+    origin_ts = "2026-08-01T00:07:00+00:00"
+    expected = ["A", "B"]
+    book = {
+        "legs": [
+            {
+                "symbol": symbol,
+                "side": "long",
+                "seat_role": "alpha",
+                "target_notional": 1_000.0,
+                "expected_price_edge_frac": 0.01,
+                "edge_horizon_hours": 24,
+                "rationale": "complete cohort",
+            }
+            for symbol in expected
+        ]
+    }
+    _seed_cycle(
+        state,
+        1,
+        marks={"A": 100.0, "B": 100.0, btc: 100.0},
+        betas={"A": 0.0, "B": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book=book,
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin_ts},
+    )
+    _commit_seeded_cycle(state, 1)
+    outcome_ts = "2026-08-02T00:07:00+00:00"
+    outcome_marks = {"A": 101.0, "B": 99.0, btc: 100.0}
+    _seed_cycle(
+        state,
+        2,
+        marks=outcome_marks,
+        betas={"A": 0.0, "B": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": []},
+        adversary={"accept": True},
+        report={"cycle": 2, "decision_ts": outcome_ts},
+    )
+    _commit_seeded_cycle(
+        state,
+        2,
+        {"as_of_ts": outcome_ts, "marks": outcome_marks},
+    )
+
+    result = score_mature_leg_forecasts(
+        state, memory, through_cycle=2, btc_symbol=btc
+    )
+    assert result["new_forecast_scores"] == 2
+    path = Path(memory) / "forecast-scorecard.jsonl"
+    original = path.read_text()
+    rows = read_forecast_scorecard(path, state_dir=state)
+    expected_sha256 = forecast_cohort_membership_sha256(1, 24, expected)
+    assert {row["outcome_observation_cycle"] for row in rows} == {2}
+    assert all(row["learning_eligible"] for row in rows)
+    assert all(row["forecast_cohort_expected_symbols"] == expected for row in rows)
+    assert all(row["forecast_cohort_expected_member_count"] == 2 for row in rows)
+    assert all(
+        row["forecast_cohort_expected_symbols_sha256"] == expected_sha256
+        for row in rows
+    )
+
+    for field, value in (
+        ("forecast_cohort_expected_symbols", ["A"]),
+        ("forecast_cohort_expected_member_count", 1),
+        ("forecast_cohort_expected_symbols_sha256", "f" * 64),
+    ):
+        forged = {**rows[0], field: value}
+        if field == "forecast_cohort_expected_symbols":
+            forged["forecast_cohort_expected_member_count"] = 1
+            forged["forecast_cohort_expected_symbols_sha256"] = (
+                forecast_cohort_membership_sha256(1, 24, ["A"])
+            )
+        path.write_text(json.dumps(forged) + "\n")
+        with pytest.raises(ValueError, match="invalid forecast score row"):
+            read_forecast_scorecard(path, state_dir=state)
+    path.write_text(original)
+
+
+def test_forecast_v5_mixed_horizons_have_separate_memberships(tmp_path):
+    state = str(tmp_path / "state")
+    memory = str(tmp_path / "memory")
+    btc = "BTC/USDT:USDT"
+    origin_ts = "2026-08-01T00:07:00+00:00"
+    legs = [
+        {
+            "symbol": symbol,
+            "side": "long",
+            "seat_role": "alpha",
+            "target_notional": 1_000.0,
+            "expected_price_edge_frac": 0.01,
+            "edge_horizon_hours": horizon,
+            "rationale": "mixed horizons",
+        }
+        for symbol, horizon in (("A", 24), ("B", 72), ("C", 24))
+    ]
+    _seed_cycle(
+        state,
+        1,
+        marks={"A": 100.0, "B": 100.0, "C": 100.0, btc: 100.0},
+        betas={"A": 0.0, "B": 0.0, "C": 0.0, btc: 1.0},
+        reads={"sentiment": [], "technical": [], "futures": []},
+        book={"legs": legs},
+        adversary={"accept": True},
+        report={"cycle": 1, "decision_ts": origin_ts},
+    )
+    _commit_seeded_cycle(state, 1)
+    for cycle, outcome_ts, outcome_marks in (
+        (2, "2026-08-02T00:07:00+00:00", {"A": 101.0, "C": 102.0, btc: 100.0}),
+        (3, "2026-08-04T00:07:00+00:00", {"B": 103.0, btc: 100.0}),
+    ):
+        _seed_cycle(
+            state,
+            cycle,
+            marks=outcome_marks,
+            betas={symbol: 0.0 for symbol in outcome_marks},
+            reads={"sentiment": [], "technical": [], "futures": []},
+            book={"legs": []},
+            adversary={"accept": True},
+            report={"cycle": cycle, "decision_ts": outcome_ts},
+        )
+        _commit_seeded_cycle(
+            state,
+            cycle,
+            {"as_of_ts": outcome_ts, "marks": outcome_marks},
+        )
+
+    score_mature_leg_forecasts(state, memory, through_cycle=3, btc_symbol=btc)
+    rows = read_forecast_scorecard(
+        Path(memory) / "forecast-scorecard.jsonl", state_dir=state
+    )
+    by_symbol = {row["symbol"]: row for row in rows}
+    assert by_symbol["A"]["forecast_cohort_expected_symbols"] == ["A", "C"]
+    assert by_symbol["C"]["forecast_cohort_expected_symbols"] == ["A", "C"]
+    assert by_symbol["B"]["forecast_cohort_expected_symbols"] == ["B"]
+    assert by_symbol["A"]["outcome_observation_cycle"] == 2
+    assert by_symbol["C"]["outcome_observation_cycle"] == 2
+    assert by_symbol["B"]["outcome_observation_cycle"] == 3
 
 
 def test_overlapping_unchanged_forecast_renewals_do_not_inflate_effective_sample(tmp_path):
@@ -1239,7 +1854,7 @@ def test_shorter_changed_forecast_cannot_shorten_independent_cohort_boundary(tmp
     by_cycle = {row["origin_cycle"]: row for row in rows}
 
     assert result["new_forecast_scores"] == 4
-    assert by_cycle[1]["forecast_score_schema_version"] == 4
+    assert by_cycle[1]["forecast_score_schema_version"] == 5
     assert by_cycle[1]["statistically_independent"] is None
     assert by_cycle[1]["leg_nonoverlap_eligible"] is True
     # The day-1 168h cohort remains the calibration boundary through day 8. The overlapping
@@ -1274,9 +1889,9 @@ def test_shorter_changed_forecast_cannot_shorten_independent_cohort_boundary(tmp
         read_forecast_scorecard(path, state_dir=st)
     path.write_text(original)
 
-    # Schema-v1/v2/v3 rows remain exactly reconstructible against the same committed
-    # origin/outcome artifact hashes after introducing schema v4.
-    for policy_version, historical_origin_cycle in ((1, 1), (2, 3), (3, 3)):
+    # Schema-v1/v2/v3/v4 rows remain exactly reconstructible against the same committed
+    # origin/outcome artifact hashes after introducing schema v5.
+    for policy_version, historical_origin_cycle in ((1, 1), (2, 3), (3, 3), (4, 1)):
         historical = reflection._build_forecast_score_row(
             st,
             origin_cycle=historical_origin_cycle,
@@ -1299,6 +1914,9 @@ def test_shorter_changed_forecast_cannot_shorten_independent_cohort_boundary(tmp
             assert historical["statistically_independent"] is False
             assert historical["forecast_calibration_cohort_origin_cycle"] == 1
             assert "leg_nonoverlap_eligible" not in historical
+        if policy_version == 4:
+            assert historical["forecast_score_schema_version"] == 4
+            assert "round_trip_friction_priced" not in historical
         historical_path = Path(mem) / f"forecast-scorecard-v{policy_version}.jsonl"
         historical_path.write_text(json.dumps(historical) + "\n")
         assert read_forecast_scorecard(historical_path, state_dir=st) == [historical]
@@ -1313,6 +1931,21 @@ def test_shorter_changed_forecast_cannot_shorten_independent_cohort_boundary(tmp
         )
         with pytest.raises(ValueError, match="invalid forecast score row"):
             read_forecast_scorecard(historical_path, state_dir=st)
+
+    # A live ledger may legitimately contain mature immutable v4 rows followed by v5 rows.
+    historical_v4 = reflection._build_forecast_score_row(
+        st,
+        origin_cycle=1,
+        symbol="A",
+        btc_symbol=btc,
+        cadence="rebal",
+        policy_version=4,
+    )
+    assert historical_v4 is not None
+    mixed = [historical_v4, by_cycle[8]]
+    mixed_path = Path(mem) / "forecast-scorecard-mixed-v4-v5.jsonl"
+    mixed_path.write_text("".join(json.dumps(item) + "\n" for item in mixed))
+    assert read_forecast_scorecard(mixed_path, state_dir=st) == mixed
 
 
 def _role_file(tmp_path, role, hard_rule):
@@ -1412,7 +2045,11 @@ def _pending_score_packet(tmp_path, *, cycle: int = 7):
     state = tmp_path / "state"
     memory = tmp_path / "memory"
     agents = tmp_path / "agents"
-    bootstrap_reflector_heads(agents, memory / "reflector-journal.md")
+    bootstrap_reflector_heads(
+        agents,
+        memory / "reflector-journal.md",
+        anchor_path=state / "reflector-head-anchor-v1.json",
+    )
     pending = memory / "pending" / str(cycle)
     pending.mkdir(parents=True)
     now = datetime.now().astimezone().isoformat()
@@ -1474,6 +2111,7 @@ def test_desk_score_recovers_seal_before_authority_and_same_dir_consumed_retry(t
         source_cycle=7,
         recurrences_sha256=prepared_sha256,
         outcome="no_head_change",
+        proposal={"edits": [], "no_action_reason": "test fixture stand-down"},
     )
     (pending / "reflection.json").write_text(json.dumps({"edits": []}))
 
@@ -1484,6 +2122,8 @@ def test_desk_score_recovers_seal_before_authority_and_same_dir_consumed_retry(t
     assert (pending / "recurrences.sha256").read_text().strip() == canonical_json_sha256([])
     assert not (pending / "reflection.json").exists()
     assert reflection_authority_recovery_status(state, memory, 7)["status"] == "consumed"
+    handled = json.loads((memory / "recurrence-handled.json").read_text())
+    assert handled["pm_negative_alpha:pm"]["cycle"] == 7
 
 
 @pytest.mark.parametrize(
@@ -1515,6 +2155,7 @@ def test_consumed_recurrence_rotation_recovers_every_durable_boundary(
         source_cycle=7,
         recurrences_sha256=prepared_sha256,
         outcome="no_head_change",
+        proposal={"edits": [], "no_action_reason": "test fixture stand-down"},
     )
 
     primitive_name = (
@@ -1548,6 +2189,8 @@ def test_consumed_recurrence_rotation_recovers_every_durable_boundary(
     assert recovered["recurrences"] == []
     assert json.loads((pending / "recurrences.json").read_text()) == []
     assert (pending / "recurrences.sha256").read_text().strip() == canonical_json_sha256([])
+    handled = json.loads((memory / "recurrence-handled.json").read_text())
+    assert handled["pm_negative_alpha:pm"]["cycle"] == 7
 
 
 def test_reflection_rejects_unsealed_or_mutated_recurrence_authority(tmp_path):
@@ -1652,6 +2295,146 @@ def test_incomplete_cycle_authority_replays_before_apply_then_stands_down_after_
     stood_down = _recover_reflection_authority_packet(str(state), str(memory), retry_after, 21)
     assert stood_down["reflection_authority_recovery"] == "consumed"
     assert json.loads((retry_after / "recurrences.json").read_text()) == []
+    handled = json.loads((memory / "recurrence-handled.json").read_text())
+    assert handled["pm_negative_alpha:pm"]["cycle"] == 21
+
+
+def test_recovered_handled_marker_never_moves_newer_cooldown_backwards(tmp_path):
+    desk_score, state, memory, pending, _argv = _pending_score_packet(tmp_path)
+    recurrences = [{
+        "kind": "pm_negative_alpha",
+        "role": "pm",
+        "count": 3,
+        "window": 6,
+        "evidence": ["bound"],
+        "suggestion": "review",
+    }]
+    (pending / "recurrences.json").write_text(json.dumps(recurrences))
+    seal = _seal_recurrences(pending)
+    write_reflection_authority(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=seal,
+        recurrences=recurrences,
+    )
+    from futures_fund.reflection import write_reflection_authority_consumption
+
+    write_reflection_authority_consumption(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=seal,
+        outcome="no_head_change",
+        proposal={"edits": [], "no_action_reason": "test fixture stand-down"},
+    )
+    mark_recurrences_handled(memory, recurrences, cycle=10)
+
+    recovered = desk_score._recover_reflection_authority_packet(
+        str(state), str(memory), pending, 7
+    )
+    assert recovered["reflection_authority_recovery"] == "consumed"
+    handled = json.loads((memory / "recurrence-handled.json").read_text())
+    assert handled["pm_negative_alpha:pm"]["cycle"] == 10
+
+
+def test_next_cycle_score_recovers_prior_no_action_consumption_cooldown(tmp_path):
+    desk_score, state, memory, _pending, _argv = _pending_score_packet(tmp_path)
+    agents = tmp_path / "agents"
+    recurrences = [{
+        "kind": "pm_negative_alpha",
+        "role": "pm",
+        "count": 3,
+        "window": 6,
+        "evidence": ["bound"],
+        "suggestion": "review",
+    }]
+    seal = canonical_json_sha256(recurrences)
+    write_reflection_authority(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=seal,
+        recurrences=recurrences,
+    )
+    no_action = {
+        "edits": [],
+        "no_action_reason": "the active PM calibration already addresses the recurrence",
+    }
+    write_reflection_authority_consumption(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=seal,
+        outcome="no_head_change",
+        proposal=no_action,
+        agents_dir=agents,
+    )
+    handled = memory / "recurrence-handled.json"
+    assert not handled.exists()  # process death immediately after immutable consumption
+
+    next_pending = memory / "pending" / "8"
+    next_pending.mkdir()
+    assert desk_score._recover_reflection_authority_packet(
+        str(state),
+        str(memory),
+        next_pending,
+        8,
+        agents_dir=agents,
+    ) is None
+
+    assert json.loads(handled.read_text())["pm_negative_alpha:pm"]["cycle"] == 7
+    consumption = json.loads(reflection_authority_consumption_path(state, 7).read_text())
+    assert consumption["proposal"] == ReflectionProposal.model_validate(no_action).model_dump(
+        mode="json"
+    )
+    assert consumption["no_action_reason"] == no_action["no_action_reason"]
+
+
+def test_existing_legacy_consumption_schema_remains_recoverable(tmp_path):
+    _desk_score, state, memory, _pending, _argv = _pending_score_packet(tmp_path)
+    recurrences = [{
+        "kind": "pm_negative_alpha",
+        "role": "pm",
+        "count": 3,
+        "window": 6,
+        "evidence": ["legacy-bound"],
+        "suggestion": "review",
+    }]
+    recurrence_sha = canonical_json_sha256(recurrences)
+    authority = write_reflection_authority(
+        state,
+        memory,
+        source_cycle=7,
+        recurrences_sha256=recurrence_sha,
+        recurrences=recurrences,
+    )
+    heads = memory / "reflector-heads-v1.json"
+    journal = memory / "reflector-journal.md"
+    legacy_payload = {
+        "authority_receipt_sha256": authority["receipt_sha256"],
+        "outcome": "no_head_change",
+        "post_heads_file_sha256": sha256(heads.read_bytes()).hexdigest(),
+        "post_journal_sha256": sha256(
+            journal.read_bytes() if journal.exists() else b""
+        ).hexdigest(),
+        "schema_version": 1,
+        "source_cycle": 7,
+    }
+    legacy = {
+        **legacy_payload,
+        "consumption_sha256": canonical_json_sha256(legacy_payload),
+    }
+    consumption_path = reflection_authority_consumption_path(state, 7)
+    consumption_path.parent.mkdir(parents=True, exist_ok=True)
+    consumption_path.write_text(json.dumps(legacy, indent=2, sort_keys=True) + "\n")
+
+    assert _recover_reflection_authority_packet(
+        str(state), str(memory), memory / "pending" / "7", 7, agents_dir=tmp_path / "agents"
+    )["reflection_authority_recovery"] == "consumed"
+    assert json.loads((memory / "recurrence-handled.json").read_text())[
+        "pm_negative_alpha:pm"
+    ]["cycle"] == 7
 
 
 def _apply_with_heads(proposal, agents, journal, *, allowed_roles=None, cycle=2, anchor_path=None):
@@ -1927,7 +2710,8 @@ def test_blank_retirement_is_a_bound_head_with_source_provenance(tmp_path):
                 "evidence": ["manifest-bound recovery"],
                 "retire_if": "",
             }
-        ]
+        ],
+        "no_action_reason": "the PM recurrence does not warrant a PM prompt change",
     }
     _apply_with_heads(active, agents, journal, cycle=7)
     recurrences = [
@@ -2059,14 +2843,14 @@ def test_reflection_head_write_failure_rolls_back_prompt_journal_and_head(tmp_pa
     prompt_before = role_path.read_bytes()
     heads_before = heads.read_bytes()
     anchor_before = anchor.read_bytes()
-    original_write = reflection._atomic_write_bytes
+    original_write = reflection.durable_write_bytes
 
-    def fail_on_heads(path, content):
+    def fail_on_heads(path, content, **kwargs):
         if Path(path) == heads:
             raise OSError("injected heads write failure")
-        return original_write(path, content)
+        return original_write(path, content, **kwargs)
 
-    monkeypatch.setattr(reflection, "_atomic_write_bytes", fail_on_heads)
+    monkeypatch.setattr(reflection, "durable_write_bytes", fail_on_heads)
     proposal = {
         "edits": [
             {
@@ -2092,7 +2876,6 @@ def test_reflection_head_write_failure_rolls_back_prompt_journal_and_head(tmp_pa
         json.dumps(recurrences, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     # The authority receipt is intentionally outside the injected head-write path.
-    monkeypatch.setattr(reflection, "_atomic_write_bytes", original_write)
     write_reflection_authority(
         journal.parent,
         journal.parent,
@@ -2102,7 +2885,6 @@ def test_reflection_head_write_failure_rolls_back_prompt_journal_and_head(tmp_pa
         journal_path=journal,
         heads_path=heads,
     )
-    monkeypatch.setattr(reflection, "_atomic_write_bytes", fail_on_heads)
     with pytest.raises(OSError, match="injected heads write failure"):
         apply_reflection(
             proposal,
@@ -2166,15 +2948,15 @@ def test_bootstrap_uses_reviewed_active_region_not_latest_legacy_blank_row(tmp_p
     assert audit_managed_region_provenance(agents, journal) == []
 
 
-def test_apply_reflection_skips_oversize_region(tmp_path):
+def test_apply_reflection_rejects_oversize_region_atomically(tmp_path):
     _role_file(tmp_path, "pm", "Deploy >=90%")
     proposal = {
         "edits": [
             {"role": "pm", "region_text": "x" * 5000, "reason": "", "evidence": [], "retire_if": ""}
         ]
     }
-    res = _apply_with_heads(proposal, tmp_path / "agents", tmp_path / "journal.md")
-    assert res["applied"] == [] and res["skipped"][0][0] == "pm"
+    with pytest.raises(ValueError, match="unapplied edits: pm"):
+        _apply_with_heads(proposal, tmp_path / "agents", tmp_path / "journal.md")
 
 
 def test_apply_reflection_rejects_unknown_role_at_contract_boundary(tmp_path):
@@ -2452,7 +3234,7 @@ def test_adv_revised_derived_from_verdict(tmp_path):
     assert rec["adv_accepted"] is False
 
 
-def test_apply_reflection_skips_role_without_recurrence(tmp_path):
+def test_apply_reflection_rejects_role_without_recurrence_atomically(tmp_path):
     p = _role_file(tmp_path, "sentiment", "never invent a headline")
     proposal = {
         "edits": [
@@ -2463,33 +3245,32 @@ def test_apply_reflection_skips_role_without_recurrence(tmp_path):
                 "evidence": [],
                 "retire_if": "",
             }
-        ]
+        ],
+        "no_action_reason": "the surfaced technical recurrence needs no prompt change",
     }
-    res = _apply_with_heads(
-        proposal,
-        tmp_path / "agents",
-        tmp_path / "j.md",
-        allowed_roles={"technical"},
-    )  # sentiment NOT surfaced
-    assert res["applied"] == []
-    assert res["skipped"][0][0] == "sentiment"
+    with pytest.raises(ValueError, match="no surfaced recurrence for this role"):
+        _apply_with_heads(
+            proposal,
+            tmp_path / "agents",
+            tmp_path / "j.md",
+            allowed_roles={"technical"},
+        )  # sentiment NOT surfaced
     _pre, region, _suf = split_managed(p.read_text())
     assert region.strip() == ""  # unchanged
 
 
-def test_apply_reflection_dedupes_multiple_edits_per_role(tmp_path):
-    p = _role_file(tmp_path, "sentiment", "never invent a headline")
+def test_reflection_proposal_rejects_duplicate_edit_roles():
     proposal = {
         "edits": [
             {
-                "role": "sentiment",
+                "role": "pm",
                 "region_text": "- first",
                 "reason": "",
                 "evidence": [],
                 "retire_if": "",
             },
             {
-                "role": "sentiment",
+                "role": "pm",
                 "region_text": "- second",
                 "reason": "",
                 "evidence": [],
@@ -2497,15 +3278,403 @@ def test_apply_reflection_dedupes_multiple_edits_per_role(tmp_path):
             },
         ]
     }
-    res = _apply_with_heads(
-        proposal,
-        tmp_path / "agents",
-        tmp_path / "j.md",
-        allowed_roles={"sentiment"},
+
+    with pytest.raises(ValueError, match="duplicate reflection edit roles: pm"):
+        ReflectionProposal.model_validate(proposal)
+
+
+def test_apply_reflection_defensively_rejects_constructed_duplicates_without_mutation(tmp_path):
+    _role_file(tmp_path, "pm", "protected")
+    agents = tmp_path / "agents"
+    journal = tmp_path / "reflector-journal.md"
+    bootstrap_reflector_heads(agents, journal)
+
+    def snapshot() -> tuple[dict[str, bytes], list[str]]:
+        files = {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+        return files, sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    before = snapshot()
+    bypassed = ReflectionProposal.model_construct(
+        edits=[
+            ReflectorEdit(role="pm", region_text="- first"),
+            ReflectorEdit(role="pm", region_text="- second"),
+        ],
+        no_action_reason="",
     )
-    assert res["applied"] == ["sentiment"]  # applied ONCE, not twice
-    _pre, region, _suf = split_managed(p.read_text())
-    assert "second" in region and "first" not in region  # last edit wins
+
+    with pytest.raises(ValueError, match="duplicate reflection edit roles: pm"):
+        apply_reflection(bypassed, agents, journal)
+
+    assert snapshot() == before
+
+
+def test_distinct_reflection_edit_roles_remain_valid():
+    proposal = ReflectionProposal.model_validate(
+        {
+            "edits": [
+                {"role": "pm", "region_text": "- pm"},
+                {"role": "adversary", "region_text": "- adversary"},
+            ]
+        }
+    )
+
+    assert [edit.role for edit in proposal.edits] == ["pm", "adversary"]
+
+
+def test_one_consolidated_role_edit_binds_multiple_recurrences(tmp_path):
+    role_path = _role_file(tmp_path, "pm", "protected")
+    agents = tmp_path / "agents"
+    journal = tmp_path / "reflector-journal.md"
+    bootstrap_reflector_heads(agents, journal)
+    recurrences = [
+        {
+            "kind": "pm_negative_net_edge",
+            "role": "pm",
+            "count": 3,
+            "window": 6,
+            "evidence": ["c51", "c52", "c53"],
+            "suggestion": "tighten economics",
+        },
+        {
+            "kind": "pm_gate_inactive",
+            "role": "pm",
+            "count": 3,
+            "window": 3,
+            "evidence": ["c51", "c52", "c53"],
+            "suggestion": "restore liveness",
+        },
+    ]
+    canonical_recurrences = [
+        Recurrence.model_validate(item).model_dump(mode="json") for item in recurrences
+    ]
+    recurrence_seal = sha256(
+        json.dumps(canonical_recurrences, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    write_reflection_authority(
+        tmp_path,
+        tmp_path,
+        source_cycle=55,
+        recurrences_sha256=recurrence_seal,
+        recurrences=canonical_recurrences,
+        journal_path=journal,
+        heads_path=reflector_heads_path(journal),
+    )
+    result = apply_reflection(
+        {
+            "edits": [
+                {
+                    "role": "pm",
+                    "region_text": "- one balanced calibration update",
+                    "reason": "address both PM recurrences",
+                    "evidence": ["c51", "c52", "c53"],
+                    "retire_if": "measured recovery",
+                }
+            ]
+        },
+        agents,
+        journal,
+        allowed_roles={"pm"},
+        current_cycle=55,
+        surfaced_recurrences=canonical_recurrences,
+        sealed_recurrences_sha256=recurrence_seal,
+    )
+
+    assert result == {"applied": ["pm"], "skipped": []}
+    assert "one balanced calibration update" in split_managed(role_path.read_text())[1]
+    assert journal.read_text().count("## pm —") == 1
+    assert "pm_negative_net_edge" in journal.read_text()
+    assert "pm_gate_inactive" in journal.read_text()
+
+
+def _state_evidence_apply_setup(tmp_path, *, include_technical: bool = False):
+    pm_path = _role_file(tmp_path, "pm", "protected")
+    technical_path = _role_file(tmp_path, "technical", "protected")
+    agents = tmp_path / "agents"
+    journal = tmp_path / "reflector-journal.md"
+    bootstrap_reflector_heads(agents, journal)
+    state_rows = [
+        "c52: alpha_legs=0, complete_specialists=3, candidate_reviews=0",
+        "c53: alpha_legs=0, complete_specialists=3, candidate_reviews=0",
+        "c54: alpha_legs=0, complete_specialists=3, candidate_reviews=6",
+    ]
+    recurrences = [
+        {
+            "kind": "pm_gate_inactive",
+            "role": "pm",
+            "count": 3,
+            "window": 3,
+            "evidence": state_rows,
+            "suggestion": "narrow only the causal PM gate",
+        }
+    ]
+    if include_technical:
+        recurrences.append(
+            {
+                "kind": "specialist_inactive",
+                "role": "technical",
+                "count": 3,
+                "window": 6,
+                "evidence": ["c52 scored", "c53 scored"],
+                "suggestion": "review technical calibration",
+            }
+        )
+    canonical = [Recurrence.model_validate(row).model_dump(mode="json") for row in recurrences]
+    seal = sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    write_reflection_authority(
+        tmp_path,
+        tmp_path,
+        source_cycle=55,
+        recurrences_sha256=seal,
+        recurrences=canonical,
+        journal_path=journal,
+        heads_path=reflector_heads_path(journal),
+    )
+    return pm_path, technical_path, agents, journal, canonical, seal, state_rows
+
+
+def test_state_only_pm_gate_exact_unscored_evidence_row_applies(tmp_path):
+    pm_path, _technical, agents, journal, recurrences, seal, rows = (
+        _state_evidence_apply_setup(tmp_path)
+    )
+    result = apply_reflection(
+        {
+            "edits": [
+                {
+                    "role": "pm",
+                    "region_text": "- [c55] Let credible candidates reach full PM judgment.",
+                    "reason": "sealed state-only gate recurrence",
+                    "evidence": rows,
+                    "retire_if": "alpha seats recover by c64",
+                }
+            ]
+        },
+        agents,
+        journal,
+        allowed_roles={"pm"},
+        known_cycles={52, 53},
+        current_cycle=55,
+        surfaced_recurrences=recurrences,
+        sealed_recurrences_sha256=seal,
+    )
+
+    assert result == {"applied": ["pm"], "skipped": []}
+    assert "credible candidates" in split_managed(pm_path.read_text())[1]
+
+
+@pytest.mark.parametrize("field", ["region_text", "reason", "retire_if"])
+def test_state_only_exception_never_authorizes_unscored_claim_outside_evidence(
+    tmp_path, field
+):
+    pm_path, _technical, agents, journal, recurrences, seal, rows = (
+        _state_evidence_apply_setup(tmp_path)
+    )
+    before = pm_path.read_bytes()
+    edit = {
+        "role": "pm",
+        "region_text": "- [c55] governed update",
+        "reason": "sealed gate recurrence",
+        "evidence": rows,
+        "retire_if": "review by c64",
+    }
+    edit[field] += "; c54 realized_edge=-10%"
+
+    with pytest.raises(ValueError, match=r"past cycle\(s\) \[54\]"):
+        apply_reflection(
+            {"edits": [edit]},
+            agents,
+            journal,
+            allowed_roles={"pm"},
+            known_cycles={52, 53},
+            current_cycle=55,
+            surfaced_recurrences=recurrences,
+            sealed_recurrences_sha256=seal,
+        )
+    assert pm_path.read_bytes() == before
+
+
+def test_state_only_exception_rejects_tampered_or_cross_role_evidence(tmp_path):
+    pm_path, technical_path, agents, journal, recurrences, seal, rows = (
+        _state_evidence_apply_setup(tmp_path, include_technical=True)
+    )
+    before = {pm_path: pm_path.read_bytes(), technical_path: technical_path.read_bytes()}
+    proposal = {
+        "edits": [
+            {
+                "role": "pm",
+                "region_text": "- [c55] valid PM update",
+                "reason": "sealed gate recurrence",
+                "evidence": rows,
+                "retire_if": "review by c64",
+            },
+            {
+                "role": "technical",
+                "region_text": "- [c55] attempted cross-role reuse",
+                "reason": "technical recurrence",
+                "evidence": [rows[-1]],
+                "retire_if": "review by c64",
+            },
+        ]
+    }
+
+    with pytest.raises(ValueError, match=r"technical: cites past cycle\(s\) \[54\]"):
+        apply_reflection(
+            proposal,
+            agents,
+            journal,
+            allowed_roles={"pm", "technical"},
+            known_cycles={52, 53},
+            current_cycle=55,
+            surfaced_recurrences=recurrences,
+            sealed_recurrences_sha256=seal,
+        )
+    assert {path: path.read_bytes() for path in before} == before
+
+    # Even the PM cannot alter or summarize the authorized row.
+    tampered = rows[-1] + ", realized_edge=-10%"
+    with pytest.raises(ValueError, match=r"pm: cites past cycle\(s\) \[54\]"):
+        apply_reflection(
+            {
+                "edits": [
+                    {
+                        "role": "pm",
+                        "region_text": "- [c55] governed update",
+                        "reason": "sealed gate recurrence",
+                        "evidence": [*rows[:-1], tampered],
+                        "retire_if": "review by c64",
+                    }
+                ],
+                "no_action_reason": "the technical recurrence needs no prompt change",
+            },
+            agents,
+            journal,
+            allowed_roles={"pm", "technical"},
+            known_cycles={52, 53},
+            current_cycle=55,
+            surfaced_recurrences=recurrences,
+            sealed_recurrences_sha256=seal,
+        )
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_state_only_exception_rejects_same_role_row_from_other_recurrence_kind(tmp_path):
+    pm_path = _role_file(tmp_path, "pm", "protected")
+    agents = tmp_path / "agents"
+    journal = tmp_path / "reflector-journal.md"
+    bootstrap_reflector_heads(agents, journal)
+    row = "c54 realized_selected_edge_frac=-0.01"
+    recurrences = [{
+        "kind": "pm_negative_net_edge",
+        "role": "pm",
+        "count": 3,
+        "window": 6,
+        "evidence": [row],
+        "suggestion": "improve selection",
+    }]
+    seal = sha256(
+        json.dumps(recurrences, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    write_reflection_authority(
+        tmp_path,
+        tmp_path,
+        source_cycle=55,
+        recurrences_sha256=seal,
+        recurrences=recurrences,
+        journal_path=journal,
+        heads_path=reflector_heads_path(journal),
+    )
+    before = pm_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"pm: cites past cycle\(s\) \[54\]"):
+        apply_reflection(
+            {"edits": [{
+                "role": "pm",
+                "region_text": "- [c55] governed update",
+                "reason": "score recurrence",
+                "evidence": [row],
+                "retire_if": "review by c64",
+            }]},
+            agents,
+            journal,
+            allowed_roles={"pm"},
+            known_cycles={52, 53},
+            current_cycle=55,
+            surfaced_recurrences=recurrences,
+            sealed_recurrences_sha256=seal,
+        )
+    assert pm_path.read_bytes() == before
+    assert not journal.exists()
+
+
+def test_explicit_no_action_requires_reason_and_authenticates_packet(tmp_path):
+    _pm, _technical, agents, journal, recurrences, seal, _rows = (
+        _state_evidence_apply_setup(tmp_path)
+    )
+    with pytest.raises(ValueError, match="nonempty no_action_reason"):
+        apply_reflection(
+            {"edits": []},
+            agents,
+            journal,
+            allowed_roles={"pm"},
+            current_cycle=55,
+            surfaced_recurrences=recurrences,
+            sealed_recurrences_sha256=seal,
+        )
+
+    result = apply_reflection(
+        {"edits": [], "no_action_reason": "the active note already addresses this recurrence"},
+        agents,
+        journal,
+        allowed_roles={"pm"},
+        current_cycle=55,
+        surfaced_recurrences=recurrences,
+        sealed_recurrences_sha256=seal,
+    )
+    assert result == {"applied": [], "skipped": []}
+
+
+def test_partial_role_edit_requires_bound_reason_for_omitted_recurrence(tmp_path):
+    _pm, _technical, agents, journal, recurrences, seal, rows = (
+        _state_evidence_apply_setup(tmp_path, include_technical=True)
+    )
+    pm_edit = {
+        "role": "pm",
+        "region_text": "- [c55] governed PM update",
+        "reason": "sealed gate recurrence",
+        "evidence": rows,
+        "retire_if": "review by c64",
+    }
+    with pytest.raises(ValueError, match="nonempty no_action_reason.*technical"):
+        apply_reflection(
+            {"edits": [pm_edit]},
+            agents,
+            journal,
+            allowed_roles={"pm", "technical"},
+            known_cycles={52, 53},
+            current_cycle=55,
+            surfaced_recurrences=recurrences,
+            sealed_recurrences_sha256=seal,
+        )
+
+    result = apply_reflection(
+        {
+            "edits": [pm_edit],
+            "no_action_reason": "technical calibration is already sufficient",
+        },
+        agents,
+        journal,
+        allowed_roles={"pm", "technical"},
+        known_cycles={52, 53},
+        current_cycle=55,
+        surfaced_recurrences=recurrences,
+        sealed_recurrences_sha256=seal,
+    )
+    assert result == {"applied": ["pm"], "skipped": []}
 
 
 def test_reconcile_wiring_persists_then_scores(tmp_path):

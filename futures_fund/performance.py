@@ -27,9 +27,11 @@ from futures_fund.reconcile_commit import (
 )
 from futures_fund.reflection import (
     DAILY_LEARNING_HORIZON_HOURS,
-    FORECAST_SCORE_SCHEMA_VERSION,
+    FORECAST_CALIBRATION_MIN_SCHEMA_VERSION,
+    FORECAST_COST_NET_MIN_SCHEMA_VERSION,
     SCHEDULED_MARK_TOLERANCE,
     daily_score_is_learning_eligible,
+    forecast_cohort_membership_sha256,
     read_candidate_scorecard,
     read_forecast_scorecard,
     score_record_is_manifest_bound,
@@ -55,7 +57,7 @@ _MIN_SPECIALIST_DIRECTIONAL_CALLS = 30
 _MIN_SPECIALIST_OUTPUT_COVERAGE = 0.80
 _FORECAST_CALIBRATION_HORIZONS = (24, 72, 168)
 _MIN_FORECAST_HORIZON_OBSERVATIONS = 12
-PERFORMANCE_SCHEMA_VERSION = 9
+PERFORMANCE_SCHEMA_VERSION = 11
 _BENCHMARK_POLICY_VERSION = 3
 _MIN_INFORMATION_RATIO_OBSERVATIONS = 20
 
@@ -860,7 +862,96 @@ def _forecast_cohort_audit(cohort: dict) -> dict:
     }
 
 
-def _forecast_metric_summary(time_cohorts: list[dict]) -> dict:
+def _cost_net_row_has_priced_outcome(row: dict, *, require_learning: bool) -> bool:
+    value = row.get("realized_round_trip_cost_net_price_edge_frac")
+    return bool(
+        int(row.get("forecast_score_schema_version", 1))
+        >= FORECAST_COST_NET_MIN_SCHEMA_VERSION
+        and (not require_learning or row.get("cost_net_learning_eligible") is True)
+        and row.get("round_trip_friction_priced") is True
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _cost_net_rows_have_exact_membership(
+    rows: list[dict], *, require_learning: bool
+) -> bool:
+    """Authenticate one origin/horizon cohort's complete Book-derived membership."""
+    if not rows or not all(
+        _cost_net_row_has_priced_outcome(row, require_learning=require_learning)
+        for row in rows
+    ):
+        return False
+    observed_symbols = [str(row.get("symbol") or "") for row in rows]
+    if not all(observed_symbols) or len(observed_symbols) != len(set(observed_symbols)):
+        return False
+    first = rows[0]
+    expected_symbols = first.get("forecast_cohort_expected_symbols")
+    expected_count = first.get("forecast_cohort_expected_member_count")
+    expected_sha256 = first.get("forecast_cohort_expected_symbols_sha256")
+    origin_cycle = first.get("origin_cycle")
+    horizon = first.get("forecast_horizon_hours")
+    if (
+        not isinstance(expected_symbols, list)
+        or not expected_symbols
+        or not all(isinstance(symbol, str) and symbol for symbol in expected_symbols)
+        or expected_symbols != sorted(set(expected_symbols))
+        or type(expected_count) is not int
+        or expected_count != len(expected_symbols)
+        or type(origin_cycle) is not int
+        or not isinstance(horizon, (int, float))
+        or isinstance(horizon, bool)
+        or not math.isfinite(float(horizon))
+        or not float(horizon).is_integer()
+    ):
+        return False
+    canonical_sha256 = forecast_cohort_membership_sha256(
+        origin_cycle,
+        int(horizon),
+        expected_symbols,
+    )
+    if expected_sha256 != canonical_sha256:
+        return False
+    expected_identity = (
+        origin_cycle,
+        int(horizon),
+        tuple(expected_symbols),
+        expected_count,
+        expected_sha256,
+    )
+    for row in rows:
+        row_symbols = row.get("forecast_cohort_expected_symbols")
+        row_horizon = row.get("forecast_horizon_hours")
+        if (
+            not isinstance(row_horizon, (int, float))
+            or isinstance(row_horizon, bool)
+            or not math.isfinite(float(row_horizon))
+            or not float(row_horizon).is_integer()
+        ):
+            return False
+        identity = (
+            row.get("origin_cycle"),
+            int(row_horizon),
+            tuple(row_symbols) if isinstance(row_symbols, list) else None,
+            row.get("forecast_cohort_expected_member_count"),
+            row.get("forecast_cohort_expected_symbols_sha256"),
+        )
+        if identity != expected_identity:
+            return False
+    return sorted(observed_symbols) == expected_symbols
+
+
+def _forecast_metric_summary(
+    time_cohorts: list[dict],
+    *,
+    newer_incomplete_cost_net_forecast_n: int = 0,
+    mature_pending_cost_net_forecast_n: int = 0,
+    latest_invalid_cost_net_event_ts: datetime | None = None,
+    as_of: datetime | None = None,
+    horizon_hours: int | None = None,
+) -> dict:
     """Average cohort-level metrics so cross-sectional leg count cannot inflate effective n."""
     sample = [row for cohort in time_cohorts for row in cohort["rows"]]
     leg_n = len(sample)
@@ -897,15 +988,17 @@ def _forecast_metric_summary(time_cohorts: list[dict]) -> dict:
                 sum(bool(row["directional_forecast_hit"]) for row in covered) / len(covered)
             )
 
-    def weighted_cohort_means(weight_field: str, value_field: str) -> tuple[list[float], int]:
+    def weighted_cohort_means(
+        cohorts: list[dict], weight_field: str, value_field: str
+    ) -> tuple[list[float], int]:
         values = []
         covered_legs = 0
-        for cohort in time_cohorts:
+        for cohort in cohorts:
             weighted_rows = []
             for row in cohort["rows"]:
                 raw_weight = row.get(weight_field)
                 weight = float(raw_weight) if raw_weight is not None else 0.0
-                if weight > 0.0:
+                if math.isfinite(weight) and weight > 0.0:
                     covered_legs += 1
                     weighted_rows.append((weight, float(row[value_field])))
             if len(weighted_rows) == len(cohort["rows"]):
@@ -914,15 +1007,101 @@ def _forecast_metric_summary(time_cohorts: list[dict]) -> dict:
         return values, covered_legs
 
     notional_predicted, notional_observations = weighted_cohort_means(
-        "target_notional", "predicted_selected_edge_frac"
+        time_cohorts, "target_notional", "predicted_selected_edge_frac"
     )
-    notional_realized, _ = weighted_cohort_means("target_notional", "realized_selected_edge_frac")
+    notional_realized, _ = weighted_cohort_means(
+        time_cohorts, "target_notional", "realized_selected_edge_frac"
+    )
     risk_predicted, risk_observations = weighted_cohort_means(
-        "origin_standalone_vol_usd", "predicted_selected_edge_frac"
+        time_cohorts, "origin_standalone_vol_usd", "predicted_selected_edge_frac"
     )
     risk_realized, _ = weighted_cohort_means(
-        "origin_standalone_vol_usd", "realized_selected_edge_frac"
+        time_cohorts, "origin_standalone_vol_usd", "realized_selected_edge_frac"
     )
+
+    def cost_net_cohort_membership_is_exact(cohort: dict) -> bool:
+        return _cost_net_rows_have_exact_membership(
+            cohort["rows"], require_learning=True
+        )
+
+    # Cost-net evidence is all-or-nothing at the same market-time cohort boundary used by gross
+    # calibration. Graduation is deliberately *recent*: take the consecutive complete streak
+    # ending at the newest cohort, then at most its latest twelve. An incomplete newest cohort
+    # therefore invalidates the current sample instead of allowing older complete decisions to be
+    # cherry-picked from the 30-cohort audit window.
+    cost_net_complete_cohorts = [
+        cohort
+        for cohort in time_cohorts
+        if cost_net_cohort_membership_is_exact(cohort)
+    ]
+    cost_net_complete_cohort_n_total = len(cost_net_complete_cohorts)
+    streak_candidates = [
+        cohort
+        for cohort in time_cohorts
+        if latest_invalid_cost_net_event_ts is None
+        or cohort["evaluated_at"] > latest_invalid_cost_net_event_ts
+    ]
+    cost_net_trailing_complete_cohorts: list[dict] = []
+    for cohort in reversed(streak_candidates):
+        if not cost_net_cohort_membership_is_exact(cohort):
+            break
+        cost_net_trailing_complete_cohorts.append(cohort)
+    cost_net_trailing_complete_cohorts.reverse()
+    cost_net_trailing_complete_cohort_n = len(cost_net_trailing_complete_cohorts)
+    newest_complete_cohort = (
+        cost_net_trailing_complete_cohorts[-1]
+        if cost_net_trailing_complete_cohorts
+        else None
+    )
+    age_gate_applied = as_of is not None and horizon_hours is not None
+    max_age_hours = max(72.0, 2.0 * float(horizon_hours)) if horizon_hours is not None else None
+    newest_complete_age_hours = (
+        max(0.0, (as_of - newest_complete_cohort["evaluated_at"]).total_seconds() / 3600.0)
+        if as_of is not None and newest_complete_cohort is not None
+        else None
+    )
+    cost_net_age_stale = bool(
+        age_gate_applied
+        and newest_complete_age_hours is not None
+        and max_age_hours is not None
+        and newest_complete_age_hours > max_age_hours
+    )
+    cost_net_recency_blocked = bool(
+        newer_incomplete_cost_net_forecast_n
+        or mature_pending_cost_net_forecast_n
+        or cost_net_age_stale
+    )
+    cost_net_cohorts = (
+        []
+        if cost_net_recency_blocked
+        else cost_net_trailing_complete_cohorts[-_MIN_FORECAST_HORIZON_OBSERVATIONS:]
+    )
+    cost_net_cohort_n = len(cost_net_cohorts)
+    cost_net_sample = [row for cohort in cost_net_cohorts for row in cohort["rows"]]
+    cost_net_leg_n = len(cost_net_sample)
+    cost_net_cohort_means = [
+        sum(float(row["realized_round_trip_cost_net_price_edge_frac"]) for row in cohort["rows"])
+        / len(cohort["rows"])
+        for cohort in cost_net_cohorts
+    ]
+    cost_net_notional_realized, cost_net_notional_observations = weighted_cohort_means(
+        cost_net_cohorts,
+        "target_notional",
+        "realized_round_trip_cost_net_price_edge_frac",
+    )
+    cost_net_risk_realized, cost_net_risk_observations = weighted_cohort_means(
+        cost_net_cohorts,
+        "origin_standalone_vol_usd",
+        "realized_round_trip_cost_net_price_edge_frac",
+    )
+    cost_net_enough_history = cost_net_cohort_n >= _MIN_FORECAST_HORIZON_OBSERVATIONS
+    newest_cost_net_cohort_complete = bool(
+        time_cohorts and cost_net_cohort_membership_is_exact(time_cohorts[-1])
+    )
+    cost_net_notional_complete = (
+        cost_net_leg_n > 0 and cost_net_notional_observations == cost_net_leg_n
+    )
+    cost_net_risk_complete = cost_net_leg_n > 0 and cost_net_risk_observations == cost_net_leg_n
     enough_history = cohort_n >= _MIN_FORECAST_HORIZON_OBSERVATIONS
     notional_complete = leg_n > 0 and notional_observations == leg_n
     risk_complete = leg_n > 0 and risk_observations == leg_n
@@ -983,16 +1162,113 @@ def _forecast_metric_summary(time_cohorts: list[dict]) -> dict:
         "residual_risk_weighted_realized_selected_edge_frac": (
             mean(risk_realized) if risk_complete else None
         ),
+        "cost_net_independent_time_cohort_n": cost_net_cohort_n,
+        "cost_net_complete_time_cohort_n_total": cost_net_complete_cohort_n_total,
+        "cost_net_trailing_complete_time_cohort_n": cost_net_trailing_complete_cohort_n,
+        "cost_net_window_time_cohort_n": cost_net_cohort_n,
+        "cost_net_window_max_time_cohorts": _MIN_FORECAST_HORIZON_OBSERVATIONS,
+        "cost_net_newest_time_cohort_complete": newest_cost_net_cohort_complete,
+        "cost_net_latest_invalid_event_ts": (
+            latest_invalid_cost_net_event_ts.isoformat()
+            if latest_invalid_cost_net_event_ts is not None
+            else None
+        ),
+        "cost_net_age_gate_applied": age_gate_applied,
+        "cost_net_newest_complete_cohort_evaluated_at": (
+            newest_complete_cohort["evaluated_at"].isoformat()
+            if newest_complete_cohort is not None
+            else None
+        ),
+        "cost_net_newest_complete_cohort_age_hours": newest_complete_age_hours,
+        "cost_net_max_cohort_age_hours": max_age_hours,
+        "cost_net_age_status": (
+            "stale"
+            if cost_net_age_stale
+            else "current"
+            if newest_complete_cohort is not None
+            else "unavailable"
+            if age_gate_applied
+            else "not_evaluated"
+        ),
+        "cost_net_newer_incomplete_forecast_n": newer_incomplete_cost_net_forecast_n,
+        "cost_net_mature_pending_forecast_n": mature_pending_cost_net_forecast_n,
+        "cost_net_recency_blocked": cost_net_recency_blocked,
+        "cost_net_leg_n": cost_net_leg_n,
+        "cost_net_coverage_frac": (
+            cost_net_complete_cohort_n_total / cohort_n if cohort_n else None
+        ),
+        "cost_net_minimum_independent_time_cohorts": _MIN_FORECAST_HORIZON_OBSERVATIONS,
+        "cost_net_calibration_status": (
+            "usable"
+            if cost_net_enough_history
+            else "newer_matching_horizon_forecast_incomplete"
+            if newer_incomplete_cost_net_forecast_n or mature_pending_cost_net_forecast_n
+            else "stale_latest_complete_time_cohort"
+            if cost_net_age_stale
+            else "newest_time_cohort_incomplete"
+            if time_cohorts and not newest_cost_net_cohort_complete
+            else "insufficient_independent_time_cohorts"
+        ),
+        "mean_realized_round_trip_cost_net_price_edge_frac": mean(cost_net_cohort_means),
+        "cost_net_notional_weighted_observations": cost_net_notional_observations,
+        "cost_net_notional_weighted_time_cohort_observations": len(cost_net_notional_realized),
+        "cost_net_notional_weight_coverage_frac": (
+            cost_net_notional_observations / cost_net_leg_n if cost_net_leg_n else None
+        ),
+        "cost_net_notional_weighted_status": (
+            "usable"
+            if cost_net_enough_history and cost_net_notional_complete
+            else "newer_matching_horizon_forecast_incomplete"
+            if newer_incomplete_cost_net_forecast_n or mature_pending_cost_net_forecast_n
+            else "stale_latest_complete_time_cohort"
+            if cost_net_age_stale
+            else "newest_time_cohort_incomplete"
+            if time_cohorts and not newest_cost_net_cohort_complete
+            else "insufficient_independent_time_cohorts"
+            if not cost_net_enough_history
+            else "incomplete_coverage"
+        ),
+        "notional_weighted_realized_round_trip_cost_net_price_edge_frac": (
+            mean(cost_net_notional_realized) if cost_net_notional_complete else None
+        ),
+        "cost_net_residual_risk_weighted_observations": cost_net_risk_observations,
+        "cost_net_residual_risk_weighted_time_cohort_observations": len(cost_net_risk_realized),
+        "cost_net_residual_risk_weight_coverage_frac": (
+            cost_net_risk_observations / cost_net_leg_n if cost_net_leg_n else None
+        ),
+        "cost_net_residual_risk_weighted_status": (
+            "usable"
+            if cost_net_enough_history and cost_net_risk_complete
+            else "newer_matching_horizon_forecast_incomplete"
+            if newer_incomplete_cost_net_forecast_n or mature_pending_cost_net_forecast_n
+            else "stale_latest_complete_time_cohort"
+            if cost_net_age_stale
+            else "newest_time_cohort_incomplete"
+            if time_cohorts and not newest_cost_net_cohort_complete
+            else "insufficient_independent_time_cohorts"
+            if not cost_net_enough_history
+            else "incomplete_coverage"
+        ),
+        "residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac": (
+            mean(cost_net_risk_realized) if cost_net_risk_complete else None
+        ),
         "time_cohorts": [_forecast_cohort_audit(cohort) for cohort in time_cohorts],
     }
 
 
-def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
+def _forecast_performance(
+    rows: list[dict],
+    *,
+    limit: int = 30,
+    pending_forecasts: list[dict] | None = None,
+    as_of: datetime | None = None,
+) -> dict:
     audit_recent = rows[-limit:]
     current_policy_rows = [
         row
         for row in rows
-        if int(row.get("forecast_score_schema_version", 1)) >= FORECAST_SCORE_SCHEMA_VERSION
+        if int(row.get("forecast_score_schema_version", 1))
+        >= FORECAST_CALIBRATION_MIN_SCHEMA_VERSION
     ]
     decision_eligible_all = [
         row
@@ -1014,6 +1290,9 @@ def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
     aggregate["calibration_status"] = "context_only_cross_horizon"
     aggregate["notional_weighted_status"] = "context_only_cross_horizon"
     aggregate["risk_capacity_status"] = "context_only_cross_horizon"
+    aggregate["cost_net_calibration_status"] = "context_only_cross_horizon"
+    aggregate["cost_net_notional_weighted_status"] = "context_only_cross_horizon"
+    aggregate["cost_net_residual_risk_weighted_status"] = "context_only_cross_horizon"
     by_horizon = {}
     temporal_overlap_keys: set[tuple[int, str]] = set()
     temporal_overlap_cohort_n = 0
@@ -1023,8 +1302,125 @@ def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
             for row in leg_nonoverlap_all
             if float(row.get("forecast_horizon_hours") or 0.0) == float(horizon)
         ]
-        horizon_cohorts, horizon_overlaps = _forecast_time_cohorts(horizon_legs)
-        horizon_cohorts = horizon_cohorts[-limit:]
+        all_horizon_cohorts, horizon_overlaps = _forecast_time_cohorts(horizon_legs)
+        included_keys = {
+            (int(row["origin_cycle"]), str(row["symbol"]))
+            for cohort in all_horizon_cohorts
+            for row in cohort["rows"]
+        }
+        horizon_cohorts = all_horizon_cohorts[-limit:]
+        newest_selected_end = (
+            horizon_cohorts[-1]["evaluated_at"] if horizon_cohorts else None
+        )
+        excluded_rows = [
+            row
+            for row in rows
+            if int(row.get("forecast_score_schema_version", 1))
+            >= FORECAST_COST_NET_MIN_SCHEMA_VERSION
+            and float(row.get("forecast_horizon_hours") or 0.0) == float(horizon)
+            and (int(row["origin_cycle"]), str(row["symbol"])) not in included_keys
+        ]
+        excluded_groups: dict[tuple[int, int], list[dict]] = {}
+        for row in excluded_rows:
+            key = (int(row["origin_cycle"]), int(row["forecast_horizon_hours"]))
+            excluded_groups.setdefault(key, []).append(row)
+        scheduler_overlap_keys = {
+            (int(row["origin_cycle"]), str(row["symbol"]))
+            for cohort in horizon_overlaps
+            for row in cohort["rows"]
+        }
+        overlap_only_reasons = frozenset({
+            "overlapping_unchanged_thesis",
+            "nonindependent_overlapping_calibration_cohort",
+        })
+
+        def explicit_overlap_only(
+            row: dict, *, allowed_reasons: frozenset[str] = overlap_only_reasons
+        ) -> bool:
+            reasons = row.get("cost_net_learning_exclusion_reasons")
+            if not isinstance(reasons, list):
+                reasons = row.get("learning_exclusion_reasons")
+            return bool(
+                isinstance(reasons, list)
+                and reasons
+                and all(reason in allowed_reasons for reason in reasons)
+                and (
+                    row.get("leg_nonoverlap_eligible") is False
+                    or row.get("decision_learning_eligible") is False
+                )
+            )
+
+        overlap_audit_only_groups: list[list[dict]] = []
+        invalid_excluded_groups: list[tuple[datetime, list[dict]]] = []
+        for group_rows in excluded_groups.values():
+            fully_priced_exact = _cost_net_rows_have_exact_membership(
+                group_rows, require_learning=False
+            )
+            on_schedule = all(
+                row.get("horizon_label_eligible") is True for row in group_rows
+            )
+            explicitly_overlapping = all(
+                (int(row["origin_cycle"]), str(row["symbol"]))
+                in scheduler_overlap_keys
+                or explicit_overlap_only(row)
+                for row in group_rows
+            )
+            if fully_priced_exact and on_schedule and explicitly_overlapping:
+                overlap_audit_only_groups.append(group_rows)
+            else:
+                # Count observed rows, while cohort counts below make the grouped semantics clear.
+                # Exact expected membership is checked before exemption, so a partial overlap
+                # cannot present its surviving rows as a complete audit-only cohort.
+                invalid_excluded_groups.append(
+                    (
+                        max(_as_utc(str(row["evaluated_at"])) for row in group_rows),
+                        group_rows,
+                    )
+                )
+        latest_invalid_excluded_event_ts = max(
+            (event_ts for event_ts, _group in invalid_excluded_groups),
+            default=None,
+        )
+        currently_blocking_invalid_groups = [
+            group_rows
+            for event_ts, group_rows in invalid_excluded_groups
+            if newest_selected_end is None
+            or event_ts >= newest_selected_end - SCHEDULED_MARK_TOLERANCE
+        ]
+        newer_incomplete_rows = [
+            row for group in currently_blocking_invalid_groups for row in group
+        ]
+        tolerance_hours = SCHEDULED_MARK_TOLERANCE.total_seconds() / 3600.0
+        all_mature_pending_rows = [
+            row
+            for row in (pending_forecasts or [])
+            if float(row.get("edge_horizon_hours") or 0.0) == float(horizon)
+            and float(row.get("hours_past_maturity") or 0.0) > tolerance_hours
+        ]
+        mature_pending_rows = [
+            row
+            for row in all_mature_pending_rows
+            if (
+                newest_selected_end is None
+                or _as_utc(str(row["maturity_ts"]))
+                >= newest_selected_end - SCHEDULED_MARK_TOLERANCE
+            )
+        ]
+        latest_mature_pending_event_ts = max(
+            (_as_utc(str(row["maturity_ts"])) for row in all_mature_pending_rows),
+            default=None,
+        )
+        latest_invalid_event_ts = max(
+            (
+                event_ts
+                for event_ts in (
+                    latest_invalid_excluded_event_ts,
+                    latest_mature_pending_event_ts,
+                )
+                if event_ts is not None
+            ),
+            default=None,
+        )
         temporal_overlap_cohort_n += len(horizon_overlaps)
         for cohort in horizon_overlaps:
             temporal_overlap_keys.update(
@@ -1032,7 +1428,34 @@ def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
             )
         by_horizon[str(horizon)] = {
             "horizon_hours": horizon,
-            **_forecast_metric_summary(horizon_cohorts),
+            **_forecast_metric_summary(
+                horizon_cohorts,
+                newer_incomplete_cost_net_forecast_n=len(newer_incomplete_rows),
+                mature_pending_cost_net_forecast_n=len(mature_pending_rows),
+                latest_invalid_cost_net_event_ts=latest_invalid_event_ts,
+                as_of=as_of,
+                horizon_hours=horizon,
+            ),
+            "cost_net_complete_overlap_cohort_n_audit_only_in_history": len(
+                overlap_audit_only_groups
+            ),
+            "cost_net_complete_overlap_forecast_n_audit_only_in_history": sum(
+                len(group) for group in overlap_audit_only_groups
+            ),
+            "cost_net_newer_incomplete_cohort_n": (
+                len(currently_blocking_invalid_groups)
+            ),
+            "cost_net_invalid_excluded_cohort_n_in_audit_history": len(
+                invalid_excluded_groups
+            ),
+            "cost_net_latest_invalid_excluded_event_ts": (
+                latest_invalid_excluded_event_ts.isoformat()
+                if latest_invalid_excluded_event_ts is not None
+                else None
+            ),
+            "cost_net_mature_pending_forecast_n_in_audit_history": len(
+                all_mature_pending_rows
+            ),
             "overlapping_time_cohort_n_audit_only": len(horizon_overlaps),
             "overlapping_time_cohort_leg_n_audit_only": sum(
                 len(cohort["rows"]) for cohort in horizon_overlaps
@@ -1058,11 +1481,13 @@ def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
             for row in overlapping_decisions
         ),
         "legacy_policy_forecasts_audit_only": sum(
-            int(row.get("forecast_score_schema_version", 1)) < FORECAST_SCORE_SCHEMA_VERSION
+            int(row.get("forecast_score_schema_version", 1))
+            < FORECAST_CALIBRATION_MIN_SCHEMA_VERSION
             for row in rows
         ),
         "off_horizon_forecasts_audit_only": sum(
-            int(row.get("forecast_score_schema_version", 1)) >= FORECAST_SCORE_SCHEMA_VERSION
+            int(row.get("forecast_score_schema_version", 1))
+            >= FORECAST_CALIBRATION_MIN_SCHEMA_VERSION
             and row.get("horizon_label_eligible") is False
             for row in rows
         ),
@@ -1076,9 +1501,21 @@ def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
         ),
         "calibration_sample_note": (
             "BookLeg calibration must use its exact by_horizon_hours bucket. Every bucket uses "
-            "only schema-v4, horizon-eligible, same-symbol non-overlapping legs, clusters all legs "
-            "sharing a time/outcome window, and gates usability on non-overlapping temporal "
-            "cohorts rather than leg_n. Overlapping leg renewals and time cohorts are audit-only. "
+            "only schema-v4+, horizon-eligible, same-symbol non-overlapping legs, clusters all "
+            "legs sharing a time/outcome window, and gates usability on non-overlapping temporal "
+            "cohorts rather than leg_n. An exact, on-schedule, fully priced schema-v5 cohort "
+            "excluded solely for declared leg/time overlap stays audit-only: it neither enters n "
+            "nor blocks recency. Partial membership cannot claim that exemption. "
+            "Cost-net calibration additionally requires exact observed equality with the "
+            "Book-derived same-origin/same-horizon schema-v5 membership (canonical symbols, "
+            "count, and hash), with every member learning-eligible and priced for round-trip "
+            "friction. Its primary sample is the latest twelve consecutive complete cohorts "
+            "ending at the newest outcome (or the available shorter trailing streak); a newest "
+            "incomplete cohort, excluded/off-schedule outcome, or forecast still waiting for a "
+            "mark beyond the five-minute scheduled-mark tolerance resets that streak. Any such "
+            "event newer than the newest complete cohort makes current calibration unusable. The "
+            "newest complete cohort must also be no older than max(72 hours, twice the bucket "
+            "horizon) at snapshot time. "
             "aggregate_context_only pools incompatible horizons and is never calibration or "
             "risk-capacity evidence."
         ),
@@ -1094,7 +1531,8 @@ def _forecast_performance(rows: list[dict], *, limit: int = 30) -> dict:
         "audit_only_outcomes": [
             row
             for row in audit_recent
-            if int(row.get("forecast_score_schema_version", 1)) < FORECAST_SCORE_SCHEMA_VERSION
+            if int(row.get("forecast_score_schema_version", 1))
+            < FORECAST_CALIBRATION_MIN_SCHEMA_VERSION
             or row.get("learning_eligible") is not True
             or row.get("leg_nonoverlap_eligible") is not True
             or (int(row["origin_cycle"]), str(row["symbol"])) in temporal_overlap_keys
@@ -1139,6 +1577,7 @@ def _pending_forecast_inventory(state: Path, scored_rows: list[dict], *, now: da
                 if (
                     not required.issubset(leg)
                     or leg.get("seat_role") != "alpha"
+                    or symbol == "BTC/USDT:USDT"
                     or (cycle, symbol) in seen
                 ):
                     continue
@@ -1147,13 +1586,19 @@ def _pending_forecast_inventory(state: Path, scored_rows: list[dict], *, now: da
                     {
                         "origin_cycle": cycle,
                         "symbol": symbol,
+                        "origin_ts": origin_ts.isoformat(),
+                        "edge_horizon_hours": int(leg["edge_horizon_hours"]),
                         "maturity_ts": maturity.isoformat(),
                         "hours_past_maturity": max(0.0, (now - maturity).total_seconds() / 3600.0),
                     }
                 )
     return {
         "pending_forecasts": len(pending),
-        "mature_waiting_for_mark": sum(row["hours_past_maturity"] > 0.0 for row in pending),
+        "mature_waiting_for_mark": sum(
+            row["hours_past_maturity"]
+            > SCHEDULED_MARK_TOLERANCE.total_seconds() / 3600.0
+            for row in pending
+        ),
         "oldest_pending_hours_past_maturity": max(
             (row["hours_past_maturity"] for row in pending), default=0.0
         ),
@@ -2395,9 +2840,16 @@ def build_performance_snapshot(
     agent_performance = _agent_performance(
         [record.model_dump(mode="json") for record in parsed_score_records]
     )
+    pending_forecast_inventory = _pending_forecast_inventory(
+        state, forecast_rows, now=now
+    )
     forecast_performance = {
-        **_forecast_performance(forecast_rows),
-        **_pending_forecast_inventory(state, forecast_rows, now=now),
+        **_forecast_performance(
+            forecast_rows,
+            pending_forecasts=pending_forecast_inventory["pending"],
+            as_of=now,
+        ),
+        **pending_forecast_inventory,
     }
     drawdown_frac = (equity / peak_equity - 1.0) if peak_equity > 0.0 else 0.0
     pm_performance = agent_performance["roles"]["pm"]

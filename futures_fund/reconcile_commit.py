@@ -1,9 +1,10 @@
 """Durable, replayable commit protocol for one PAPER reconcile.
 
 No collection of ordinary files can be renamed atomically as a group.  The desk therefore writes
-one durable intent containing the complete post-reconcile state, replays every write idempotently,
-and publishes ``complete.json`` last.  Heartbeats and new cycles recover an unfinished intent before
-touching the account, so a crash cannot strand fills/funding outside their audit chain.
+one durable intent containing the complete post-reconcile state and explicit one-shot-directive
+expectation, replays every write idempotently, and publishes ``complete.json`` last. Heartbeats and
+new cycles recover an unfinished intent before touching the account, so a crash cannot strand
+fills/funding outside their audit chain or publish around a concurrently claimed instruction.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ TRANSACTION_FILE = "reconcile-transaction.json"
 HEARTBEAT_TRANSACTION_FILE = "heartbeat-transaction.json"
 COMPLETE_ARTIFACT = "complete"
 PROTOCOL_VERSION = 1
+RECONCILE_TRANSACTION_VERSION = 2
+SUPPORTED_RECONCILE_TRANSACTION_VERSIONS = {1, RECONCILE_TRANSACTION_VERSION}
 MANIFEST_VERSION = 4
 SUPPORTED_MANIFEST_VERSIONS = {1, 2, 3, MANIFEST_VERSION}
 GENERATION_ROOT_SCHEMA_VERSION = 1
@@ -507,6 +510,54 @@ def finalize_manifest_migration(state_dir, *, cadence: str = "rebal") -> None:
     _atomic_json(_protocol_path(state_dir), raw)
 
 
+def _validate_reconcile_directive_binding(
+    state_dir,
+    *,
+    cycle: int,
+    artifacts: object,
+    expectation: object,
+    allow_consumed: bool = False,
+) -> dict:
+    """Couple WAL state, explicit claim presence, and its exact schema-v2 artifact."""
+
+    from futures_fund.directives import (
+        DIRECTIVE_RECEIPT_ARTIFACT,
+        validate_directive_commit_expectation,
+        validate_directive_receipt,
+    )
+
+    if not isinstance(artifacts, dict):
+        raise ValueError("reconcile transaction artifacts must be an object")
+    expected = validate_directive_commit_expectation(
+        state_dir,
+        expectation,
+        allow_consumed=allow_consumed,
+    )
+    if expected["cycle"] != cycle:
+        raise ValueError("directive expectation cycle does not match reconcile cycle")
+    receipt_present = DIRECTIVE_RECEIPT_ARTIFACT in artifacts
+    if expected["present"] is not receipt_present:
+        raise ValueError("directive expectation/receipt presence mismatch")
+    if not receipt_present:
+        return expected
+    receipt = validate_directive_receipt(
+        artifacts[DIRECTIVE_RECEIPT_ARTIFACT],
+        expected_cycle=cycle,
+    )
+    bound_fields = (
+        "claim_id",
+        "claim_intent_sha256",
+        "source_relpath",
+        "payload_sha256",
+        "directive_sha256",
+        "capabilities",
+        "capabilities_sha256",
+    )
+    if any(receipt[field] != expected[field] for field in bound_fields):
+        raise ValueError("directive receipt does not match reconcile expectation")
+    return expected
+
+
 def stage_reconcile_transaction(
     state_dir,
     *,
@@ -519,9 +570,25 @@ def stage_reconcile_transaction(
     equity: float,
     ledger: dict,
     runtime_provenance: dict | None = None,
+    directive_expectation: dict | None = None,
 ) -> dict:
     """Durably record the entire intended post-reconcile generation before any state write."""
+    if type(cycle) is not int or cycle < 1:
+        raise ValueError("reconcile cycle must be a positive integer")
     with exclusive_state_transaction_lock(state_dir):
+        from futures_fund.directives import build_directive_commit_expectation
+
+        candidate_expectation = (
+            directive_expectation
+            if directive_expectation is not None
+            else build_directive_commit_expectation(None, cycle=int(cycle))
+        )
+        validated_directive_expectation = _validate_reconcile_directive_binding(
+            state_dir,
+            cycle=int(cycle),
+            artifacts=artifacts,
+            expectation=candidate_expectation,
+        )
         if current_account_sha256(state_dir) != expected_base_account_sha256:
             raise RuntimeError("reconcile staging lost its optimistic account-state lock")
         return _stage_reconcile_transaction_unlocked(
@@ -535,6 +602,7 @@ def stage_reconcile_transaction(
             equity=equity,
             ledger=ledger,
             runtime_provenance=runtime_provenance,
+            directive_expectation=validated_directive_expectation,
         )
 
 
@@ -549,6 +617,7 @@ def _stage_reconcile_transaction_unlocked(
     equity_ts: datetime,
     equity: float,
     ledger: dict,
+    directive_expectation: dict,
     runtime_provenance: dict | None = None,
 ) -> dict:
     path = transaction_path(state_dir)
@@ -596,7 +665,7 @@ def _stage_reconcile_transaction_unlocked(
     )
     durable_artifacts["account_event"] = account_event
     transaction = {
-        "version": PROTOCOL_VERSION,
+        "version": RECONCILE_TRANSACTION_VERSION,
         "paper_only": True,
         "manifest_version": MANIFEST_VERSION,
         "commit_id": commit_id,
@@ -609,6 +678,7 @@ def _stage_reconcile_transaction_unlocked(
         "ledger": ledger,
         "generation_root_sha256": generation_root_sha256,
     }
+    transaction["directive_expectation"] = dict(directive_expectation)
     transaction["intent_sha256"] = _canonical_sha256(transaction)
     _atomic_json(path, transaction)
     return transaction
@@ -630,8 +700,10 @@ def _recover_reconcile_transaction_unlocked(state_dir) -> dict:
             "both reconcile and heartbeat transactions are pending; refusing ambiguous replay"
         )
     transaction = _read_json(path)
+    transaction_version = transaction.get("version")
     if (
-        int(transaction.get("version", 0)) != PROTOCOL_VERSION
+        type(transaction_version) is not int
+        or transaction_version not in SUPPORTED_RECONCILE_TRANSACTION_VERSIONS
         or transaction.get("paper_only") is not True
     ):
         raise ValueError(f"invalid reconcile transaction: {path}")
@@ -653,8 +725,44 @@ def _recover_reconcile_transaction_unlocked(state_dir) -> dict:
         raise ValueError(f"reconcile transaction has invalid manifest version: {path}") from exc
     if manifest_version not in {3, MANIFEST_VERSION}:
         raise ValueError(f"reconcile transaction has unsupported manifest version: {path}")
-    cycle = int(transaction["cycle"])
+    raw_cycle = transaction.get("cycle")
+    if transaction_version >= RECONCILE_TRANSACTION_VERSION and (
+        type(raw_cycle) is not int or raw_cycle < 1
+    ):
+        raise ValueError("current reconcile transaction has invalid cycle")
+    cycle = int(raw_cycle)
     cadence = str(transaction["cadence"])
+    if transaction_version >= RECONCILE_TRANSACTION_VERSION:
+        if "directive_expectation" not in transaction:
+            raise ValueError("current reconcile transaction lacks directive expectation")
+        _validate_reconcile_directive_binding(
+            state_dir,
+            cycle=cycle,
+            artifacts=transaction.get("artifacts"),
+            expectation=transaction["directive_expectation"],
+            allow_consumed=True,
+        )
+    elif "directive_expectation" in transaction:
+        _validate_reconcile_directive_binding(
+            state_dir,
+            cycle=cycle,
+            artifacts=transaction.get("artifacts"),
+            expectation=transaction["directive_expectation"],
+            allow_consumed=True,
+        )
+    else:
+        # A genuine v1 WAL predates claimed-instance directives. It may recover only while that
+        # newer lifecycle is explicitly absent; otherwise legacy replay could publish around a
+        # claim that current code correctly refuses to create while any WAL exists.
+        from futures_fund.directives import build_directive_commit_expectation
+
+        _validate_reconcile_directive_binding(
+            state_dir,
+            cycle=cycle,
+            artifacts=transaction.get("artifacts"),
+            expectation=build_directive_commit_expectation(None, cycle=cycle),
+            allow_consumed=True,
+        )
     commit_id = str(transaction["commit_id"])
     complete_path = cycle_dir(state_dir, cycle, cadence=cadence) / "complete.json"
     pending_event = transaction.get("artifacts", {}).get("account_event")

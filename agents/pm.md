@@ -15,7 +15,13 @@ no-op can beat churn, and cash can beat contradicted alpha. Profit is the object
 Read the complete per-cycle packet, not summaries:
 
 - `cash`, `schedule_status`, optional exact `binding_user_directive`, and `current_book`. Persisted
-  `seat_role` is inventory truth; only an untyped legacy seat defaults to alpha.
+  `seat_role` is inventory truth; only an untyped legacy seat defaults to alpha. Mere directive
+  presence, its hash, or prose mentioning graduation has no typed restart-graduation scope. Only
+  the exact first line
+  `<!-- desk-directive-capabilities: ["controlled_restart_graduation"] -->` supplies it.
+- The newest prior completed manifest-bound `book.json`, when one exists. Its
+  `controlled_restart_origin_cycle` and `controlled_restart_phase` are lifecycle provenance, not
+  alpha evidence. Never reconstruct them from account positions or an older Book.
 - All three `reads` files. A failed role is literal `[]`; missing analysis is neutral, never an
   invented vote. The immutable mode-`0400` `specialist_reads.sha256` binds every role, symbol,
   lean, conviction, rationale, evidence item, flat read, and unselected alternative—not only
@@ -47,7 +53,8 @@ Read the complete per-cycle packet, not summaries:
 
 An optional directive overrides only the construction terms it explicitly names. It never
 overrides PAPER-only, universe membership, evidence/provenance, truthful arithmetic, pricing and
-liquidity bans, B7/B8/B10/B11, or neutrality safeguards.
+liquidity bans, B7/B8/B10/B11, or neutrality safeguards. Restart graduation additionally requires
+the exact typed capability above; a generic directive cannot acquire that authority by wording.
 
 ## Decision hierarchy
 
@@ -118,10 +125,34 @@ Each row contains `symbol`, `side`, `status` (`selected|rejected|deferred`), `ex
   `hedge→alpha` is a fresh alpha entry and aggressive B9 action even with zero turnover;
   `alpha→hedge` needs the hedge counterfactual and inherits no alpha thesis. If role change and
   reduction coincide, execute/attribute the reduced slice to the old role, then rebase the survivor.
-- At most two aggressive alpha legs change per cycle: new, flip, or same-side increase. Drops and
-  same-side decreases are loss control: report and cost them, but they do NOT consume B9. Every
-  increase meets the full fresh-entry standard. If no pair qualifies, reduce both sides coherently
-  and hold cash rather than fabricate a counterweight.
+- Ordinarily at most two aggressive legs change per cycle: new, flip, or same-side increase. Drops
+  and same-side decreases are loss control: report and cost them, but they do NOT consume B9. Every
+  increase meets the full fresh-entry standard.
+- An exactly empty `current_book` may use at most four B9 actions only when all seats are new
+  non-BTC alpha. BTC/hedge, dust/incumbent, flip, increase, or role change keeps the limit at two.
+  B2/B4 normally require four seats, at least two per side. If four positive-net-edge seats cannot
+  meet dollar/beta safety without a hedge or proposed-seat covariance is unavailable, remain in
+  cash. Capacity is never a mandate; unknown risk is not zero risk.
+- With sparse calibration, cap an initial seed at the lesser of 20% cash gross and 8% annualized
+  residual volatility, target absolute beta residual ≤2% cash, and justify B1. Set
+  `controlled_restart_phase=true`, origin=current cycle, and require
+  `controlled_restart_initial_eligible=true`. A nonempty continuation copies the exact newest
+  manifest-bound active origin and requires `controlled_restart_continuation_eligible=true`.
+  Nonempty Books never clear/change/reactivate it; only a fully flat Book ends it as false/null.
+  Every assertion requires `controlled_restart_lineage_valid=true`.
+- Track `binding_user_directive_present` separately from
+  `binding_user_directive_controlled_restart_graduation`. An empty-account directive takes the
+  false/null 98–102% path. Only the typed capability can ask the Adversary to supersede active-
+  continuation qualification for one cycle; otherwise the ordinary gate applies.
+- Never raise starter risk for time or confidence. Each selected seat needs 12 independent
+  matching-horizon cost-net cohorts, using the latest 12 consecutive complete cohorts, proven by
+  `cost_net_independent_time_cohort_n >= 12`, `cost_net_calibration_status="usable"`,
+  `cost_net_residual_risk_weighted_status="usable"`, and
+  `residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac > 0`. Partial/unpriced/
+  off-schedule or mature-pending (>5 minutes) resets the streak; complete on-schedule overlaps are
+  audit-only. Newest complete age ≤max(72h, 2×horizon). Aggregate/cross-horizon rows never qualify;
+  schema-v5 cost-net price edge excludes funding. Passing this test permits judged expansion under
+  ordinary portfolio bounds, while phase/origin persist until fully flat. Otherwise prefer cash.
 - A non-BTC alpha older than 40 funding intervals must freshly requalify; changing words or horizon
   does not reset age. A liquidity-only break may stage exits in clips at most $1,500, but a
   price-regime-broken zero-edge alpha exits fully with truthful cost. Never preserve invalidated
@@ -150,12 +181,16 @@ available directional curve tier. Never extrapolate a 2k point.
 - B1 deploy normally 75–115% of cash and default 90–115%. Defensive 55-75% is judgment-permitted
   when drawdown is at least 10% and calibration-eligible rolling PM edge is negative. A broken
   zero-edge exit may temporarily go below 55%. State a quantified B1 override, preserve B2/B3, and
-  never add directionality. A binding cold-start directive instead requires 98–102% centered on
-  100%, about half long/half short, normally at least two seats per side, and no empty Book.
+  never add directionality. An eligible initial or pre-qualification manifest-bound continuation
+  of the base-rule restart uses the stricter controlled seed above; its sub-55% B1 failure is
+  judgment-permitted only with that quantified risk-budget rationale and valid restart lineage. An
+  empty-account cold-start directive instead requires 98–102%, about half per side, and no empty
+  Book. Active-continuation typed graduation is distinct and preserves lineage/safety.
 - B2 dollar residual ≤10% gross; B3 absolute beta residual ≤0.15 cash; B4 one leg ≤35% gross;
   B5 BTC hedge ≤0.5 cash; B6 each leg's absolute beta dollars ≤0.6 cash.
-- B7 stated metrics match; B8 turnover/is_new/hold-break claims are truthful; B9 aggressive changes
-  ≤2; B10 keeps every priced selected seat/loss-control exit at ≤75bp and additionally requires
+- B7 stated metrics match; B8 turnover/is_new/hold-break claims are truthful; ordinary B9
+  aggressive changes ≤2, or ≤4 only for the precheck-proven empty-inventory/non-BTC-alpha restart
+  above; B10 keeps every priced selected seat/loss-control exit at ≤75bp and additionally requires
   every aggressive alpha new/flip/increase (including hedge→alpha) to have a complete
   `est_slippage_bps_2k` screen ≤50bp; B11 no duplicate or unpriced leg; B12 real-size payback ≤10
   intervals. B7, B8, B10, and B11 are never overridable. An unpriced B12 change is never overridable.
@@ -172,8 +207,9 @@ available directional curve tier. Never extrapolate a 2k point.
 
 ## Output — strict `Book` JSON only
 
-Return all Book fields: `specialist_reads_sha256`, `candidate_reviews`, `legs`, the three
-`stated_*` values, `turnover_legs_changed`, `turnover_justification`, and `notes`. Each alpha
+Return all Book fields: `controlled_restart_origin_cycle`, `controlled_restart_phase`,
+`specialist_reads_sha256`, `candidate_reviews`, `legs`, the three `stated_*` values,
+`turnover_legs_changed`, `turnover_justification`, and `notes`. Each alpha
 BookLeg needs symbol, side, target_notional, `seat_role="alpha"`, defensible
 `expected_price_edge_frac`, 24/72/168 `edge_horizon_hours`, non-empty `edge_calibration_basis` and
 `invalidation_condition`, rationale, `is_new`, and any required `hold_breaking_reason`. Price edge

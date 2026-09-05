@@ -18,12 +18,43 @@ Paths: state `live_state/`, memory `live_memory/`, agent role prompts `agents/*.
 artifacts live in the PER-CYCLE dir `live_memory/pending/<cycle>/` (pointer:
 `live_memory/pending/current.json`) — never write agent outputs anywhere else.
 
-Before Step 0, read `ops/next-cycle-directive.md` when it exists. It is a binding one-shot user
-instruction: pass its full text to the PM and Adversary as `binding_user_directive`. Archive it to
-`live_memory/directives/applied/cycle-<N>.md` only after a successful reconcile satisfying its
-completion condition. EARLY, HALT, or noncompliance leaves it pending.
-Evidence copies the exact text to `pending/<cycle>/binding_user_directive.md` and binds its
-canonical SHA-256 in `meta.json`; reconcile rejects a missing, changed, or invented directive.
+`ops/next-cycle-directive.md` is the sole canonical one-shot user-instruction inbox. Do not read,
+copy, overwrite, or delete that mutable pathname by hand. After the watchdog admits a cycle and
+before market-data network work, evidence atomically moves that concrete regular-file instance to
+state-owned `live_state/directive-claims-v1/` and reads the claim. It passes the full claimed text to
+the PM and Adversary as `binding_user_directive`. EARLY stands down before claiming. HALT or any
+later pre-commit failure leaves the same private claim pending for the same cycle retry.
+Evidence copies the exact UTF-8 bytes to `pending/<cycle>/binding_user_directive.md`. `meta.json`
+binds the claim UUID, durable claim-intent hash, raw-payload and canonical-text hashes, fixed relative
+source identity, and canonical capability list/hash. Precheck and reconcile reject missing,
+partial, changed, invented, or wrong-cycle claim provenance. A new file written to the canonical
+inbox while a claim is active is a distinct queued instruction—even when byte-identical—and is
+never read or removed by the active cycle.
+Only a successful durable reconcile archives the exact claim as manifest-bound schema-v2
+`binding_user_directive.json`. After `complete.json` publishes, finalization renames and removes
+only that UUID-derived state-owned payload and writes its consumption receipt; it never unlinks the
+canonical inbox. Reconcile recovery, outcome attestation, and `desk_recover.py` replay this exact
+claim finalization idempotently. Thus a committed claim cannot silently bind again, while an
+unsuccessful cycle cannot consume it.
+Every new reconcile WAL also binds either explicit claim absence or the exact seven-field claim
+identity and matching schema-v2 receipt. Staging and recovery revalidate that relationship under
+the exclusive state transaction lock. A new claim is refused while the WAL exists and for an
+already completed cycle, closing the verify-to-commit window even for standalone CLIs.
+This crash protocol requires Linux `renameat2(RENAME_NOREPLACE)`. Run the repository and state as
+one trusted local desk account: pre-existing symlinks and cooperating writer races fail closed, but
+a hostile process with concurrent write/rename access to repository or state ancestors is outside
+the security boundary because it can already rewrite code, prompts, and paper-account artifacts.
+Directive presence or prose never creates machine-readable restart-graduation authority. That
+single capability requires this exact first line:
+
+```text
+<!-- desk-directive-capabilities: ["controlled_restart_graduation"] -->
+```
+
+The JSON list must be unique, sorted, and contain only known capabilities. Evidence parses it
+before network work and hash-binds the canonical list separately from the full directive; a
+malformed/unknown reserved header HALTs before agents. No header means an empty capability list:
+the directive remains a binding user instruction, but cannot supersede restart qualification.
 
 ## Step 0c — Mandatory candle-proxy freshness (deterministic, fail-closed)
 
@@ -80,8 +111,12 @@ uv run python scripts/desk_recover.py --state-dir live_state
 ```
 
 Run this after managed-region provenance and before the watchdog. It replays any complete durable
-PAPER reconcile intent idempotently and publishes that cycle's `complete.json` last. A recovery
-failure HALTS. Heartbeats run the same recovery before touching the account.
+PAPER reconcile intent idempotently and publishes that cycle's `complete.json` last, then recovers
+the directive lifecycle: a prepared same-cycle claim is materialized/reused, while a completed
+manifest-bound claim is finalized by UUID. It validates historical schema-v2 receipts against their
+state-owned consumption acknowledgements, but never derives cleanup authority from legacy receipt
+paths and never removes the canonical inbox. A recovery failure HALTS. Heartbeats run reconcile
+recovery before touching the account.
 The completion marker contains hashes for every reconcile artifact plus the exact ledger and
 equity rows, the committed account snapshot, and runtime provenance. New generations additionally
 commit that exact artifact membership and those hashes into a recomputable generation root carried
@@ -132,6 +167,18 @@ uv run python scripts/reflector_apply.py --memory-dir live_memory \
 
 Any failure HALTS before opening a cycle. This prevents calibration notes copied from a predecessor
 desk—or a stale historically journaled prompt rollback—from silently steering the live agents.
+The full launcher owns `logs/desk-cycle.lock` before this command, so `--check-existing` first
+recovers any durable Reflector apply transaction and consumed-but-unhandled cooldown receipt, then
+performs the audit. The unlocked host health probe instead uses the strictly read-only mode:
+
+```bash
+uv run python scripts/reflector_apply.py --memory-dir live_memory \
+  --agents-dir agents --probe-existing
+```
+
+That mode never recovers or writes. It fails and reports any pending apply transaction or
+consumed-but-unhandled receipt for the next lock-owning full preflight; it cannot race an active
+cycle by rolling prompt state backward or forward.
 For a pre-v1 desk only, an operator may establish the trust anchor once, outside a cycle and only
 after reviewing the current prompts and journal:
 
@@ -175,6 +222,9 @@ and `pending_dir` — every subsequent step reads/writes THAT directory.
 `meta.json` includes the deterministic `watchdog_receipt` and its SHA-256; reconcile reproduces it
 from the completed state history and refuses a changed receipt, non-next cycle, or forbidden
 cadence status before any PAPER mutation.
+After reproducing the non-EARLY watchdog status and before its first market request, evidence claims
+or reuses the exact state-owned directive instance described above. Agents read only the resulting
+pending artifact, never the mutable canonical inbox.
 
 Every 1h/1d OHLCV range is requested from `~/binance-proxy` with explicit `startTime`: immutable
 closed candles use its disk cache and only the currently-forming tail is refreshed. Evidence HALTS
@@ -209,8 +259,14 @@ up rather than lost to survivorship bias. It immutably records the first valid o
 `live_memory/scorecard.jsonl`; a retry cannot relabel the decision at a later horizon. A late
 outage/catch-up outcome remains immutable audit evidence but is excluded from role/PM calibration.
 It writes immutable per-leg alpha forecast outcomes to `live_memory/forecast-scorecard.jsonl` at
-the scheduled declared horizon (`24`, `72`, or `168` hours only) with the same tolerance while retaining actual elapsed time and
-mark provenance. Legacy/off-horizon rows remain auditable but cannot train the desk. Unchanged
+the scheduled declared horizon (`24`, `72`, or `168` hours only) with the same tolerance while
+retaining actual elapsed time and mark provenance. Schema v5 also binds the origin precheck/risk
+model and prices a standardized full-target round trip on both directional sides of the origin L2:
+taker fees, displayed-depth haircut, adverse selection, and a fixed book-breadth legging reserve
+are included; funding is excluded. Missing policy, either side, full visible fill, or finite curve
+cost makes the cost-net label unavailable rather than zero. Immutable v4 rows remain valid gross
+forecast calibration but can never satisfy a cost-net expansion gate. Legacy/off-horizon rows
+remain auditable but cannot train the desk. Unchanged
 overlapping seat renewals do not inflate the effective sample; explicit material thesis changes
 are identified separately, but every overlapping outcome remains audit-only and cannot enter the
 headline calibration/risk-capacity sample. It
@@ -238,7 +294,23 @@ A damaged, unbound, stale, or unmatched newest generation is explicitly unavaila
 never falls back to an older thesis. The agents must then use fresh-entry-quality current evidence
 rather than silently reconstructing continuation provenance.
 It reports selected-side profitability separately from directional forecast accuracy, effective
-non-overlapping sample counts, off-horizon exclusions, alpha gross separately from hedge gross,
+non-overlapping sample counts, off-horizon exclusions, and exact-horizon complete-cohort cost-net
+coverage. A cost-net cohort is usable only when every selected leg has a schema-v5 full-round-trip
+label; one unpriced leg excludes the whole cohort, and 24h/72h/168h observations never pool for
+calibration. The canonical starter-risk expansion evidence is
+`cost_net_independent_time_cohort_n >= 12`, `cost_net_calibration_status="usable"`,
+`cost_net_residual_risk_weighted_status="usable"`, and positive
+`residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac` in the BookLeg's exact
+horizon bucket. Primary cost-net values use only the latest 12 consecutive complete cohorts (or
+the shorter trailing streak); total-complete, trailing-complete, and primary-window counts are
+reported separately. Partial, unpriced, or off-schedule matching-horizon cohorts and forecasts
+unmarked beyond the five-minute scheduled-mark tolerance reset the consecutive streak and block
+while newer than the newest complete cohort, so a later result cannot reconnect to old wins across
+a gap. An exact, on-schedule, fully priced cohort excluded only for temporal overlap remains
+audit-only and neither enters effective n nor blocks recency. At snapshot time, the newest complete
+cohort must be no older than max(72 hours, twice its horizon). These are desk-process calibration
+facts by horizon, not per-symbol performance histories.
+It also reports alpha gross separately from hedge gross,
 alpha beta before the hedge, hedge efficiency, same-side positive-correlation clusters,
 signed-position co-risk clusters, and descriptive
 drawdown/rolling-edge risk-capacity context. These are measurements for GPT judgment, not code
@@ -267,6 +339,23 @@ journal; replacing both pending recurrence files cannot manufacture authorizatio
 retains the canonical recurrence packet: an incomplete-cycle retry restores it when unconsumed,
 or publishes empty recurrences when a head event/consumption receipt proves cycle N already used
 that authority. Never delete an authority receipt to unbrick a retry.
+Outcome-based calibration uses only mature immutable score rows, but the state-only
+`pm_gate_inactive` liveness window ends at the newest completed prior cycle even when its outcome
+is not mature. Its cooldown uses the pending decision/source cycle, never the older score-origin
+identifier. The prose adapter for Books predating structured `candidate_reviews` is code-limited
+to immutable cycles 51–53; every later Book needs structured gate-causal rows. If multiple
+recurrences implicate one role, the Reflector must issue one consolidated full-region edit;
+duplicate role edits invalidate the whole proposal before any prompt, journal, head, or anchor
+mutation. The sole unscored-cycle citation exception is an `edits[].evidence` string copied exactly
+from a same-role, sealed `pm_gate_inactive` recurrence row. It never applies to `region_text`,
+`reason`, or `retire_if`, to a paraphrase, to another role/kind, or to any claimed performance
+outcome. A malformed proposed edit leaves the authority unconsumed and the recurrence retryable;
+only an authenticated explicit no-edit decision or a fully applied proposal starts cooldown.
+If a proposal does not edit every surfaced role, its bound `no_action_reason` must explain the
+omission; otherwise the whole proposal is rejected before mutation and no recurrence is consumed.
+On an incomplete-cycle retry, a durable head event or consumption receipt reconstructs the handled
+marker from the authority's retained canonical packet before publishing an empty stand-down. This
+makes cooldown crash-consistent and never moves a newer handled-cycle clock backwards.
 
 Immediately after this fail-soft step, rerun the fail-closed Step 0a `--check-existing` command.
 HALT before specialists if it fails. This closes the mutation window between the initial preflight
@@ -349,7 +438,8 @@ this point.
 Spawn one GPT PM subagent (`agents/pm.md`), inheriting the root model and effort. Prompt = role text
 + the per-cycle paths
 (`meta.json` for `cash`, the three `*_reads.json`, `evidence.json`,
-`risk_model.json`, `performance_snapshot.json`, `specialist_reads.sha256` and its exact value), the current held book
+`risk_model.json`, `performance_snapshot.json`, `specialist_reads.sha256` and its exact value), the
+current held book and the newest prior completed manifest-bound `book.json` (when one exists),
 (symbol/side/seat_role/notional at fresh marks), `schedule_status` from Step 0, and the exact pending
 `binding_user_directive` when present. It writes the
 strict-JSON `Book` to `pending/<cycle>/pm_book.json`. Validate the file parses as a `Book`.
@@ -388,7 +478,61 @@ and bounds B1-B12) into `pending/<cycle>/precheck.json`. Risk fields are data on
 deterministic B13. B8 records
 the count, `is_new`, and hold-breaking claims truthfully; every resize above one cent counts. B9
 caps only aggressive changes (new entries, flips, and same-side increases); drops and decreases
-stay fully costed but cannot trap invalidated risk. B10 keeps every priced selected seat and
+stay fully costed but cannot trap invalidated risk. Its ordinary limit is two. From an exactly
+empty trusted `current_book`, the base limit becomes four only when every proposed seat is a new
+non-BTC alpha; a BTC/hedge seat, dust/incumbent, flip, increase, or role change leaves the limit at
+two. `cold_start_reentry_eligible` and `b9_aggressive_change_limit` expose this state-derived fact
+in the hashed precheck and the Adversary's exact echo. Eligibility additionally requires a complete
+proposed-symbol residual-risk model; `risk_model_available` is explicitly echoed, and unavailable
+covariance is never represented as zero restart risk. B2/B4 still make a valid non-empty restart a
+four-seat, at-least-two-per-side construction, and B3 must be met without a fifth hedge. This is
+capacity for GPT judgment, never deterministic selection or forced deployment. On the base-rule
+path when no binding cold-start directive is present, the Book explicitly records
+`controlled_restart_phase` and `controlled_restart_origin_cycle`. Initial eligibility requires
+phase true, origin equal to the current cycle, and the cold-start facts above. A nonempty-inventory
+continuation requires the exact active origin from the newest prior manifest-bound Book. The
+precheck loads that newest Book without searching backward on a corrupt generation and publishes
+the prior cycle/hash/origin/phase plus proposed origin/phase and explicit initial, continuation,
+and lineage-validity facts. An active prior Book is accepted as lineage input only when its
+manifest also binds a schema-v7+ precheck whose canonical artifact hash, internal hash, cycle,
+phase/origin, valid-lineage flag, and initial-or-continuation assertion all authenticate. Inactive
+legacy Books remain readable. False/null explicitly ends a phase only with a fully flat proposed
+Book; a nonempty Book preserves the active origin even after judged expansion. An ended origin
+cannot reactivate. An empty account with an active prior may only submit that fully-flat explicit
+end, not replace the origin. A genuinely flat account may start a new origin only with no active
+prior and no binding directive. `binding_user_directive_present` and
+`binding_user_directive_controlled_restart_graduation` are independently derived from cycle meta
+and hash-echoed: an empty-account directive must use false/null lineage and its distinct 98–102%
+path. These hashed facts inform the sole Adversary and add no deterministic trading veto.
+
+For an eligible initial and every pre-qualification valid continuation, PM and Adversary cap the
+Book at the lesser of 20% cash gross and the gross producing 8% annualized residual volatility,
+target absolute beta residual at most 2% cash, and explicitly justify the resulting B1
+under-deployment. Risk does not rise until every selected seat has at least 12 independent
+matching-horizon cost-net time cohorts,
+proven by its schema-v5 bucket fields
+`cost_net_independent_time_cohort_n >= 12`, `cost_net_calibration_status="usable"`,
+`cost_net_residual_risk_weighted_status="usable"`, and
+`residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac > 0`; aggregate and
+cross-horizon rows cannot qualify. Partial/unpriced/off-schedule gaps and forecasts unmarked more
+than five minutes past maturity reset the streak and block while newest; exact fully priced
+temporal overlaps are audit-only. The newest complete cohort must satisfy the max(72 hours, twice
+its horizon) age cap. This schema-v5 round-trip price edge excludes funding.
+Passing permits judged expansion under ordinary portfolio
+bounds, but phase remains true and its exact origin remains fixed until the Book is fully flat.
+For every active Book the Adversary returns `controlled_restart_risk_audit`, echoing the exact
+gross/20%-cash, residual-volatility/8%, beta-residual/2%, and expansion facts plus one exact-horizon
+performance row for every selected alpha. By desk policy the Adversary rejects an initial
+expansion. A continuation beyond any cap requires all selected rows to derive qualified and
+explicit Adversary approval/note unless the exact typed
+`controlled_restart_graduation` capability is present and the Adversary explicitly records
+`directive_graduation_capability_used=true`. A generic directive hash, unrelated prose, or false
+usage never bypasses qualification. The capability applies only during an already-authenticated
+continuation for that cycle; structured audit/approval and exact origin remain required, and the
+base gate resumes without it. Deterministic binding authenticates facts, scope, and the
+Adversary's explicit choice; it does not derive the trading verdict. Inactive Books must not carry
+this audit.
+B10 keeps every priced selected seat and
 loss-control exit at or below 75bp and applies the tighter complete 50bp
 `est_slippage_bps_2k` screen to every aggressive alpha new/flip/increase, including a hedge→alpha
 semantic entry. `hard_ban_violations` also records the objective post-crash/fade new-short and
@@ -437,6 +581,11 @@ Validate the verdict: `AdversaryVerdict.model_validate` must pass AND `cycle` mu
 cycle AND `precheck_sha256` must match. For current schema, `hard_ban_violations_confirmed` must
 exactly echo the precheck list; any row makes acceptance invalid and the final revision must clear
 all rows. These facts cannot be overridden by prose, a directive, or allowed failing bounds.
+The current-schema `metrics_echo` must also explicitly copy
+`cold_start_reentry_eligible`, `b9_aggressive_change_limit`, `risk_model_available`, and every
+controlled-restart proposed/prior identity plus initial/continuation/validity flag; omission or
+disagreement is invalid. It separately copies `binding_user_directive_present` and
+`binding_user_directive_controlled_restart_graduation`; neither can be inferred by the agent.
 `citation_checks` must cover every non-flat sentiment
 symbol exactly once, repeat every cited URL exactly, and truthfully mark whether the symbol appears
 in the reviewed book. An accepted book may not use a selected sentiment claim the Adversary marked
@@ -557,7 +706,14 @@ reconcile; the prior completed book stands and the directive remains pending.
   envelope: unlisted seats are frozen; every permitted final seat is side/role-bound to an exact
   Adversary-authored price forecast plus an exact `{24,72,168}` horizon. Every v2 typed alpha
   constraint also binds the exact calibration-basis and invalidation strings that may survive the
-  unreviewed revision; and at least one constraint must correct the
+  unreviewed revision. Controlled-restart origin/phase is frozen across the one unreviewed
+  revision except that a constraint-authorized fully flat final Book may explicitly end it; both
+  prechecks must carry the identical newest manifest-bound prior lineage; and
+  an active revised Book cannot add or change a selected alpha symbol/horizon outside the original
+  `controlled_restart_risk_audit`. Any final expansion must remain within its explicitly approved
+  coverage; qualification may be superseded only when that original audit truthfully set
+  `directive_graduation_capability_used=true` against the exact-cycle typed capability; and
+  at least one constraint must correct the
   rejected original. Restoring a held side the original PM omitted or flipped away from requires a
   complete `revision_fallback_seat_audits` incumbent review; changing a hedge or its surrounding
   alpha-beta context requires an exact `revision_hedge_audit`. Reconcile also rebinds final selected symbols
@@ -577,7 +733,9 @@ exact canned `StubAgentRunner`; the checked-in CLI cannot construct any runner.
 Before any fill, reconcile recomputes the final precheck against the ORIGINAL evidence marks and
 binds the exact cycle, book, SHA-256, metrics echo, B1–B12 rulings, and (after rejection) both
 immutable one-attempt revision receipts, the original/revision trail, objective hard-ban facts,
-and structured revision compliance.
+and structured revision compliance. It independently reloads the same newest prior
+manifest-bound Book lineage used by precheck; an invalid newest completion never falls back to an
+older origin.
 An accepted original carrying either receipt also HALTs. It then captures a FRESH execution snapshot for every touched symbol: a
 complete two-sided L2 book supplies both the fill reference (top-of-book midpoint) and the depth
 walked for slippage. This separation is load-bearing: market drift while GPT agents reason is not
@@ -614,9 +772,12 @@ snapshots HALT without being sorted or repaired. These rows make recorded VWAP a
 independently replayable.
 It HALTs (prior book stands) on: all-specialists-failed, an invalid decision chain, or a held
 position with no mark. `complete.json` is published only after the account, artifacts, equity, and
-ledger are durable; an interrupted commit is recovered before any later task. This validates
-workflow provenance; it records and never makes a trading
-decision.
+ledger are durable; an interrupted commit is recovered before any later task. When the cycle carries
+a directive, its schema-v2 archive binds the exact claim UUID and intent/payload provenance. Only
+after publication does reconcile finalize that private claim and record consumption. A failed
+finalization reports recovery required while leaving both the completed generation and any newer
+canonical inbox file intact. This validates workflow provenance; it records and never makes a
+trading decision.
 
 Then report a decision-cycle heartbeat: cycle #, schedule_status, n_legs, achieved deploy %,
 dollar residual, beta residual, equity, **turnover_usd / fees_paid_cycle / slippage_paid_cycle /

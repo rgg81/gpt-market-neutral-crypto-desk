@@ -145,7 +145,7 @@ The precheck exposes these bounds to the Adversary:
 | B6 | Per-leg beta-dollar exposure is bounded |
 | B7 | PM-stated metrics match recomputed metrics |
 | B8 | Turnover fields describe the proposed change truthfully |
-| B9 | New entries, flips, and same-side increases stay within the aggressive-change limit; every resize is reported/costed, while exits and decreases remain uncapped loss control |
+| B9 | New entries, flips, and same-side increases stay within the ordinary two-action limit; an exactly empty book can seed up to four new non-BTC alpha seats, while exits and decreases remain uncapped loss control |
 | B10 | Priced selected seats/exits remain ≤75bp; aggressive alpha actions also require a complete ≤50bp 2k screen |
 | B11 | No duplicate or unpriced legs |
 | B12 | Explicit price-plus-conservative-carry edge repays size-aware entry/flip/resize/drop friction promptly; carry-only and required-forecast diagnostics expose self-justifying forecasts |
@@ -158,7 +158,7 @@ failing bound halts before any paper fill.
 
 ## Requirements
 
-- Linux or macOS with Python 3.11+
+- Linux with Python 3.11+ and `renameat2(RENAME_NOREPLACE)` filesystem support
 - [`uv`](https://docs.astral.sh/uv/) for the locked Python environment
 - Codex CLI authenticated with a ChatGPT subscription
 - Cron and `flock` for the supplied persistent scheduler
@@ -315,6 +315,23 @@ logs/             scheduler and Codex output
 
 This keeps account history, agent deliberation artifacts, machine paths, and potentially sensitive
 local directives out of public commits.
+
+The optional `ops/next-cycle-directive.md` is a one-shot inbox. On an admitted cycle, evidence
+atomically moves that exact file instance into ignored, state-owned claim storage before network
+work. Failed cycles reuse the claim; successful cycles archive its UUID-bound receipt in the cycle
+manifest and then finalize only the private claim. A new inbox file written while a cycle runs is
+preserved as a distinct next instruction, even when its text is identical. Operators should use
+`scripts/desk_recover.py` after interruption and never delete claim files manually.
+The hash-bound reconcile WAL records explicit claim absence or that exact claim plus its matching
+schema-v2 receipt, and rechecks the relationship under the state lock before publication. No new
+claim can enter a pending reconcile transaction or an already completed cycle.
+
+Run the repository and its state under one trusted local desk account. The directive lifecycle is
+designed for crashes, retries, and cooperating concurrent writers; it rejects pre-existing
+symlinks and preserves independently queued inbox instances. It is not a sandbox against a hostile
+process with concurrent write/rename access to repository or state-directory ancestors—such access
+already permits alteration of desk code, prompts, and paper-account artifacts. Do not grant shared
+write access to those paths.
 
 ## Repository map
 

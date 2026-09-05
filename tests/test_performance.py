@@ -12,6 +12,7 @@ from futures_fund.performance import (
     _benchmark_comparisons,
     _cost_net_benchmark_outcome,
     _forecast_performance,
+    _pending_forecast_inventory,
     _portfolio_risk_context,
     _recent_windows,
     _time_based_performance,
@@ -23,7 +24,12 @@ from futures_fund.reconcile_commit import (
     recover_reconcile_transaction,
     stage_reconcile_transaction,
 )
-from futures_fund.reflection import read_forecast_scorecard, score_previous_cycle
+from futures_fund.reflection import (
+    SCHEDULED_MARK_TOLERANCE,
+    forecast_cohort_membership_sha256,
+    read_forecast_scorecard,
+    score_previous_cycle,
+)
 from futures_fund.scorecard import BookScore, ScoreRecord, SpecialistScore
 from futures_fund.slippage import ExecutionRealism
 from futures_fund.state_transaction import current_account_sha256
@@ -727,6 +733,32 @@ def _forecast_performance_row(
     }
 
 
+def _cost_net_forecast_performance_row(
+    *,
+    cost_net_realized: float | None = 0.015,
+    cost_net_learning_eligible: bool = True,
+    round_trip_friction_priced: bool = True,
+    expected_symbols: list[str] | None = None,
+    **kwargs,
+) -> dict:
+    row = _forecast_performance_row(**kwargs)
+    members = sorted(expected_symbols or [str(row["symbol"])])
+    return {
+        **row,
+        "forecast_score_schema_version": 5,
+        "forecast_cohort_expected_symbols": members,
+        "forecast_cohort_expected_member_count": len(members),
+        "forecast_cohort_expected_symbols_sha256": forecast_cohort_membership_sha256(
+            int(row["origin_cycle"]),
+            int(row["forecast_horizon_hours"]),
+            members,
+        ),
+        "cost_net_learning_eligible": cost_net_learning_eligible,
+        "round_trip_friction_priced": round_trip_friction_priced,
+        "realized_round_trip_cost_net_price_edge_frac": cost_net_realized,
+    }
+
+
 def test_forecast_performance_discloses_missing_residual_risk_coverage():
     result = _forecast_performance(
         [
@@ -962,6 +994,511 @@ def test_multi_leg_forecasts_become_usable_only_after_twelve_time_cohorts():
     assert bucket["risk_capacity_status"] == "usable"
     assert len(bucket["time_cohorts"]) == 12
     assert all(cohort["leg_n"] == 10 for cohort in bucket["time_cohorts"])
+
+
+def test_cost_net_calibration_becomes_usable_at_twelve_complete_time_cohorts():
+    rows = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"S{index}",
+            cost_net_realized=0.006 + index / 100_000,
+        )
+        for index in range(12)
+    ]
+
+    eleven = _forecast_performance(rows[:11])["by_horizon_hours"]["24"]
+    assert eleven["cost_net_independent_time_cohort_n"] == 11
+    assert eleven["cost_net_leg_n"] == 11
+    assert eleven["cost_net_coverage_frac"] == 1.0
+    assert eleven["cost_net_calibration_status"] == ("insufficient_independent_time_cohorts")
+    assert eleven["cost_net_notional_weighted_status"] == ("insufficient_independent_time_cohorts")
+    assert eleven["cost_net_residual_risk_weighted_status"] == (
+        "insufficient_independent_time_cohorts"
+    )
+
+    twelve = _forecast_performance(rows)["by_horizon_hours"]["24"]
+    expected = sum(0.006 + index / 100_000 for index in range(12)) / 12
+    assert twelve["cost_net_independent_time_cohort_n"] == 12
+    assert twelve["cost_net_leg_n"] == 12
+    assert twelve["cost_net_calibration_status"] == "usable"
+    assert twelve["mean_realized_round_trip_cost_net_price_edge_frac"] == pytest.approx(expected)
+    assert twelve[
+        "notional_weighted_realized_round_trip_cost_net_price_edge_frac"
+    ] == pytest.approx(expected)
+    assert twelve["cost_net_notional_weight_coverage_frac"] == 1.0
+    assert twelve["cost_net_notional_weighted_status"] == "usable"
+    assert twelve[
+        "residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"
+    ] == pytest.approx(expected)
+    assert twelve["cost_net_residual_risk_weight_coverage_frac"] == 1.0
+    assert twelve["cost_net_residual_risk_weighted_status"] == "usable"
+
+
+def test_cost_net_primary_window_is_latest_twelve_consecutive_complete_cohorts():
+    rows = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"S{index}",
+            cost_net_realized=float(index) / 1_000.0,
+        )
+        for index in range(20)
+    ]
+
+    bucket = _forecast_performance(rows)["by_horizon_hours"]["24"]
+
+    assert bucket["cost_net_complete_time_cohort_n_total"] == 20
+    assert bucket["cost_net_trailing_complete_time_cohort_n"] == 20
+    assert bucket["cost_net_window_time_cohort_n"] == 12
+    assert bucket["cost_net_independent_time_cohort_n"] == 12
+    assert bucket["mean_realized_round_trip_cost_net_price_edge_frac"] == pytest.approx(
+        sum(float(index) / 1_000.0 for index in range(8, 20)) / 12
+    )
+
+
+def test_twelve_old_complete_plus_eighteen_new_unpriced_cohorts_is_unusable():
+    complete = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(12)
+    ]
+    unpriced = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 13,
+            symbol=f"NEW{index}",
+            cost_net_realized=None,
+            cost_net_learning_eligible=False,
+            round_trip_friction_priced=False,
+        )
+        for index in range(18)
+    ]
+
+    bucket = _forecast_performance([*complete, *unpriced])["by_horizon_hours"]["24"]
+
+    assert bucket["cost_net_complete_time_cohort_n_total"] == 12
+    assert bucket["cost_net_trailing_complete_time_cohort_n"] == 0
+    assert bucket["cost_net_window_time_cohort_n"] == 0
+    assert bucket["cost_net_calibration_status"] == "newest_time_cohort_incomplete"
+    assert bucket["cost_net_residual_risk_weighted_status"] == (
+        "newest_time_cohort_incomplete"
+    )
+    assert bucket["residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"] is None
+
+
+def test_newer_off_schedule_or_mature_pending_forecast_blocks_stale_cost_net_window():
+    complete = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(12)
+    ]
+    off_schedule = {
+        **_cost_net_forecast_performance_row(origin_cycle=13, symbol="NEW"),
+        "horizon_label_eligible": False,
+        "decision_learning_eligible": False,
+        "learning_eligible": False,
+    }
+    blocked = _forecast_performance([*complete, off_schedule])["by_horizon_hours"]["24"]
+    assert blocked["cost_net_newer_incomplete_forecast_n"] == 1
+    assert blocked["cost_net_window_time_cohort_n"] == 0
+    assert blocked["cost_net_calibration_status"] == (
+        "newer_matching_horizon_forecast_incomplete"
+    )
+
+    maturity = datetime(2026, 1, 20, tzinfo=UTC)
+    pending = _forecast_performance(
+        complete,
+        pending_forecasts=[{
+            "origin_cycle": 20,
+            "symbol": "WAITING",
+            "edge_horizon_hours": 24,
+            "maturity_ts": maturity.isoformat(),
+            "hours_past_maturity": 1.0,
+        }],
+    )["by_horizon_hours"]["24"]
+    assert pending["cost_net_mature_pending_forecast_n"] == 1
+    assert pending["cost_net_window_time_cohort_n"] == 0
+    assert pending["cost_net_recency_blocked"] is True
+
+
+def test_complete_temporal_overlap_is_audit_only_but_partial_membership_blocks():
+    complete = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(12)
+    ]
+    overlap_start = datetime(2026, 1, 12, 12, tzinfo=UTC)
+    complete_overlap = _cost_net_forecast_performance_row(
+        origin_cycle=13,
+        symbol="OVERLAP",
+        start=overlap_start,
+    )
+
+    audit_only = _forecast_performance([*complete, complete_overlap])[
+        "by_horizon_hours"
+    ]["24"]
+    assert audit_only["cost_net_complete_overlap_cohort_n_audit_only_in_history"] == 1
+    assert audit_only["cost_net_complete_overlap_forecast_n_audit_only_in_history"] == 1
+    assert audit_only["cost_net_newer_incomplete_cohort_n"] == 0
+    assert audit_only["cost_net_newer_incomplete_forecast_n"] == 0
+    assert audit_only["cost_net_independent_time_cohort_n"] == 12
+    assert audit_only["cost_net_calibration_status"] == "usable"
+
+    explicit_symbols = ["EXPLICIT-A", "EXPLICIT-B"]
+    explicit_overlap = [
+        {
+            **_cost_net_forecast_performance_row(
+                origin_cycle=14,
+                symbol=symbol,
+                expected_symbols=explicit_symbols,
+            ),
+            "decision_learning_eligible": False,
+            "learning_eligible": False,
+            "leg_nonoverlap_eligible": False,
+            "cost_net_learning_eligible": False,
+            "cost_net_learning_exclusion_reasons": [
+                "overlapping_unchanged_thesis",
+                "nonindependent_overlapping_calibration_cohort",
+            ],
+        }
+        for symbol in explicit_symbols
+    ]
+    declared_audit_only = _forecast_performance([*complete, *explicit_overlap])[
+        "by_horizon_hours"
+    ]["24"]
+    assert declared_audit_only[
+        "cost_net_complete_overlap_cohort_n_audit_only_in_history"
+    ] == 1
+    assert declared_audit_only[
+        "cost_net_complete_overlap_forecast_n_audit_only_in_history"
+    ] == 2
+    assert declared_audit_only["cost_net_newer_incomplete_forecast_n"] == 0
+    assert declared_audit_only["cost_net_independent_time_cohort_n"] == 12
+    assert declared_audit_only["cost_net_calibration_status"] == "usable"
+
+    partial_overlap = _cost_net_forecast_performance_row(
+        origin_cycle=13,
+        symbol="OVERLAP-A",
+        start=overlap_start,
+        expected_symbols=["OVERLAP-A", "OVERLAP-B"],
+    )
+    blocked = _forecast_performance([*complete, partial_overlap])[
+        "by_horizon_hours"
+    ]["24"]
+    assert blocked["cost_net_complete_overlap_cohort_n_audit_only_in_history"] == 0
+    assert blocked["cost_net_newer_incomplete_cohort_n"] == 1
+    assert blocked["cost_net_newer_incomplete_forecast_n"] == 1
+    assert blocked["cost_net_independent_time_cohort_n"] == 0
+
+
+def test_mature_pending_recency_block_starts_after_scheduled_mark_tolerance():
+    complete = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(12)
+    ]
+    maturity = datetime(2026, 1, 20, tzinfo=UTC)
+    tolerance_hours = SCHEDULED_MARK_TOLERANCE.total_seconds() / 3600.0
+
+    def bucket(hours_past_maturity: float) -> dict:
+        return _forecast_performance(
+            complete,
+            pending_forecasts=[{
+                "origin_cycle": 20,
+                "symbol": "WAITING",
+                "edge_horizon_hours": 24,
+                "maturity_ts": maturity.isoformat(),
+                "hours_past_maturity": hours_past_maturity,
+            }],
+        )["by_horizon_hours"]["24"]
+
+    inside = bucket(tolerance_hours - 1.0 / 3600.0)
+    assert inside["cost_net_mature_pending_forecast_n"] == 0
+    assert inside["cost_net_independent_time_cohort_n"] == 12
+    assert inside["cost_net_calibration_status"] == "usable"
+
+    outside = bucket(tolerance_hours + 1.0 / 3600.0)
+    assert outside["cost_net_mature_pending_forecast_n"] == 1
+    assert outside["cost_net_independent_time_cohort_n"] == 0
+    assert outside["cost_net_calibration_status"] == (
+        "newer_matching_horizon_forecast_incomplete"
+    )
+
+
+def test_invalid_gap_breaks_streak_even_after_one_new_complete_cohort():
+    old = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(11)
+    ]
+    invalid = {
+        **_cost_net_forecast_performance_row(origin_cycle=12, symbol="INVALID"),
+        "horizon_label_eligible": False,
+        "decision_learning_eligible": False,
+        "learning_eligible": False,
+    }
+    new = _cost_net_forecast_performance_row(origin_cycle=13, symbol="NEW")
+
+    bucket = _forecast_performance([*old, invalid, new])["by_horizon_hours"]["24"]
+
+    assert bucket["cost_net_invalid_excluded_cohort_n_in_audit_history"] == 1
+    assert bucket["cost_net_newer_incomplete_cohort_n"] == 0
+    assert bucket["cost_net_trailing_complete_time_cohort_n"] == 1
+    assert bucket["cost_net_independent_time_cohort_n"] == 1
+    assert bucket["cost_net_calibration_status"] == (
+        "insufficient_independent_time_cohorts"
+    )
+
+
+def test_mature_pending_gap_breaks_streak_after_one_new_complete_cohort():
+    old = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(11)
+    ]
+    new = _cost_net_forecast_performance_row(origin_cycle=13, symbol="NEW")
+    maturity = datetime(2026, 1, 12, 12, tzinfo=UTC)
+
+    bucket = _forecast_performance(
+        [*old, new],
+        pending_forecasts=[{
+            "origin_cycle": 12,
+            "symbol": "MISSING",
+            "edge_horizon_hours": 24,
+            "maturity_ts": maturity.isoformat(),
+            "hours_past_maturity": 24.0,
+        }],
+    )["by_horizon_hours"]["24"]
+
+    assert bucket["cost_net_mature_pending_forecast_n"] == 0
+    assert bucket["cost_net_mature_pending_forecast_n_in_audit_history"] == 1
+    assert bucket["cost_net_latest_invalid_event_ts"] == maturity.isoformat()
+    assert bucket["cost_net_trailing_complete_time_cohort_n"] == 1
+    assert bucket["cost_net_independent_time_cohort_n"] == 1
+    assert bucket["cost_net_calibration_status"] == (
+        "insufficient_independent_time_cohorts"
+    )
+
+
+def test_year_old_complete_cost_net_window_is_stale_in_production_context():
+    rows = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"OLD{index}",
+        )
+        for index in range(12)
+    ]
+    as_of = datetime(2027, 1, 20, tzinfo=UTC)
+
+    bucket = _forecast_performance(rows, as_of=as_of)["by_horizon_hours"]["24"]
+
+    assert bucket["cost_net_age_gate_applied"] is True
+    assert bucket["cost_net_max_cohort_age_hours"] == 72.0
+    assert bucket["cost_net_age_status"] == "stale"
+    assert bucket["cost_net_independent_time_cohort_n"] == 0
+    assert bucket["cost_net_calibration_status"] == (
+        "stale_latest_complete_time_cohort"
+    )
+    assert bucket["residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"] is None
+
+
+def test_pending_inventory_excludes_btc_and_any_already_scored_overlap(tmp_path, monkeypatch):
+    directory = tmp_path / "rebal" / "cycle" / "1"
+    directory.mkdir(parents=True)
+    (directory / "complete.json").write_text("{}")
+    origin = datetime(2026, 1, 1, tzinfo=UTC)
+    (directory / "report.json").write_text(json.dumps({
+        "decision_ts": origin.isoformat()
+    }))
+    (directory / "book.json").write_text(json.dumps({
+        "legs": [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "seat_role": "alpha",
+                "expected_price_edge_frac": 0.01,
+                "edge_horizon_hours": 24,
+            },
+            {
+                "symbol": "A/USDT:USDT",
+                "seat_role": "alpha",
+                "expected_price_edge_frac": 0.01,
+                "edge_horizon_hours": 24,
+            },
+        ]
+    }))
+    monkeypatch.setattr(
+        "futures_fund.performance.cycle_is_complete", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        "futures_fund.performance.completed_artifact_is_bound",
+        lambda *args, **kwargs: True,
+    )
+
+    unscored = _pending_forecast_inventory(
+        tmp_path, [], now=origin + timedelta(hours=25)
+    )
+    assert [row["symbol"] for row in unscored["pending"]] == ["A/USDT:USDT"]
+    assert unscored["mature_waiting_for_mark"] == 1
+
+    scored_overlap = [{
+        "origin_cycle": 1,
+        "symbol": "A/USDT:USDT",
+        "learning_eligible": False,
+        "forecast_independence_reason": "overlapping_unchanged_thesis",
+    }]
+    already_seen = _pending_forecast_inventory(
+        tmp_path,
+        scored_overlap,
+        now=origin + timedelta(hours=25),
+    )
+    assert already_seen["pending_forecasts"] == 0
+    assert already_seen["mature_waiting_for_mark"] == 0
+
+
+def test_cost_net_calibration_never_pools_mixed_forecast_horizons():
+    rows = []
+    for horizon, first_start in (
+        (24, datetime(2026, 1, 1, tzinfo=UTC)),
+        (72, datetime(2027, 1, 1, tzinfo=UTC)),
+    ):
+        rows.extend(
+            _cost_net_forecast_performance_row(
+                origin_cycle=horizon * 100 + index,
+                symbol=f"S{horizon}-{index}",
+                horizon=horizon,
+                start=first_start + timedelta(hours=horizon * index),
+            )
+            for index in range(6)
+        )
+
+    result = _forecast_performance(rows)
+
+    assert result["by_horizon_hours"]["24"]["cost_net_independent_time_cohort_n"] == 6
+    assert result["by_horizon_hours"]["72"]["cost_net_independent_time_cohort_n"] == 6
+    assert result["by_horizon_hours"]["24"]["cost_net_calibration_status"] == (
+        "insufficient_independent_time_cohorts"
+    )
+    assert result["by_horizon_hours"]["72"]["cost_net_calibration_status"] == (
+        "insufficient_independent_time_cohorts"
+    )
+    # The context aggregate can disclose that twelve cohorts exist, but it is never admissible
+    # calibration evidence because the forecast horizons are incompatible.
+    assert result["aggregate_context_only"]["cost_net_independent_time_cohort_n"] == 12
+    assert result["aggregate_context_only"]["cost_net_calibration_status"] == (
+        "context_only_cross_horizon"
+    )
+    assert result["aggregate_context_only"]["cost_net_residual_risk_weighted_status"] == (
+        "context_only_cross_horizon"
+    )
+
+
+def test_one_unpriced_leg_invalidates_the_entire_cost_net_time_cohort():
+    rows = []
+    for cohort_index in range(12):
+        expected_symbols = [f"S{cohort_index}-{leg_index}" for leg_index in range(2)]
+        for leg_index in range(2):
+            priced = not (cohort_index == 0 and leg_index == 1)
+            rows.append(
+                _cost_net_forecast_performance_row(
+                    origin_cycle=cohort_index + 1,
+                    symbol=f"S{cohort_index}-{leg_index}",
+                    expected_symbols=expected_symbols,
+                    cost_net_realized=0.01 if priced else None,
+                    cost_net_learning_eligible=priced,
+                    round_trip_friction_priced=priced,
+                )
+            )
+
+    bucket = _forecast_performance(rows)["by_horizon_hours"]["24"]
+
+    assert bucket["independent_time_cohort_n"] == 12
+    assert bucket["leg_n"] == 24
+    assert bucket["calibration_status"] == "usable"
+    assert bucket["cost_net_independent_time_cohort_n"] == 11
+    assert bucket["cost_net_leg_n"] == 22
+    assert bucket["cost_net_coverage_frac"] == pytest.approx(11 / 12)
+    assert bucket["cost_net_calibration_status"] == ("insufficient_independent_time_cohorts")
+
+
+def test_cost_net_cohort_requires_exact_canonical_expected_membership():
+    expected = ["A", "B"]
+    rows = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=1,
+            symbol=symbol,
+            expected_symbols=expected,
+        )
+        for symbol in expected
+    ]
+
+    complete = _forecast_performance(rows)["by_horizon_hours"]["24"]
+    assert complete["cost_net_independent_time_cohort_n"] == 1
+    assert complete["cost_net_leg_n"] == 2
+
+    removed = _forecast_performance(rows[:1])["by_horizon_hours"]["24"]
+    assert removed["cost_net_independent_time_cohort_n"] == 0
+    assert removed["cost_net_leg_n"] == 0
+
+    duplicate = _forecast_performance([*rows, rows[0]])["by_horizon_hours"]["24"]
+    assert duplicate["cost_net_independent_time_cohort_n"] == 0
+
+    for forged_field, forged_value in (
+        ("forecast_cohort_expected_symbols", ["A"]),
+        ("forecast_cohort_expected_member_count", 1),
+        ("forecast_cohort_expected_symbols_sha256", "f" * 64),
+    ):
+        forged_rows = [{**row, forged_field: forged_value} for row in rows]
+        bucket = _forecast_performance(forged_rows)["by_horizon_hours"]["24"]
+        assert bucket["cost_net_independent_time_cohort_n"] == 0
+
+
+def test_schema_v4_forecasts_remain_gross_calibration_without_cost_net_evidence():
+    rows = [
+        _forecast_performance_row(origin_cycle=index + 1, symbol=f"S{index}") for index in range(12)
+    ]
+
+    result = _forecast_performance(rows)
+    bucket = result["by_horizon_hours"]["24"]
+
+    assert result["legacy_policy_forecasts_audit_only"] == 0
+    assert bucket["independent_time_cohort_n"] == 12
+    assert bucket["calibration_status"] == "usable"
+    assert bucket["cost_net_independent_time_cohort_n"] == 0
+    assert bucket["cost_net_leg_n"] == 0
+    assert bucket["cost_net_coverage_frac"] == 0.0
+    assert bucket["cost_net_calibration_status"] == "newest_time_cohort_incomplete"
+    assert bucket["mean_realized_round_trip_cost_net_price_edge_frac"] is None
+    assert bucket["residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"] is None
+
+
+def test_cost_net_residual_risk_weighting_requires_complete_positive_weights():
+    rows = [
+        _cost_net_forecast_performance_row(
+            origin_cycle=index + 1,
+            symbol=f"S{index}",
+            standalone_vol=None if index == 0 else 200.0,
+        )
+        for index in range(12)
+    ]
+
+    bucket = _forecast_performance(rows)["by_horizon_hours"]["24"]
+
+    assert bucket["cost_net_calibration_status"] == "usable"
+    assert bucket["cost_net_notional_weighted_status"] == "usable"
+    assert bucket["cost_net_residual_risk_weighted_observations"] == 11
+    assert bucket["cost_net_residual_risk_weight_coverage_frac"] == pytest.approx(11 / 12)
+    assert bucket["cost_net_residual_risk_weighted_status"] == "incomplete_coverage"
+    assert bucket["residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"] is None
 
 
 def test_snapshot_exposes_when_tiny_carry_is_overwhelmed_by_opposing_trend(tmp_path):

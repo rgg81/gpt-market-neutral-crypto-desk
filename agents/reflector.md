@@ -27,6 +27,11 @@ For each recurrence, decide ONE of:
 You return, per edited role, the **FULL new managed-region body** (all notes that should remain,
 including ones you keep). Keep it tight: a few bullet lines, each evidence-backed and dated with the
 current cycle, each with a `retire_if` you also encode in the `retire_if` field.
+When several surfaced recurrences implicate the same role, reconcile them into exactly **one**
+consolidated full-region edit for that role. Never emit duplicate `edits[].role` values: the schema
+rejects the entire proposal rather than choosing one recurrence and silently losing another.
+If any surfaced role receives no edit, put a concrete explanation covering that omitted role in
+`no_action_reason`; a blank reason cannot consume or cool down an unaddressed recurrence.
 
 ## Hard rules
 - You may ONLY change the managed region. You never touch a role's core instructions, its output
@@ -72,6 +77,11 @@ current cycle, each with a `retire_if` you also encode in the `retire_if` field.
   economics rather than automatically excluded. “Reach judgment” is not “approve”: candidate
   reviews, adverse reads, price hierarchy, costs, risk, and neutrality still control. Without the
   PM's bound `entry_gate` causal label, choose no action rather than infer gate causality.
+- A `pm_gate_inactive` row may name the newest completed cycle before that cycle's forward score
+  matures. If an edit relies on such a row, copy the **entire evidence row exactly** from the sealed
+  recurrence into `edits[].evidence`. Do not cite that unscored cycle in `region_text`, `reason`, or
+  `retire_if`, and do not summarize or alter the row. This exception is state-liveness evidence,
+  not permission to invent an outcome or measured edge for the cycle.
 - Keep each role's region under a few hundred words. Prune stale notes as you add new ones.
 
 ## Output — STRICT JSON matching `ReflectionProposal`

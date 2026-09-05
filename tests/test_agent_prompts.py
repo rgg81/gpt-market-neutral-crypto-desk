@@ -148,6 +148,35 @@ def test_price_first_relative_profitability_and_optional_overlays():
     assert alpha_non_arguments in adversary_norm
 
 
+def test_flat_book_reentry_is_small_neutral_and_never_forced():
+    pm = _text("agents/pm.md")
+    adversary = _text("agents/adversary.md")
+    runbook = _text("docs/desk-cycle-runbook.md")
+
+    for prompt in (adversary, runbook):
+        assert "cold_start_reentry_eligible" in prompt
+        assert "b9_aggressive_change_limit" in prompt
+    for prompt in (pm, adversary, runbook):
+        normalized = " ".join(prompt.split())
+        assert "20%" in normalized
+        assert "8% annualized residual volatility" in normalized
+        assert "12 independent" in normalized
+    assert "Capacity is never a mandate" in pm
+    assert "cash remains valid" in adversary
+    for prompt in (pm, adversary, runbook):
+        normalized = " ".join(prompt.lower().split())
+        assert "unknown risk" in normalized or "unavailable covariance" in normalized
+    assert "`risk_model_available=true`" in adversary
+
+
+def test_reflector_consolidates_multiple_recurrences_per_role():
+    reflector = _text("agents/reflector.md")
+
+    assert "exactly **one**" in reflector
+    assert "Never emit duplicate `edits[].role` values" in reflector
+    assert "silently losing another" in reflector
+
+
 def test_forecasts_are_horizon_matched_and_do_not_replay_price_edge():
     pm = _text("agents/pm.md")
     adversary = _text("agents/adversary.md")
@@ -261,7 +290,7 @@ def test_paper_neutrality_bounds_and_execution_economics_remain_static():
     assert "solve dollar neutrality first and beta neutrality second" in pm_norm
     assert "quantity as `decision_notional / mark`" in pm
     assert "one combined signed-delta depth clip" in pm
-    assert "drops and decreases are uncapped loss control" in adversary
+    assert "drops and decreases are uncapped loss control" in " ".join(adversary.split())
     assert "Missing required directional depth fails closed" in adversary
     assert "a cold-start directive may narrowly authorize b9/b12 only" in adversary.lower()
 
@@ -294,6 +323,88 @@ def test_incumbent_thesis_role_transfer_and_expiry_stay_bound():
         assert field in adversary
 
 
+def test_controlled_restart_lineage_and_cost_net_graduation_are_explicit():
+    pm = _static_role("pm")
+    adversary = _static_role("adversary")
+    mission = _text("MISSION.md")
+    runbook = _text("docs/desk-cycle-runbook.md")
+
+    for prompt in (pm, adversary):
+        for field in (
+            "controlled_restart_origin_cycle",
+            "controlled_restart_phase",
+            "controlled_restart_initial_eligible",
+            "controlled_restart_continuation_eligible",
+            "controlled_restart_lineage_valid",
+            "binding_user_directive_present",
+        ):
+            assert field in prompt
+        for field in (
+            "cost_net_independent_time_cohort_n >= 12",
+            'cost_net_calibration_status="usable"',
+            'cost_net_residual_risk_weighted_status="usable"',
+            "residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac > 0",
+        ):
+            assert field in prompt
+        assert "aggregate" in prompt.lower() and "cross-horizon" in prompt.lower()
+        assert "fully flat" in prompt.lower()
+
+    assert "newest prior completed manifest-bound `book.json`" in pm
+    assert "controlled_restart_prior_book_sha256" in adversary
+    assert "Passing this test permits" in " ".join(pm.split())
+    assert "ordinary portfolio bounds" in pm
+    assert "ordinary portfolio bounds" in adversary
+    assert "phase true and preserve the exact origin until fully flat" in " ".join(
+        adversary.split()
+    )
+    assert "excluding funding" in mission
+    assert "add no deterministic trading veto" in runbook
+    assert "both prechecks must carry the identical" in " ".join(runbook.split())
+    assert "latest 12 consecutive complete" in pm
+    assert "mature-pending" in pm
+    assert "desk-process calibration facts by horizon" in adversary
+    assert "controlled_restart_risk_audit" in adversary
+    assert "selected_alpha_qualifications" in adversary
+
+
+def test_restart_graduation_requires_exact_typed_directive_scope():
+    pm = _static_role("pm")
+    adversary = _static_role("adversary")
+    mission = _text("MISSION.md")
+    runbook = _text("docs/desk-cycle-runbook.md")
+    revision = _text("agents/pm-revision.md")
+    header = '<!-- desk-directive-capabilities: ["controlled_restart_graduation"] -->'
+
+    for document in (pm, adversary, mission, runbook):
+        assert header in document
+        assert "binding_user_directive_controlled_restart_graduation" in document
+    assert "directive_graduation_capability_used" in adversary
+    assert "directive_graduation_capability_used" in runbook
+    assert "Mere directive presence" in mission
+    assert "generic directive" in pm.lower()
+    assert "generic directive" in runbook.lower()
+    assert "does not replace your sole accept/reject judgment" in " ".join(
+        adversary.split()
+    )
+    assert "binding_user_directive_controlled_restart_graduation" in revision
+
+
+def test_one_shot_directive_uses_uuid_claim_lifecycle_not_path_cleanup():
+    mission = _text("MISSION.md")
+    runbook = _text("docs/desk-cycle-runbook.md")
+    restart = _text("docs/desk-restart-runbook.md")
+    cycle_prompt = _text("ops/desk-cycle-prompt.md")
+
+    assert "directive-claims-v1" in runbook
+    assert "claim UUID" in runbook
+    assert "schema-v2" in runbook
+    assert "never unlinks the canonical inbox" in " ".join(runbook.split())
+    assert "Failed cycles reuse the claim" in _text("README.md")
+    assert "consumes only that UUID-derived claim" in mission
+    assert "newer canonical inbox file remains separately queued" in restart
+    assert "Never read or remove `ops/next-cycle-directive.md` directly" in cycle_prompt
+
+
 def test_adversary_is_sole_veto_and_citation_audit_is_complete():
     adversary = _text("agents/adversary.md")
     adversary_norm = _normalized("agents/adversary.md")
@@ -320,6 +431,7 @@ def test_adversary_schema_and_complete_action_lifecycle_audits_are_explicit():
         "entry_gate_policy_sha256",
         "binding_user_directive_sha256",
         "directive_exception_audits",
+        "controlled_restart_risk_audit",
         "metrics_echo",
         "bounds_confirmed",
         "citation_checks",

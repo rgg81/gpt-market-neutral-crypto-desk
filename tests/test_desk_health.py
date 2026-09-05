@@ -145,6 +145,113 @@ def test_health_report_verifies_deduplicated_state_and_latest_account(tmp_path):
     assert report["state"]["deduplication"]["heartbeats"]["unique_rows"] == 1
     assert report["state"]["account_event_chain_valid"] is True
     assert report["state"]["account_event_count"] == 2
+    assert report["state"]["directive_lifecycle"] == {
+        "status": "idle",
+        "queued_source_present": False,
+    }
+
+
+def test_health_report_surfaces_retryable_claim_and_queued_inbox_without_text(
+    tmp_path, monkeypatch
+):
+    state, logs = _healthy_state(tmp_path)
+    monkeypatch.setattr(
+        desk_health,
+        "directive_lifecycle_status",
+        lambda _state: {
+            "status": "claimed_pending",
+            "cycle": 2,
+            "claim_id": "a" * 32,
+            "payload_state": "claim",
+            "queued_source_present": True,
+            "text": "must never appear in health output",
+        },
+    )
+
+    report = build_health_report(state, logs, now=T1 + timedelta(hours=1))
+
+    assert report["status"] == "CAUTION"
+    assert report["state"]["directive_lifecycle"] == {
+        "status": "claimed_pending",
+        "queued_source_present": True,
+        "cycle": 2,
+        "claim_id": "a" * 32,
+        "payload_state": "claim",
+    }
+    codes = {issue["code"] for issue in report["issues"]}
+    assert "DIRECTIVE_CLAIM_PENDING" in codes
+    assert "DIRECTIVE_INBOX_QUEUED_BEHIND_ACTIVE" in codes
+    assert "must never appear" not in json.dumps(report)
+
+
+@pytest.mark.parametrize(
+    "payload_state", ["tombstone", "duplicate_source", "missing", "conflict"]
+)
+def test_health_report_treats_nonretryable_claim_payload_state_as_critical(
+    tmp_path, monkeypatch, payload_state
+):
+    state, logs = _healthy_state(tmp_path)
+    monkeypatch.setattr(
+        desk_health,
+        "directive_lifecycle_status",
+        lambda _state: {
+            "status": "claimed_pending",
+            "cycle": 2,
+            "claim_id": "b" * 32,
+            "payload_state": payload_state,
+            "queued_source_present": False,
+        },
+    )
+
+    report = build_health_report(state, logs, now=T1 + timedelta(hours=1))
+
+    assert report["status"] == "CRITICAL"
+    assert any(issue["code"] == "DIRECTIVE_LIFECYCLE_CONFLICT" for issue in report["issues"])
+
+
+def test_health_report_treats_directive_finalization_pending_as_critical(
+    tmp_path, monkeypatch
+):
+    state, logs = _healthy_state(tmp_path)
+    monkeypatch.setattr(
+        desk_health,
+        "directive_lifecycle_status",
+        lambda _state: {
+            "status": "cleanup_pending",
+            "cycle": 2,
+            "claim_id": "c" * 32,
+            "payload_state": "tombstone",
+            "queued_source_present": False,
+        },
+    )
+
+    report = build_health_report(state, logs, now=T1 + timedelta(hours=1))
+
+    assert report["status"] == "CRITICAL"
+    assert any(
+        issue["code"] == "DIRECTIVE_FINALIZATION_PENDING" for issue in report["issues"]
+    )
+
+
+def test_health_report_redacts_directive_conflict_diagnostics(tmp_path, monkeypatch):
+    state, logs = _healthy_state(tmp_path)
+    monkeypatch.setattr(
+        desk_health,
+        "directive_lifecycle_status",
+        lambda _state: {
+            "status": "conflict",
+            "queued_source_present": False,
+            "error": "directive body secret-token",
+        },
+    )
+
+    report = build_health_report(state, logs, now=T1 + timedelta(hours=1))
+
+    assert report["status"] == "CRITICAL"
+    assert any(issue["code"] == "DIRECTIVE_LIFECYCLE_CONFLICT" for issue in report["issues"])
+    serialized = json.dumps(report)
+    assert "secret-token" not in serialized
+    assert "read-only lifecycle validation failed" in serialized
 
 
 def test_health_report_flags_stale_funding_flat_book_and_proxy_monitor(tmp_path):

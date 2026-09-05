@@ -167,6 +167,11 @@ class BookLeg(BaseModel):
 
 class Book(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    # Historical Books predate controlled restart lineage. ``false``/``null`` is therefore the
+    # neutral legacy value. New production restart Books opt in explicitly; deterministic
+    # precheck binds that assertion to the current inventory and newest manifest-bound prior Book.
+    controlled_restart_origin_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_phase: bool = False
     specialist_reads_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -195,6 +200,17 @@ class Book(BaseModel):
         ),
     )
     notes: str = ""
+
+    @model_validator(mode="after")
+    def validate_controlled_restart_shape(self) -> Book:
+        if self.controlled_restart_phase != (self.controlled_restart_origin_cycle is not None):
+            raise ValueError(
+                "controlled_restart_phase=true requires an origin cycle and phase=false "
+                "requires a null origin"
+            )
+        if self.controlled_restart_phase and not self.legs:
+            raise ValueError("controlled_restart_phase=true requires a non-empty Book")
+        return self
 
     def validate_production_contract(self) -> Book:
         """Validate fields required only for newly proposed production PAPER books.
@@ -432,6 +448,22 @@ class MetricsEcho(BaseModel):
     max_leg_frac_gross: float = Field(ge=0.0)
     turnover_legs_changed: int = Field(ge=0)
     turnover_aggressive_legs_changed: int = Field(default=0, ge=0)
+    cold_start_reentry_eligible: bool = False
+    b9_aggressive_change_limit: Literal[2, 4] = 2
+    risk_model_available: bool = False
+    controlled_restart_origin_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_phase: bool = False
+    controlled_restart_initial_eligible: bool = False
+    controlled_restart_continuation_eligible: bool = False
+    controlled_restart_lineage_valid: bool = True
+    controlled_restart_prior_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_prior_book_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    controlled_restart_prior_origin_cycle: int | None = Field(default=None, ge=1)
+    controlled_restart_prior_phase: bool = False
+    binding_user_directive_present: bool = False
+    binding_user_directive_controlled_restart_graduation: bool = False
     alpha_gross: float = Field(default=0.0, ge=0.0)
     hedge_gross: float = Field(default=0.0, ge=0.0)
     hedge_risk_reducing: bool = False
@@ -594,6 +626,49 @@ class DirectiveExceptionAudit(BaseModel):
         return self
 
 
+class ControlledRestartSeatQualification(BaseModel):
+    """Matching-horizon desk-process calibration reviewed for one restart alpha seat."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    symbol: str = Field(min_length=1)
+    edge_horizon_hours: int = Field(ge=1)
+    cost_net_independent_time_cohort_n: int = Field(ge=0)
+    cost_net_calibration_status: str = Field(min_length=1)
+    cost_net_residual_risk_weighted_status: str = Field(min_length=1)
+    residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac: float | None
+    qualified: bool
+
+
+class ControlledRestartRiskAudit(BaseModel):
+    """Adversary review of seed caps and process evidence for an active restart Book."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    expansion_requested: bool
+    gross_usd: float = Field(ge=0.0)
+    gross_seed_cap_usd: float = Field(ge=0.0)
+    residual_vol_annualized_frac_cash: float = Field(ge=0.0)
+    residual_vol_seed_cap_frac_cash: float = Field(ge=0.0)
+    absolute_beta_residual: float = Field(ge=0.0)
+    beta_residual_seed_cap_abs: float = Field(ge=0.0)
+    within_all_seed_caps: bool
+    selected_alpha_qualifications: list[ControlledRestartSeatQualification]
+    all_selected_alpha_qualified: bool
+    directive_graduation_capability_used: bool = False
+    expansion_approved: bool
+    approval_note: str = ""
+
+    @model_validator(mode="after")
+    def validate_approval_shape(self) -> ControlledRestartRiskAudit:
+        symbols = [row.symbol for row in self.selected_alpha_qualifications]
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("restart-risk audit contains duplicate selected alpha symbols")
+        if self.directive_graduation_capability_used and not self.expansion_approved:
+            raise ValueError("using directive graduation capability requires expansion approval")
+        if self.expansion_approved and not self.approval_note.strip():
+            raise ValueError("restart expansion approval requires a non-empty note")
+        return self
+
+
 class AdversaryVerdict(BaseModel):
     """The Adversary's verdict. `cycle`, `precheck_sha256`, `metrics_echo`, and `bounds_confirmed`
     are REQUIRED so an accept must demonstrate the arithmetic was seen (cycle-4 regression).
@@ -612,6 +687,7 @@ class AdversaryVerdict(BaseModel):
     specialist_reads_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     binding_user_directive_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     directive_exception_audits: list[DirectiveExceptionAudit] = Field(default_factory=list)
+    controlled_restart_risk_audit: ControlledRestartRiskAudit | None = None
     hard_ban_violations_confirmed: list[ObjectiveHardBanViolation] = Field(
         default_factory=list
     )
@@ -708,7 +784,25 @@ class ReflectorEdit(BaseModel):
     retire_if: str = ""
 
 
+def validate_unique_reflection_edit_roles(edits: list[ReflectorEdit]) -> None:
+    """Reject ambiguous multi-edit proposals instead of choosing a first/last winner."""
+    seen: set[ReflectorRole] = set()
+    duplicates: set[ReflectorRole] = set()
+    for edit in edits:
+        if edit.role in seen:
+            duplicates.add(edit.role)
+        seen.add(edit.role)
+    if duplicates:
+        names = ", ".join(sorted(duplicates))
+        raise ValueError(f"duplicate reflection edit roles: {names}")
+
+
 class ReflectionProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
     edits: list[ReflectorEdit] = Field(default_factory=list)
     no_action_reason: str = ""
+
+    @model_validator(mode="after")
+    def validate_unique_roles(self) -> ReflectionProposal:
+        validate_unique_reflection_edit_roles(self.edits)
+        return self

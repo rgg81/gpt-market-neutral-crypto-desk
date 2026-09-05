@@ -3,8 +3,9 @@
 Run exactly one PAPER desk cycle in this repository without asking questions. Read `AGENTS.md`,
 `MISSION.md`, and the **complete** `docs/desk-cycle-runbook.md`; execute that runbook exactly. It
 is the source of truth for command order, artifacts, validation, retry limits, decision authority,
-and failure handling. Read any `ops/next-cycle-directive.md` in full and preserve its one-shot
-binding/archive semantics.
+and failure handling. Never read or remove `ops/next-cycle-directive.md` directly. Let evidence
+atomically claim it, then read and pass the exact pending `binding_user_directive.md` when present;
+preserve its manifest-bound, UUID-specific, crash-safe one-shot semantics.
 
 Runtime identity is fixed: root and every real Reflector, specialist, PM, and Adversary subagent
 are `gpt-5.6-sol` at `xhigh`, authenticated by Codex login. Do not set a subagent model override,
@@ -15,7 +16,7 @@ The mandatory sequence is:
 
 ```text
 proxy ensure/freshness → managed-prompt provenance → durable recovery → watchdog
-→ evidence → scheduled scoring → performance → optional real Reflector
+→ evidence + exact directive claim → scheduled scoring → performance → optional real Reflector
 → repeat managed-prompt provenance check
 → seal post-reflection decision-start runtime provenance
 → three real specialists in parallel → immutable read digest

@@ -29,7 +29,10 @@ from futures_fund.reflection import (
     canonical_daily_score_observation,
     horizon_is_on_schedule,
     learning_origin_is_bound,
+    mark_recurrences_handled,
+    recover_reflection_apply_transactions,
     reflection_authority_recovery_status,
+    refresh_recurrences,
     score_mature_leg_forecasts,
     score_previous_cycle,
     scored_cycles,
@@ -89,11 +92,24 @@ def _seal_recurrences(pending: Path) -> str:
 
 
 def _recover_reflection_authority_packet(
-    state_dir: str, memory_dir: str, pending: Path, source_cycle: int
+    state_dir: str,
+    memory_dir: str,
+    pending: Path,
+    source_cycle: int,
+    *,
+    agents_dir=None,
 ) -> dict | None:
     """Restore an unconsumed packet, or publish empty after that cycle already consumed it."""
+    # Repair a process-death boundary before reading heads/journal authority. A partial prompt
+    # transaction otherwise makes the prestate comparison fail closed before it can self-heal.
+    recover_reflection_apply_transactions(
+        state_dir,
+        memory_dir,
+        agents_dir,
+        source_cycle=source_cycle,
+    )
     recovery = reflection_authority_recovery_status(
-        state_dir, memory_dir, source_cycle
+        state_dir, memory_dir, source_cycle, agents_dir=agents_dir
     )
     if recovery is None:
         return None
@@ -113,6 +129,11 @@ def _recover_reflection_authority_packet(
         # A consumed authority is the sole permission to rotate its ephemeral pending packet to an
         # empty stand-down. Validate any old prepared packet before removing its immutable seal;
         # the authority receipt retains the original packet permanently.
+        # Reconstruct cooldown first. A process can die after the durable head/consumption event
+        # but before reflector_apply records recurrence-handled.json; recovery must not expose the
+        # same calibration authority again. The marker update is idempotent and never moves a
+        # newer cooldown clock backwards.
+        mark_recurrences_handled(memory_dir, receipt_recurrences, cycle=source_cycle)
         empty: list[dict] = []
         empty_sha256 = canonical_sha256(empty)
         if (
@@ -182,11 +203,20 @@ def score_eligible_completed_cycles(
     btc_symbol: str,
     active_calibration_roles: set[str],
     cadence: str = "rebal",
+    decision_cycle: int | None = None,
 ) -> dict:
     """Catch up every unscored origin at its earliest complete, all-symbol mark packet."""
     if btc_symbol != CANONICAL_BTC_SYMBOL:
         raise ValueError(f"daily score benchmark must be {CANONICAL_BTC_SYMBOL}")
     completed = completed_cycle_numbers(state_dir, cadence=cadence)
+    latest_completed_cycle = max(completed, default=0)
+    # Production supplies the exact pending source cycle. Keep direct callers compatible while
+    # still ending state-only windows at the newest committed cycle rather than an outcome origin.
+    recurrence_decision_cycle = (
+        latest_completed_cycle if decision_cycle is None else int(decision_cycle)
+    )
+    if recurrence_decision_cycle < 0:
+        raise ValueError("decision_cycle must be non-negative")
     seen = scored_cycles(memory_dir, state_dir=state_dir, cadence=cadence)
     results: list[dict] = []
     waiting: list[int] = []
@@ -230,6 +260,8 @@ def score_eligible_completed_cycles(
             active_calibration_roles=active_calibration_roles,
             outcome_observation_cycle=observation_cycle,
             outcome_scoring_marks_sha256=artifact_sha256,
+            recurrence_through_cycle=latest_completed_cycle,
+            recurrence_decision_cycle=recurrence_decision_cycle,
         )
         results.append(result)
         elapsed_hours = (observation_ts - origin_ts).total_seconds() / 3600.0
@@ -269,14 +301,24 @@ def score_eligible_completed_cycles(
             active_calibration_roles=active_calibration_roles,
             outcome_observation_cycle=observation_cycle,
             outcome_scoring_marks_sha256=artifact_sha256,
+            recurrence_through_cycle=latest_completed_cycle,
+            recurrence_decision_cycle=recurrence_decision_cycle,
         )
     elif not results:
-        pending, _meta = resolve_pending(memory_dir)
-        _write_recurrences(pending / "recurrences.json", [])
+        # State-only feedback can be ready even before any outcome row matures. Rebuild it without
+        # manufacturing a score or borrowing the current pending marks as a learning label.
+        refresh_recurrences(
+            state_dir,
+            memory_dir,
+            through_cycle=latest_completed_cycle,
+            decision_cycle=recurrence_decision_cycle,
+            cadence=cadence,
+            active_calibration_roles=active_calibration_roles,
+        )
     forecast_status = score_mature_leg_forecasts(
         state_dir,
         memory_dir,
-        through_cycle=max(completed, default=0),
+        through_cycle=latest_completed_cycle,
         btc_symbol=btc_symbol,
         cadence=cadence,
     )
@@ -318,7 +360,11 @@ def main(argv: list[str] | None = None) -> int:
         if not pending_marks:
             raise ValueError("pending scoring marks are empty")
         authority_recovery = _recover_reflection_authority_packet(
-            args.state_dir, args.memory_dir, pending, int(meta["cycle"])
+            args.state_dir,
+            args.memory_dir,
+            pending,
+            int(meta["cycle"]),
+            agents_dir=args.agents_dir,
         )
         if authority_recovery is not None:
             print(json.dumps(authority_recovery, indent=2))
@@ -335,6 +381,7 @@ def main(argv: list[str] | None = None) -> int:
             args.memory_dir,
             btc_symbol=meta["btc_symbol"],
             active_calibration_roles=_active_calibration_roles(Path(args.agents_dir)),
+            decision_cycle=int(meta["cycle"]),
         )
         recurrences_sha256 = _seal_recurrences(pending)
         write_reflection_authority(
@@ -362,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                         active_calibration_roles=_active_calibration_roles(
                             Path(args.agents_dir)
                         ),
+                        decision_cycle=int(meta["cycle"]),
                     )
                     outcome = "replayed score state and sealed its recurrence packet"
                 except Exception:  # noqa: BLE001 — ordinary learning failure remains fail-soft

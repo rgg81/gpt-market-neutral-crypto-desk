@@ -32,6 +32,42 @@ non-overlapping calibration sample. Risk review includes both same-side positive
 correlation and signed-position co-risk, so opposite-side/negative-correlation exposures cannot
 masquerade as diversification.
 
+Cash must not become an absorbing state. Ordinary turnover allows two aggressive changes, while an
+exactly empty book may seed up to four new non-BTC alpha seats so B2 dollar neutrality and B4
+concentration can both be satisfied. This is optional experimental capacity, not forced risk: with
+sparse exact-horizon evidence the initial seed is capped by 20% gross and an 8% annualized residual-
+volatility budget, targets beta residual within 2% of equity, and carries an explicit origin-cycle
+lineage across nonempty-inventory continuations. Active lineage is authenticated through both the
+newest manifest-bound Book and its internally hashed manifest-bound precheck; an empty active Book
+is invalid. It stays at starter risk until every selected seat's matching-horizon schema-v5
+cost-net bucket uses the latest 12 consecutive complete independent time cohorts, with usable
+cost-net and residual-risk-weighted status, and positive residual-risk-weighted realized round-trip
+cost-net price edge excluding funding. A partial, unpriced, or off-schedule cohort—or a forecast
+still unmarked beyond the five-minute scheduler tolerance—resets the consecutive streak and blocks
+while newest. An exact, on-schedule, fully priced cohort excluded only for temporal overlap remains
+audit-only and does neither. The newest complete cohort must be no older than max(72 hours, twice
+its horizon); aggregate/cross-horizon rows never qualify. Passing permits
+judged expansion but the origin remains active until a fully flat proposed Book explicitly ends
+it; an ended origin cannot reactivate, and only a genuinely flat later account may start a new
+origin. All liquidity, friction, forecast, provenance, hard-ban, and Adversary-veto controls still
+apply. Missing proposed-symbol covariance disables the restart capacity: unknown risk is never
+treated as zero risk.
+This controlled seed is the base-rule path only. Precheck hashes whether an exact user directive is
+present: a flat-account directive uses false/null lineage and its explicit 98–102% gross mandate,
+never a disguised seed. Mere directive presence, its hash, or a prose mention of graduation grants
+no restart-graduation authority. Only this exact first line declares that typed scope:
+`<!-- desk-directive-capabilities: ["controlled_restart_graduation"] -->`. Evidence binds both the
+full directive and its canonical capability list. During an authenticated active continuation, the
+Adversary may explicitly use that one-shot capability to supersede only the base qualification gate
+for that cycle while preserving origin and all non-overridable safety; it records that choice in
+`directive_graduation_capability_used`; precheck exposes the scope as
+`binding_user_directive_controlled_restart_graduation`. Without it the ordinary gate applies, and
+it resumes after the directive is consumed. A malformed reserved header fails before agents. Exact
+text, raw payload, fixed relative source identity, claim UUID/intent, and capability provenance are
+committed in the completed cycle manifest. Evidence first moves the canonical inbox file into a
+state-owned claim; cleanup after durable commit consumes only that UUID-derived claim, never a new
+file at the inbox, and is idempotently recovered after crashes.
+
 We operate on **two clocks**: one full **24h GPT decision cycle** at 00:07 UTC and token-free
 deterministic funding/portfolio heartbeats at 08:07 and 16:07 UTC. Each full cycle scans the top-40
 by 24h volume fresh and quality-filters to at most 20 liquid, established names. The intervening

@@ -26,6 +26,8 @@ from futures_fund.desk_contracts import (
     BoundVerdict,
     CandidateReview,
     CitationCheck,
+    ControlledRestartRiskAudit,
+    ControlledRestartSeatQualification,
     DirectiveExceptionAudit,
     ExitAudit,
     HedgeAudit,
@@ -34,8 +36,14 @@ from futures_fund.desk_contracts import (
     SpecialistRead,
     SpecialistSupportEcho,
 )
+from futures_fund.directives import claim_next_directive
 from futures_fund.performance import PERFORMANCE_SCHEMA_VERSION, canonical_sha256
-from futures_fund.precheck import PrecheckMetrics, compute_precheck
+from futures_fund.precheck import (
+    PrecheckMetrics,
+    PriorBookLineage,
+    compute_precheck,
+    precheck_sha256,
+)
 from futures_fund.prompt_guard import split_managed
 from futures_fund.slippage import ExecutionRealism
 from scripts.desk_reconcile import (
@@ -88,6 +96,93 @@ def _performance_packet(cycle: int, as_of: datetime, evidence: list[dict]) -> di
             "account_sha256": canonical_sha256(PaperAccount(cash=20_000.0).to_dict()),
         },
     }
+
+
+def _restart_performance_packet(
+    cycle: int,
+    *,
+    qualified: bool,
+    positions: list[dict] | None = None,
+) -> dict:
+    packet = _performance_packet(cycle, datetime(2026, 1, 1, tzinfo=UTC), EVIDENCE)
+    status = "usable" if qualified else "insufficient_independent_time_cohorts"
+    packet["positions"] = positions or []
+    packet["pm_forecast_performance"] = {
+        "by_horizon_hours": {
+            str(horizon): {
+                "cost_net_independent_time_cohort_n": 12 if qualified else 3,
+                "cost_net_calibration_status": status,
+                "cost_net_residual_risk_weighted_status": status,
+                "residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac": (
+                    0.01 if qualified else -0.01
+                ),
+            }
+            for horizon in (24, 72, 168)
+        }
+    }
+    return packet
+
+
+def _restart_risk_audit(
+    precheck: PrecheckMetrics,
+    book: Book,
+    performance: dict,
+    *,
+    approve: bool,
+    use_directive_capability: bool = False,
+) -> ControlledRestartRiskAudit:
+    rows = []
+    for leg in book.legs:
+        if leg.seat_role != "alpha":
+            continue
+        bucket = performance["pm_forecast_performance"]["by_horizon_hours"][
+            str(leg.edge_horizon_hours)
+        ]
+        value = bucket[
+            "residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac"
+        ]
+        qualified = bool(
+            bucket["cost_net_independent_time_cohort_n"] >= 12
+            and bucket["cost_net_calibration_status"] == "usable"
+            and bucket["cost_net_residual_risk_weighted_status"] == "usable"
+            and value is not None
+            and value > 0.0
+        )
+        rows.append(ControlledRestartSeatQualification(
+            symbol=leg.symbol,
+            edge_horizon_hours=leg.edge_horizon_hours,
+            cost_net_independent_time_cohort_n=(
+                bucket["cost_net_independent_time_cohort_n"]
+            ),
+            cost_net_calibration_status=bucket["cost_net_calibration_status"],
+            cost_net_residual_risk_weighted_status=(
+                bucket["cost_net_residual_risk_weighted_status"]
+            ),
+            residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac=value,
+            qualified=qualified,
+        ))
+    expansion = bool(
+        precheck.gross > round(0.20 * precheck.cash, 2)
+        or precheck.portfolio_residual_vol_annualized_frac_cash > 0.08
+        or abs(precheck.beta_residual) > 0.02
+    )
+    return ControlledRestartRiskAudit(
+        expansion_requested=expansion,
+        gross_usd=precheck.gross,
+        gross_seed_cap_usd=round(0.20 * precheck.cash, 2),
+        residual_vol_annualized_frac_cash=(
+            precheck.portfolio_residual_vol_annualized_frac_cash
+        ),
+        residual_vol_seed_cap_frac_cash=0.08,
+        absolute_beta_residual=abs(precheck.beta_residual),
+        beta_residual_seed_cap_abs=0.02,
+        within_all_seed_caps=not expansion,
+        selected_alpha_qualifications=rows,
+        all_selected_alpha_qualified=bool(rows) and all(row.qualified for row in rows),
+        directive_graduation_capability_used=use_directive_capability,
+        expansion_approved=approve,
+        approval_note="explicitly reviewed expansion" if approve else "",
+    )
 
 
 def _unavailable_thesis() -> dict:
@@ -224,6 +319,36 @@ def _verdict(
             max_leg_frac_gross=precheck.max_leg_frac_gross,
             turnover_legs_changed=precheck.turnover_legs_changed,
             turnover_aggressive_legs_changed=precheck.turnover_aggressive_legs_changed,
+            cold_start_reentry_eligible=precheck.cold_start_reentry_eligible,
+            b9_aggressive_change_limit=precheck.b9_aggressive_change_limit,
+            risk_model_available=precheck.risk_model_available,
+            controlled_restart_origin_cycle=(
+                precheck.controlled_restart_origin_cycle
+            ),
+            controlled_restart_phase=precheck.controlled_restart_phase,
+            controlled_restart_initial_eligible=(
+                precheck.controlled_restart_initial_eligible
+            ),
+            controlled_restart_continuation_eligible=(
+                precheck.controlled_restart_continuation_eligible
+            ),
+            controlled_restart_lineage_valid=(
+                precheck.controlled_restart_lineage_valid
+            ),
+            controlled_restart_prior_cycle=precheck.controlled_restart_prior_cycle,
+            controlled_restart_prior_book_sha256=(
+                precheck.controlled_restart_prior_book_sha256
+            ),
+            controlled_restart_prior_origin_cycle=(
+                precheck.controlled_restart_prior_origin_cycle
+            ),
+            controlled_restart_prior_phase=precheck.controlled_restart_prior_phase,
+            binding_user_directive_present=(
+                precheck.binding_user_directive_present
+            ),
+            binding_user_directive_controlled_restart_graduation=(
+                precheck.binding_user_directive_controlled_restart_graduation
+            ),
             alpha_gross=precheck.alpha_gross,
             hedge_gross=precheck.hedge_gross,
             hedge_risk_reducing=precheck.hedge_risk_reducing,
@@ -340,6 +465,83 @@ def test_valid_verdict_is_bound_to_exact_precheck():
     precheck = _precheck(_book())
     verify_precheck_artifact(precheck, precheck, cycle=7)
     verify_verdict_binding(_verdict(precheck), precheck, cycle=7)
+
+
+@pytest.mark.parametrize(
+    "omitted_fields",
+    [
+        (
+            "binding_user_directive_present",
+            "binding_user_directive_controlled_restart_graduation",
+        ),
+        (
+            "controlled_restart_origin_cycle",
+            "controlled_restart_phase",
+            "controlled_restart_initial_eligible",
+            "controlled_restart_continuation_eligible",
+            "controlled_restart_lineage_valid",
+            "controlled_restart_prior_cycle",
+            "controlled_restart_prior_book_sha256",
+            "controlled_restart_prior_origin_cycle",
+            "controlled_restart_prior_phase",
+        ),
+    ],
+    ids=("directive-provenance", "restart-provenance"),
+)
+def test_current_precheck_requires_explicit_versioned_provenance(omitted_fields):
+    precheck = _precheck(_book())
+    payload = precheck.model_dump(mode="json")
+    for field in omitted_fields:
+        payload.pop(field)
+    omitted = PrecheckMetrics.model_validate(payload)
+
+    # Schema v9 hashes normalized semantics, so explicit-presence validation must independently
+    # reject omitted default-valued provenance.
+    assert precheck_sha256(omitted) == precheck.sha256
+    with pytest.raises(
+        AdversaryBindingError, match="omits required explicit schema-v9"
+    ) as exc_info:
+        verify_precheck_artifact(omitted, precheck, cycle=7)
+    assert all(field in str(exc_info.value) for field in omitted_fields)
+
+
+def test_precheck_artifact_rejects_unsupported_future_schema():
+    payload = _precheck(_book()).model_dump(mode="json")
+    payload["schema_version"] = 999
+    payload["sha256"] = ""
+    unhashed = PrecheckMetrics.model_validate(payload)
+    payload["sha256"] = precheck_sha256(unhashed)
+    future = PrecheckMetrics.model_validate(payload)
+
+    with pytest.raises(AdversaryBindingError, match="unsupported future schema v999"):
+        verify_precheck_artifact(future, future, cycle=7)
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "future_fields"),
+    [
+        (
+            7,
+            (
+                "binding_user_directive_present",
+                "binding_user_directive_controlled_restart_graduation",
+            ),
+        ),
+        (8, ("binding_user_directive_controlled_restart_graduation",)),
+    ],
+)
+def test_explicit_provenance_check_preserves_historical_schema_hashes(
+    schema_version, future_fields
+):
+    payload = _precheck(_book()).model_dump(mode="json")
+    payload["schema_version"] = schema_version
+    for field in future_fields:
+        payload.pop(field)
+    payload["sha256"] = ""
+    payload["sha256"] = precheck_sha256(PrecheckMetrics.model_validate(payload))
+    historical = PrecheckMetrics.model_validate(payload)
+
+    verify_precheck_artifact(historical, historical, cycle=7)
 
 
 def test_hedge_to_alpha_role_change_requires_fresh_seat_and_action_audits():
@@ -833,7 +1035,20 @@ def test_b12_raw_boundary_failure_requires_exact_aggressive_directive_audit():
         verify_verdict_binding(verdict, precheck, cycle=7)
 
     directive_sha256 = canonical_sha256("authorize exact A boundary increase")
-    wrong_scope = verdict.model_copy(update={
+    directive_precheck = compute_precheck(
+        book,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        meta_sha256=canonical_sha256(META),
+        binding_user_directive_present=True,
+    )
+    directive_verdict = _verdict(
+        directive_precheck,
+        override_rationale="exact directive is required for the raw B12 boundary failure",
+    )
+    wrong_scope = directive_verdict.model_copy(update={
         "binding_user_directive_sha256": directive_sha256,
         "directive_exception_audits": [DirectiveExceptionAudit(
             bound_id="B12",
@@ -844,7 +1059,7 @@ def test_b12_raw_boundary_failure_requires_exact_aggressive_directive_audit():
     with pytest.raises(AdversaryBindingError, match="offending symbols"):
         verify_verdict_binding(
             wrong_scope,
-            precheck,
+            directive_precheck,
             cycle=7,
             binding_user_directive_sha256=directive_sha256,
         )
@@ -858,7 +1073,7 @@ def test_b12_raw_boundary_failure_requires_exact_aggressive_directive_audit():
     })
     verify_verdict_binding(
         authorized,
-        precheck,
+        directive_precheck,
         cycle=7,
         binding_user_directive_sha256=directive_sha256,
     )
@@ -895,8 +1110,21 @@ def test_b9_exception_is_exactly_bound_to_directive_and_aggressive_symbols():
         verify_verdict_binding(verdict, precheck, cycle=7)
 
     directive_sha256 = canonical_sha256("deploy these exact three symbols")
+    directive_precheck = compute_precheck(
+        book,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        meta_sha256=canonical_sha256(META),
+        binding_user_directive_present=True,
+    )
+    directive_verdict = _verdict(
+        directive_precheck,
+        override_rationale="exact one-shot directive authorizes this cold-start deployment",
+    )
     aggressive_symbols = [SYMBOLS[index] for index in range(3)]
-    authorized = verdict.model_copy(update={
+    authorized = directive_verdict.model_copy(update={
         "binding_user_directive_sha256": directive_sha256,
         "directive_exception_audits": [DirectiveExceptionAudit(
             bound_id="B9",
@@ -906,7 +1134,7 @@ def test_b9_exception_is_exactly_bound_to_directive_and_aggressive_symbols():
     })
     verify_verdict_binding(
         authorized,
-        precheck,
+        directive_precheck,
         cycle=7,
         binding_user_directive_sha256=directive_sha256,
     )
@@ -920,7 +1148,7 @@ def test_b9_exception_is_exactly_bound_to_directive_and_aggressive_symbols():
     with pytest.raises(AdversaryBindingError, match="every final aggressive symbol"):
         verify_verdict_binding(
             wrong_scope,
-            precheck,
+            directive_precheck,
             cycle=7,
             binding_user_directive_sha256=directive_sha256,
         )
@@ -1430,6 +1658,419 @@ def test_verdict_rejects_wrong_hash_and_metric_echo():
         verify_verdict_binding(verdict, precheck, cycle=7)
 
 
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("cold_start_reentry_eligible", True),
+        ("b9_aggressive_change_limit", 4),
+        ("risk_model_available", True),
+    ],
+)
+def test_current_verdict_rejects_tampered_cold_start_echo(field, wrong_value):
+    precheck = _precheck(_book())
+    verdict = _verdict(precheck)
+    wrong_echo = verdict.metrics_echo.model_copy(update={field: wrong_value})
+
+    with pytest.raises(AdversaryBindingError, match=f"metrics_echo.{field}"):
+        verify_verdict_binding(
+            verdict.model_copy(update={"metrics_echo": wrong_echo}),
+            precheck,
+            cycle=7,
+        )
+
+
+@pytest.mark.parametrize(
+    "omitted_field",
+    [
+        "cold_start_reentry_eligible",
+        "b9_aggressive_change_limit",
+        "risk_model_available",
+    ],
+)
+def test_current_verdict_requires_explicit_cold_start_provenance_echo(omitted_field):
+    precheck = _precheck(_book())
+    verdict = _verdict(precheck)
+    echo_payload = verdict.metrics_echo.model_dump(mode="json")
+    echo_payload.pop(omitted_field)
+    omitted_echo = MetricsEcho.model_validate(echo_payload)
+
+    with pytest.raises(AdversaryBindingError, match="omits required precheck provenance"):
+        verify_verdict_binding(
+            verdict.model_copy(update={"metrics_echo": omitted_echo}),
+            precheck,
+            cycle=7,
+        )
+
+
+def _active_restart_continuation(
+    *,
+    directive_present: bool = False,
+    directive_graduation_capability: bool = False,
+):
+    prior = PriorBookLineage(
+        cycle=6,
+        book_sha256="6" * 64,
+        controlled_restart_origin_cycle=6,
+        controlled_restart_phase=True,
+    )
+    book = _book().model_copy(update={
+        "controlled_restart_origin_cycle": 6,
+        "controlled_restart_phase": True,
+    })
+    precheck = compute_precheck(
+        book,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        prior_book_lineage=prior,
+        binding_user_directive_present=directive_present,
+        binding_user_directive_controlled_restart_graduation=(
+            directive_graduation_capability
+        ),
+    )
+    return book, precheck
+
+
+def test_accept_requires_valid_controlled_restart_lineage():
+    invalid_book = _book().model_copy(update={
+        "controlled_restart_origin_cycle": 7,
+        "controlled_restart_phase": True,
+    })
+    precheck = _precheck(invalid_book)
+    assert precheck.controlled_restart_lineage_valid is False
+    performance = _restart_performance_packet(7, qualified=True)
+
+    with pytest.raises(AdversaryBindingError, match="invalid controlled-restart lineage"):
+        verify_verdict_binding(
+            _bind_performance(_verdict(precheck), performance),
+            precheck,
+            cycle=7,
+            performance_snapshot=performance,
+            book=invalid_book,
+        )
+
+
+def test_adversary_remains_sole_veto_for_an_initial_expansion_policy_breach():
+    risk_model = {
+        "residual_vol_annualized": {symbol: 0.1 for symbol in SYMBOLS},
+        "covariance_annualized": {
+            left: {right: 0.01 if left == right else 0.0 for right in SYMBOLS}
+            for left in SYMBOLS
+        },
+    }
+    legs = [
+        leg.model_copy(update={
+            "is_new": True,
+            "hold_breaking_reason": "initial seed",
+            "expected_price_edge_frac": 0.05,
+        })
+        for leg in _book().legs
+    ]
+    book = _book().model_copy(update={
+        "controlled_restart_origin_cycle": 7,
+        "controlled_restart_phase": True,
+        "legs": legs,
+        "turnover_legs_changed": 4,
+    })
+    precheck = compute_precheck(
+        book,
+        [{**row, "slippage_curve_bps": {"20k": 1.0}} for row in EVIDENCE],
+        cash=20_000.0,
+        cycle=7,
+        current_book=[],
+        risk_model=risk_model,
+    )
+    assert precheck.controlled_restart_initial_eligible is True
+    performance = _restart_performance_packet(7, qualified=True)
+    verdict = _bind_performance(
+        _verdict(
+            precheck,
+            override_rationale="fixture accepts priced initial-seed boundary",
+        ).model_copy(update={
+            "controlled_restart_risk_audit": _restart_risk_audit(
+                precheck, book, performance, approve=True
+            ),
+        }),
+        performance,
+    )
+
+    # Reaching the independent citation contract proves restart binding accepted the exact
+    # seed-cap facts plus the Adversary's explicit approval.  Code did not derive a rejection.
+    with pytest.raises(AdversaryBindingError, match="citation audit binding requires"):
+        verify_verdict_binding(
+            verdict,
+            precheck,
+            cycle=7,
+            performance_snapshot=performance,
+            book=book,
+        )
+
+
+def test_adversary_remains_sole_veto_for_unqualified_continuation_expansion():
+    book, precheck = _active_restart_continuation()
+    performance = _restart_performance_packet(7, qualified=False)
+    verdict = _bind_performance(
+        _verdict(precheck).model_copy(update={
+            "controlled_restart_risk_audit": _restart_risk_audit(
+                precheck, book, performance, approve=True
+            ),
+        }),
+        performance,
+    )
+
+    # Reaching the independent citation contract proves code did not derive the verdict from
+    # qualification.  The missing specialist packet is intentionally outside this unit's scope.
+    with pytest.raises(AdversaryBindingError, match="citation audit binding requires"):
+        verify_verdict_binding(
+            verdict,
+            precheck,
+            cycle=7,
+            performance_snapshot=performance,
+            book=book,
+        )
+
+
+def test_qualified_continuation_expansion_is_provenance_valid():
+    book, precheck = _active_restart_continuation()
+    performance = _restart_performance_packet(
+        7,
+        qualified=True,
+        positions=[_position(symbol) for symbol in SYMBOLS],
+    )
+    reads = {
+        role: [
+            SpecialistRead(
+                symbol=symbol,
+                lean="flat",
+                conviction=0.0,
+                rationale="test flat read",
+            )
+            for symbol in SYMBOLS
+        ]
+        for role in ("sentiment", "technical", "futures")
+    }
+    book = _bind_book_reads(book, reads)
+    verdict = _bind_reads(
+        _bind_performance(
+            _verdict(precheck).model_copy(update={
+                "controlled_restart_risk_audit": _restart_risk_audit(
+                    precheck, book, performance, approve=True
+                ),
+                "seat_audits": [
+                    audit.model_copy(update={"position_age_intervals": 10.0})
+                    for audit in _verdict(precheck).seat_audits
+                ],
+            }),
+            performance,
+        ),
+        reads,
+    )
+
+    verify_verdict_binding(
+        verdict,
+        precheck,
+        cycle=7,
+        sentiment_reads=reads["sentiment"],
+        specialist_reads=reads,
+        performance_snapshot=performance,
+        book=book,
+    )
+
+
+def test_typed_bound_directive_scope_is_audited_without_becoming_a_code_veto():
+    directive_sha = "d" * 64
+    book, precheck = _active_restart_continuation(
+        directive_present=True,
+        directive_graduation_capability=True,
+    )
+    performance = _restart_performance_packet(7, qualified=False)
+    verdict = _bind_performance(
+        _verdict(precheck).model_copy(update={
+            "binding_user_directive_sha256": directive_sha,
+            "controlled_restart_risk_audit": _restart_risk_audit(
+                precheck,
+                book,
+                performance,
+                approve=True,
+                use_directive_capability=True,
+            ),
+        }),
+        performance,
+    )
+
+    # Reaching the ordinary position audit proves the typed scope was authenticated without code
+    # deriving the decision. This compact fixture deliberately omits incumbent position history.
+    with pytest.raises(AdversaryBindingError, match="performance positions omit"):
+        verify_verdict_binding(
+            verdict,
+            precheck,
+            cycle=7,
+            sentiment_reads=[],
+            performance_snapshot=performance,
+            book=book,
+            binding_user_directive_sha256=directive_sha,
+        )
+
+
+def test_unscoped_directive_cannot_masquerade_as_graduation_capability():
+    directive_sha = "e" * 64
+    book, precheck = _active_restart_continuation(directive_present=True)
+    performance = _restart_performance_packet(7, qualified=False)
+    audit = _restart_risk_audit(precheck, book, performance, approve=True).model_copy(
+        update={"directive_graduation_capability_used": True}
+    )
+    verdict = _bind_performance(
+        _verdict(precheck).model_copy(update={
+            "binding_user_directive_sha256": directive_sha,
+            "controlled_restart_risk_audit": audit,
+        }),
+        performance,
+    )
+
+    with pytest.raises(AdversaryBindingError, match="absent from the hash-bound typed"):
+        verify_verdict_binding(
+            verdict,
+            precheck,
+            cycle=7,
+            performance_snapshot=performance,
+            book=book,
+            binding_user_directive_sha256=directive_sha,
+        )
+
+
+def test_schema9_requires_explicit_typed_directive_scope_echo():
+    precheck = _precheck(_book())
+    verdict = _verdict(precheck)
+    echo_payload = verdict.metrics_echo.model_dump(mode="json")
+    echo_payload.pop("binding_user_directive_controlled_restart_graduation")
+    omitted = verdict.model_copy(update={
+        "metrics_echo": MetricsEcho.model_validate(echo_payload)
+    })
+    with pytest.raises(AdversaryBindingError, match="typed directive scope"):
+        verify_verdict_binding(omitted, precheck, cycle=7)
+
+    tampered = verdict.model_copy(update={
+        "metrics_echo": verdict.metrics_echo.model_copy(update={
+            "binding_user_directive_controlled_restart_graduation": True,
+        })
+    })
+    with pytest.raises(AdversaryBindingError, match="does not match precheck"):
+        verify_verdict_binding(tampered, precheck, cycle=7)
+
+
+def test_schema9_restart_audit_requires_explicit_capability_usage_field():
+    book, precheck = _active_restart_continuation()
+    performance = _restart_performance_packet(7, qualified=True)
+    audit_payload = _restart_risk_audit(
+        precheck, book, performance, approve=False
+    ).model_dump(mode="json")
+    audit_payload.pop("directive_graduation_capability_used")
+    verdict = _bind_performance(
+        _verdict(precheck).model_copy(update={
+            "controlled_restart_risk_audit": (
+                ControlledRestartRiskAudit.model_validate(audit_payload)
+            ),
+        }),
+        performance,
+    )
+
+    with pytest.raises(AdversaryBindingError, match="omits directive graduation"):
+        verify_verdict_binding(
+            verdict,
+            precheck,
+            cycle=7,
+            performance_snapshot=performance,
+            book=book,
+        )
+
+
+def test_schema8_requires_exact_directive_presence_echo_and_inactive_audit_absence():
+    precheck = _precheck(_book())
+    verdict = _verdict(precheck)
+    echo_payload = verdict.metrics_echo.model_dump(mode="json")
+    echo_payload.pop("binding_user_directive_present")
+    omitted = verdict.model_copy(update={
+        "metrics_echo": MetricsEcho.model_validate(echo_payload)
+    })
+    with pytest.raises(AdversaryBindingError, match="directive provenance"):
+        verify_verdict_binding(omitted, precheck, cycle=7)
+
+    performance = _restart_performance_packet(7, qualified=True)
+    inapplicable = _bind_performance(
+        verdict.model_copy(update={
+            "controlled_restart_risk_audit": _restart_risk_audit(
+                precheck, _book(), performance, approve=False
+            )
+        }),
+        performance,
+    )
+    with pytest.raises(AdversaryBindingError, match="must be absent"):
+        verify_verdict_binding(
+            inapplicable,
+            precheck,
+            cycle=7,
+            performance_snapshot=performance,
+            book=_book(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("controlled_restart_origin_cycle", 1),
+        ("controlled_restart_phase", True),
+        ("controlled_restart_initial_eligible", True),
+        ("controlled_restart_continuation_eligible", True),
+        ("controlled_restart_lineage_valid", False),
+        ("controlled_restart_prior_cycle", 1),
+        ("controlled_restart_prior_book_sha256", "f" * 64),
+        ("controlled_restart_prior_origin_cycle", 1),
+        ("controlled_restart_prior_phase", True),
+    ],
+)
+def test_current_verdict_rejects_tampered_controlled_restart_echo(field, wrong_value):
+    precheck = _precheck(_book())
+    verdict = _verdict(precheck)
+    wrong_echo = verdict.metrics_echo.model_copy(update={field: wrong_value})
+
+    with pytest.raises(AdversaryBindingError, match=f"metrics_echo.{field}"):
+        verify_verdict_binding(
+            verdict.model_copy(update={"metrics_echo": wrong_echo}),
+            precheck,
+            cycle=7,
+        )
+
+
+@pytest.mark.parametrize(
+    "omitted_field",
+    [
+        "controlled_restart_origin_cycle",
+        "controlled_restart_phase",
+        "controlled_restart_initial_eligible",
+        "controlled_restart_continuation_eligible",
+        "controlled_restart_lineage_valid",
+        "controlled_restart_prior_cycle",
+        "controlled_restart_prior_book_sha256",
+        "controlled_restart_prior_origin_cycle",
+        "controlled_restart_prior_phase",
+    ],
+)
+def test_current_verdict_requires_explicit_controlled_restart_echo(omitted_field):
+    precheck = _precheck(_book())
+    verdict = _verdict(precheck)
+    echo_payload = verdict.metrics_echo.model_dump(mode="json")
+    echo_payload.pop(omitted_field)
+    omitted_echo = MetricsEcho.model_validate(echo_payload)
+
+    with pytest.raises(AdversaryBindingError, match="omits required restart lineage"):
+        verify_verdict_binding(
+            verdict.model_copy(update={"metrics_echo": omitted_echo}),
+            precheck,
+            cycle=7,
+        )
+
+
 def _sentiment_read(symbol: str = "A/USDT:USDT") -> SpecialistRead:
     return SpecialistRead(
         symbol=symbol,
@@ -1542,6 +2183,195 @@ def test_precheck_must_match_current_book_and_its_own_hash():
         verify_precheck_artifact(tampered, final, cycle=7)
 
 
+def _controlled_restart_metadata_revision():
+    prior = PriorBookLineage(
+        cycle=6,
+        book_sha256="6" * 64,
+        controlled_restart_origin_cycle=6,
+        controlled_restart_phase=True,
+    )
+    original_book = _book().model_copy(update={
+        "controlled_restart_origin_cycle": 6,
+        "controlled_restart_phase": True,
+        "stated_deploy_frac": 0.0,
+    })
+    final_book = _book().model_copy(update={
+        "controlled_restart_origin_cycle": 6,
+        "controlled_restart_phase": True,
+    })
+    original_precheck = compute_precheck(
+        original_book,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        prior_book_lineage=prior,
+    )
+    final_precheck = compute_precheck(
+        final_book,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        prior_book_lineage=prior,
+    )
+    restart_audit = ControlledRestartRiskAudit(
+        expansion_requested=True,
+        gross_usd=original_precheck.gross,
+        gross_seed_cap_usd=4_000.0,
+        residual_vol_annualized_frac_cash=(
+            original_precheck.portfolio_residual_vol_annualized_frac_cash
+        ),
+        residual_vol_seed_cap_frac_cash=0.08,
+        absolute_beta_residual=abs(original_precheck.beta_residual),
+        beta_residual_seed_cap_abs=0.02,
+        within_all_seed_caps=False,
+        selected_alpha_qualifications=[
+            ControlledRestartSeatQualification(
+                symbol=leg.symbol,
+                edge_horizon_hours=leg.edge_horizon_hours,
+                cost_net_independent_time_cohort_n=12,
+                cost_net_calibration_status="usable",
+                cost_net_residual_risk_weighted_status="usable",
+                residual_risk_weighted_realized_round_trip_cost_net_price_edge_frac=0.01,
+                qualified=True,
+            )
+            for leg in original_book.legs
+            if leg.seat_role == "alpha"
+        ],
+        all_selected_alpha_qualified=True,
+        directive_graduation_capability_used=False,
+        expansion_approved=True,
+        approval_note="fixture approves qualified continuation expansion",
+    )
+    verdict = _verdict(original_precheck, accept=False).model_copy(update={
+        "controlled_restart_risk_audit": restart_audit,
+        "revision_constraints": [RevisionConstraint(
+            kind="correct_book_metadata",
+            note="correct the original stated deployment arithmetic",
+        )],
+    })
+    return prior, original_book, original_precheck, final_book, final_precheck, verdict
+
+
+def test_revision_replays_identical_manifest_bound_restart_lineage():
+    (
+        _prior,
+        original_book,
+        original_precheck,
+        final_book,
+        final_precheck,
+        verdict,
+    ) = _controlled_restart_metadata_revision()
+
+    verify_revision_binding(
+        verdict,
+        original_book,
+        original_precheck,
+        final_book,
+        final_precheck,
+    )
+
+
+def test_restart_revision_cannot_change_a_seat_horizon_beyond_audited_coverage():
+    (
+        prior,
+        original_book,
+        original_precheck,
+        final_book,
+        _final_precheck,
+        verdict,
+    ) = _controlled_restart_metadata_revision()
+    changed_legs = list(final_book.legs)
+    changed_legs[0] = changed_legs[0].model_copy(update={"edge_horizon_hours": 72})
+    changed = final_book.model_copy(update={"legs": changed_legs})
+    changed_precheck = compute_precheck(
+        changed,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        prior_book_lineage=prior,
+    )
+
+    with pytest.raises(AdversaryBindingError, match="seat/horizon outside"):
+        verify_revision_binding(
+            verdict,
+            original_book,
+            original_precheck,
+            changed,
+            changed_precheck,
+        )
+
+
+def test_revision_cannot_recompute_against_different_prior_restart_lineage():
+    (
+        _prior,
+        original_book,
+        original_precheck,
+        final_book,
+        _final_precheck,
+        verdict,
+    ) = _controlled_restart_metadata_revision()
+    different_prior = PriorBookLineage(
+        cycle=6,
+        book_sha256="7" * 64,
+        controlled_restart_origin_cycle=6,
+        controlled_restart_phase=True,
+    )
+    changed_precheck = compute_precheck(
+        final_book,
+        EVIDENCE,
+        cash=20_000.0,
+        cycle=7,
+        current_book=CURRENT_BOOK,
+        prior_book_lineage=different_prior,
+    )
+
+    with pytest.raises(AdversaryBindingError, match="changed the manifest-bound prior"):
+        verify_revision_binding(
+            verdict,
+            original_book,
+            original_precheck,
+            final_book,
+            changed_precheck,
+        )
+
+
+def test_revision_cannot_end_controlled_restart_lineage_with_a_nonempty_book():
+    (
+        _prior,
+        original_book,
+        original_precheck,
+        final_book,
+        final_precheck,
+        verdict,
+    ) = _controlled_restart_metadata_revision()
+    ended_book = final_book.model_copy(update={
+        "controlled_restart_origin_cycle": None,
+        "controlled_restart_phase": False,
+    })
+
+    with pytest.raises(AdversaryBindingError, match="changed controlled-restart lineage"):
+        verify_revision_binding(
+            verdict,
+            original_book,
+            original_precheck,
+            ended_book,
+            final_precheck,
+        )
+
+
+def test_revision_cannot_flatten_while_leaving_restart_phase_implicitly_active():
+    with pytest.raises(ValueError, match="requires a non-empty Book"):
+        Book(
+            controlled_restart_origin_cycle=6,
+            controlled_restart_phase=True,
+            legs=[],
+            turnover_legs_changed=4,
+        )
+
+
 def test_accepting_a_precheck_failure_needs_explicit_override():
     failed = compute_precheck(Book(), [], cash=20_000.0, cycle=7)
     rulings = [
@@ -1565,6 +2395,30 @@ def test_accepting_a_precheck_failure_needs_explicit_override():
             max_leg_frac_gross=failed.max_leg_frac_gross,
             turnover_legs_changed=failed.turnover_legs_changed,
             turnover_aggressive_legs_changed=failed.turnover_aggressive_legs_changed,
+            cold_start_reentry_eligible=failed.cold_start_reentry_eligible,
+            b9_aggressive_change_limit=failed.b9_aggressive_change_limit,
+            risk_model_available=failed.risk_model_available,
+            controlled_restart_origin_cycle=failed.controlled_restart_origin_cycle,
+            controlled_restart_phase=failed.controlled_restart_phase,
+            controlled_restart_initial_eligible=(
+                failed.controlled_restart_initial_eligible
+            ),
+            controlled_restart_continuation_eligible=(
+                failed.controlled_restart_continuation_eligible
+            ),
+            controlled_restart_lineage_valid=failed.controlled_restart_lineage_valid,
+            controlled_restart_prior_cycle=failed.controlled_restart_prior_cycle,
+            controlled_restart_prior_book_sha256=(
+                failed.controlled_restart_prior_book_sha256
+            ),
+            controlled_restart_prior_origin_cycle=(
+                failed.controlled_restart_prior_origin_cycle
+            ),
+            controlled_restart_prior_phase=failed.controlled_restart_prior_phase,
+            binding_user_directive_present=failed.binding_user_directive_present,
+            binding_user_directive_controlled_restart_graduation=(
+                failed.binding_user_directive_controlled_restart_graduation
+            ),
         ),
         bounds_confirmed=rulings,
         hard_ban_violations_confirmed=failed.hard_ban_violations,
@@ -2269,6 +3123,19 @@ def test_reconcile_main_uses_fresh_book_mid_and_persists_execution_audit(
     decision_ts = datetime.now(UTC) - timedelta(minutes=15)
     directive_text = "Authorize this exact four-leg cold-start execution test basket."
     directive_sha256 = canonical_sha256(directive_text)
+    state = tmp_path / "state"
+    directive_source = tmp_path / "ops" / "next-cycle-directive.md"
+    directive_source.parent.mkdir()
+    directive_source.write_text(directive_text)
+    directive_claim = claim_next_directive(
+        state,
+        cycle=7,
+        now=decision_ts,
+        source_path=directive_source,
+    )
+    assert directive_claim is not None
+    queued_directive = "A distinct instruction queued while cycle 7 is in progress.\n"
+    directive_source.write_text(queued_directive)
     evidence = [{
         "symbol": symbol,
         "mark": 100.0,
@@ -2363,7 +3230,17 @@ def test_reconcile_main_uses_fresh_book_mid_and_persists_execution_audit(
         "evidence_sha256": canonical_sha256(evidence),
         "risk_model_sha256": canonical_sha256(risk_model),
         "scoring_marks_sha256": canonical_sha256(scoring_marks),
-        "binding_user_directive_sha256": directive_sha256,
+        "binding_user_directive_claim_id": directive_claim["claim_id"],
+        "binding_user_directive_claim_intent_sha256": (
+            directive_claim["claim_intent_sha256"]
+        ),
+        "binding_user_directive_payload_sha256": directive_claim["payload_sha256"],
+        "binding_user_directive_sha256": directive_claim["directive_sha256"],
+        "binding_user_directive_source_relpath": directive_claim["source_relpath"],
+        "binding_user_directive_capabilities": directive_claim["capabilities"],
+        "binding_user_directive_capabilities_sha256": (
+            directive_claim["capabilities_sha256"]
+        ),
         "expected_candle_requests": expected_requests,
         "candle_data": {
             "source": "binance-proxy", "all_fresh": True,
@@ -2377,7 +3254,7 @@ def test_reconcile_main_uses_fresh_book_mid_and_persists_execution_audit(
     (pending / "evidence.json").write_text(json.dumps(evidence))
     (pending / "risk_model.json").write_text(json.dumps(risk_model))
     (pending / "scoring_marks.json").write_text(json.dumps(scoring_marks))
-    (pending / "binding_user_directive.md").write_text(directive_text)
+    (pending / "binding_user_directive.md").write_bytes(directive_text.encode("utf-8"))
     performance = _performance_packet(7, decision_ts, evidence)
     performance["bindings"]["risk_model_sha256"] = canonical_sha256(risk_model)
     performance["bindings"]["meta_sha256"] = canonical_sha256(meta)
@@ -2501,6 +3378,7 @@ def test_reconcile_main_uses_fresh_book_mid_and_persists_execution_audit(
         book, evidence, cash=20_000.0, cycle=7, current_book=[], risk_model=risk_model,
         meta_sha256=canonical_sha256(meta),
         execution_realism=ExecutionRealism(),
+        binding_user_directive_present=True,
     )
     _write(pending / "pm_book.json", book)
     _write(pending / "precheck.json", precheck)
@@ -2615,7 +3493,6 @@ def test_reconcile_main_uses_fresh_book_mid_and_persists_execution_audit(
         lambda *_args, **_kwargs: watchdog_receipt,
     )
 
-    state = tmp_path / "state"
     assert main(["--state-dir", str(state), "--memory-dir", str(memory)]) == 0
 
     account = json.loads((state / "account.json").read_text())
@@ -2679,6 +3556,18 @@ def test_reconcile_main_uses_fresh_book_mid_and_persists_execution_audit(
     assert complete["manifest"]["artifact_sha256"]["execution"] == canonical_sha256(
         execution_artifact
     )
+    directive_receipt = json.loads(
+        (cycle_dir / "binding_user_directive.json").read_text()
+    )
+    assert directive_receipt["text"] == directive_text
+    assert directive_receipt["claim_id"] == directive_claim["claim_id"]
+    assert directive_receipt["claim_intent_sha256"] == (
+        directive_claim["claim_intent_sha256"]
+    )
+    assert complete["manifest"]["artifact_sha256"]["binding_user_directive"] == (
+        canonical_sha256(directive_receipt)
+    )
+    assert directive_source.read_text() == queued_directive
 
     report = json.loads((cycle_dir / "report.json").read_text())
     assert report["decision_age_seconds"] >= 15 * 60
