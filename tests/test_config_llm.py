@@ -22,6 +22,12 @@ def test_llm_desk_settings_defaults():
     assert s.execution.adverse_selection_bps == 1.0
     assert s.execution.legging_bps_per_second == 0.25
     assert s.execution.allow_partial_fills is True
+    assert s.cross_section.universe_size == 50
+    assert s.cross_section.sleeve_size == 10
+    assert s.cross_section.volume_lookback_days == 180
+    assert s.cross_section.performance_lookback_days == 7
+    assert s.cross_section.gross_target_frac == 1.0
+    assert s.cross_section.max_decision_age_minutes == 90
 
 
 def test_live_mode_cannot_be_configured():

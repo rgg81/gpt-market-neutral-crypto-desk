@@ -88,6 +88,21 @@ class ExecutionSettings(BaseModel):
     allow_partial_fills: bool = True
 
 
+class CrossSectionSettings(BaseModel):
+    """Deterministic weekly selection and agent-controlled daily weighting policy."""
+
+    universe_size: int = Field(default=50, ge=20, le=100)
+    sleeve_size: int = Field(default=10, ge=2, le=25)
+    volume_lookback_days: int = Field(default=180, ge=90, le=365)
+    performance_lookback_days: int = Field(default=7, ge=2, le=30)
+    gross_target_frac: float = Field(default=1.0, ge=0.75, le=1.10)
+    min_sleeve_weight: float = Field(default=0.02, ge=0.0, le=0.10)
+    max_sleeve_weight: float = Field(default=0.18, ge=0.10, le=0.35)
+    max_execution_slippage_bps: float = Field(default=50.0, gt=0.0, le=100.0)
+    max_decision_age_minutes: int = Field(default=90, ge=30, le=720)
+    risk_pair_count: int = Field(default=20, ge=0, le=100)
+
+
 class MetricsSettings(BaseModel):
     daily_periods_per_year: int = 365
     weekly_periods_per_year: int = 52
@@ -116,6 +131,7 @@ class Settings(BaseModel):
     funding: FundingSettings = Field(default_factory=FundingSettings)
     slippage: SlippageSettings = Field(default_factory=SlippageSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    cross_section: CrossSectionSettings = Field(default_factory=CrossSectionSettings)
     metrics: MetricsSettings = Field(default_factory=MetricsSettings)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     data: DataSettings = Field(default_factory=DataSettings)

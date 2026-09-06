@@ -1,77 +1,45 @@
-# AGENTS.md — GPT Desk Operating Rules
+# AGENTS.md — Weekly Cross-Section PAPER Desk
 
-This repository is the **paper-only LLM market-neutral crypto desk**. Before a cycle, read
-`MISSION.md` and `docs/desk-cycle-runbook.md`. The runbook is the exact one-cycle orchestration and
-these rules are non-negotiable.
+This repository is a paper-only crypto-futures desk. Before a cycle, read `MISSION.md` and
+`docs/desk-cycle-runbook.md`; the runbook is the exact production sequence.
 
-## Runtime identity
+## Runtime
 
-- **GPT only, fixed tier.** The scheduled root is `gpt-5.6-sol` at `xhigh` reasoning. Every
-  Reflector, specialist, PM, and Adversary subagent inherits that exact model and effort. Never
-  select, mention, or fall back to Claude/Opus or a cheaper/faster GPT model.
-- **ChatGPT subscription only.** Use Codex login authentication, never `OPENAI_API_KEY` or another
-  raw-API runner. `scripts/run_desk_cli.py` and `futures_fund.desk_cycle.run_cycle` are inert
-  offline-injection test seams: they require an explicit offline flag plus an opaque capability
-  bound to the exact canned `StubAgentRunner`. They are never a production orchestration path.
-- **Use real agents.** The root orchestrates; it does not impersonate the specialist, PM,
-  Reflector, or Adversary. Spawn the three specialists concurrently and wait for all of them before
-  dispatching the PM.
+- GPT only: root and every subagent use `gpt-5.6-sol` at `xhigh`, inherited from the launcher.
+- ChatGPT/Codex login only. Never use `OPENAI_API_KEY` or a raw API runner.
+- PAPER ONLY. `live` remains exactly `false`; never add or call order-placement code.
+- State stays in `live_state/`; cycle memory stays in `live_memory/pending/<cycle>/`.
 
-## Hard safety rules
+## Decision boundary
 
-- **PAPER ONLY.** `live` remains exactly `false`. Never add a live-order code path or call an
-  exchange order method.
-- **LLM proposes, code records.** GPT agents own ranking, construction, sizing, and neutrality.
-  Deterministic code only gathers data, computes the documented precheck, validates decision-chain
-  provenance, and records paper fills. It never creates or vetoes a trading decision.
-- **Stay inside v2.** State is `live_state/`; working memory is
-  `live_memory/pending/<cycle>/`. Never inspect, migrate, or mutate the original sibling desk.
-- **Fresh proxy candles are mandatory.** Every production OHLCV request goes exclusively through
-  `http://127.0.0.1:8000` (`~/binance-proxy`). Before the watchdog, run
-  `scripts/desk_data_preflight.py`; evidence must prove that every required 1h and 1d series
-  contains its currently-forming UTC candle. Proxy failure, missing coverage, or stale candles
-  HALT before agents. Never use a direct-Binance or neutral/empty-series fallback for candles.
-  The host launcher is authorized to start or restart only the exact `~/binance-proxy` Uvicorn
-  process after repeated health failures, before it claims the scheduled cycle.
-- **Neutral by default.** Build a substantially deployed, dollar- and beta-neutral long/short book
-  with a BTC hedge for residual beta. A directional tilt requires explicit PM justification.
-- **The Adversary is the sole decision veto.** A rejection gets exactly one PM revision. Keep the
-  original book/precheck and recorded verdict; do not run a second adversarial pass.
-- A rejected original must carry structured revision constraints. Bind the single PM revision to
-  those constraints and to the Adversary's explicitly allowed final bound failures; this enforces
-  the veto without deterministic code choosing a trade.
-- The Adversary must open every URL behind every non-flat sentiment read and persist complete
-  `citation_checks`, including unselected names. An accepted selected leg cannot use a claim the
-  Adversary marked unsupported.
-- Never fabricate evidence, sources, agent outputs, fills, reports, or a successful cycle. HALT on
-  an unresolved safety/provenance failure and leave the prior completed paper book standing.
-- Drops and same-side material decreases are loss control and do not consume B9's cap on aggressive
-  entries, flips, and increases. A price-regime-broken non-hedge alpha seat with non-positive
-  expected price edge exits fully, even if deployment temporarily falls below its ordinary floor;
-  preserve dollar/beta safety and disclose the Adversary-approved B1 override.
+- Python deterministically selects the active Binance USDT perpetual Top 50 by cumulative quote
+  volume over 180 completed UTC days.
+- Python deterministically ranks that Top 50 by seven-day long total return: price return minus
+  actual funding, using each funding event's settlement mark.
+- The ten best are always long and the ten worst are always short for the frozen ISO week.
+- Agents may decide weights only. They cannot add, remove, flip, hedge, or leave a selected name in
+  cash. Each sleeve must sum to 1.0 and the target portfolio is dollar neutral at 1x gross.
+- Spawn Alpha Allocator and Risk Allocator concurrently. After both validate, spawn the Weight PM.
+  Then run one Weight Adversary. A rejection permits exactly one PM revision and no second review.
+- Do not run sentiment, web research, technical/futures specialist, or Reflector agents in this
+  design. The compact numeric packet is the complete decision input.
 
-## One cycle
+## Data and execution
 
-Follow `docs/desk-cycle-runbook.md` exactly:
+- All candles come only through `http://127.0.0.1:8000` (`~/binance-proxy`). Missing, stale, or
+  incomplete required candles halt before agents. The launcher may repair only that exact proxy.
+- Weekly selection requires complete price, quote-volume, and funding coverage. Never silently
+  substitute zero or omit an otherwise eligible market after a fetch failure.
+- Weight changes use fresh two-sided L2 books, exchange filters, lot rounding, realistic fees,
+  displayed-depth haircuts, adverse-selection reserve, and legging reserve.
+- Decision-to-execution price movement is drift, not slippage. There is no forecast-payback/B12
+  gate: weekly cross-sectional rank supplies direction and agents supply weights.
+- The whole 20-name basket must remain substantially deployed and dollar neutral after simulated
+  execution. Any integrity or execution failure leaves the prior completed PAPER book unchanged.
+- Reconciliation and funding settlement use the existing durable transaction protocol. Never
+  hand-edit `live_state/`.
 
-```text
-proxy freshness → watchdog → evidence → score → optional reflector
-         → post-reflection decision-start seal
-         → sentiment + technical + futures (parallel)
-         → PM → precheck → adversary → at most one PM revision
-         → reconcile → heartbeat
-```
+## Verification
 
-An EARLY watchdog result means immediate stand-down. All three failed specialists means HALT.
-Malformed outputs get only the documented retry. Do not open multiple cycles to backfill a gap.
-
-## Correctness and repair
-
-Never weaken `live=false`, the absence of order placement, decision-chain binding, truthful
-friction/PnL accounting, or the one-revision limit. Diagnose root causes; do not guess-patch.
-Liquidity cost must compare depth with the same book's midpoint; decision-to-execution drift is
-not slippage. Convert PM target notionals to quantities at the decision mark so a preserved held
-leg stays a no-op at the later execution mark.
-Run `uv run pytest` and `uv run ruff check .` after code repairs. Reflection edits may touch only
-the managed prompt regions and must be journaled. Do not edit the scheduler or crontab from inside
-a desk cycle.
+After repairs, run `uv run pytest` and `uv run ruff check .`. Do not edit the scheduler or crontab
+from inside a cycle.

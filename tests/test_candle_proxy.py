@@ -48,6 +48,35 @@ def test_proxy_range_request_contains_current_candle_and_is_audited():
     assert audit["requests"][0]["range_complete"] is True
 
 
+def test_proxy_full_klines_preserve_valid_quote_volume():
+    boundary = int(NOW.timestamp() * 1000) // HOUR_MS * HOUR_MS
+    proxy = BinanceCandleProxy(
+        "http://127.0.0.1:8000",
+        now_fn=lambda: NOW,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=[_row(boundary)])
+        ),
+    )
+    rows = proxy.fetch_klines("BTCUSDT", "1h", 1)
+    assert len(rows[0]) == 12
+    assert rows[0][7] == "15"
+
+
+def test_proxy_full_klines_reject_invalid_quote_volume():
+    boundary = int(NOW.timestamp() * 1000) // HOUR_MS * HOUR_MS
+    row = _row(boundary)
+    row[7] = "NaN"
+    proxy = BinanceCandleProxy(
+        "http://127.0.0.1:8000",
+        now_fn=lambda: NOW,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=[row])
+        ),
+    )
+    with pytest.raises(CandleProxyError, match="invalid quote volume"):
+        proxy.fetch_klines("BTCUSDT", "1h", 1)
+
+
 def test_proxy_rejects_sparse_rows_that_fake_fresh_multi_horizon_data():
     boundary = int(NOW.timestamp() * 1000) // HOUR_MS * HOUR_MS
 

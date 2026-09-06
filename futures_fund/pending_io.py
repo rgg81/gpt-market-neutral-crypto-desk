@@ -27,7 +27,8 @@ def resolve_pending(memory_dir) -> tuple[Path, dict]:
     pointer_p = root / "current.json"
     if not pointer_p.exists():
         raise FileNotFoundError(
-            f"{pointer_p} missing — run scripts/desk_evidence.py first (no current cycle)"
+            f"{pointer_p} missing — run scripts/desk_cross_section_prepare.py first "
+            "(no current cycle)"
         )
     pointer = json.loads(pointer_p.read_text())
     cycle = int(pointer["cycle"])
@@ -59,6 +60,6 @@ def resolve_pending(memory_dir) -> tuple[Path, dict]:
     if wall - now_dt > MAX_META_AGE:
         raise ValueError(
             f"meta.now {meta['now']} is {wall - now_dt} old (> {MAX_META_AGE}) — dead cycle, "
-            "HALT (prior book stands); re-run desk_evidence.py for a fresh cycle"
+            "HALT (prior book stands); re-run desk_cross_section_prepare.py for a fresh cycle"
         )
     return pending, meta

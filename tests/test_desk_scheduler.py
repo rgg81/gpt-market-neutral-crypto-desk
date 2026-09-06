@@ -30,7 +30,8 @@ def test_managed_block_has_daily_gpt_and_token_free_heartbeats():
     assert "/usr/bin/bash /srv/desk/scripts/run_desk_heartbeat.sh --scheduled" in block
     assert "/srv/desk/.venv/bin/python /srv/desk/scripts/desk_health_alert.py" in block
     assert "--state-dir /srv/desk/live_state --log-dir /srv/desk/logs" in block
-    assert "Daily full GPT cycle at 00:07 UTC" in block
+    assert "Daily GPT weight review at 00:07 UTC" in block
+    assert "weekly selection refreshes automatically" in block
     assert "Token-free PAPER funding/portfolio heartbeats" in block
     assert "Token-free read-only SLO check" in block
     assert "Offset from :07 task polling" in block
@@ -82,7 +83,9 @@ def test_launcher_pins_sol_xhigh_and_supports_real_subagents():
     assert "exit=0 rejected by outcome attestation" in launcher
     assert '"${1:-}" == "--probe-only"' in launcher
     assert "scripts/ensure_binance_proxy.py --probe-only" in launcher
-    assert "--memory-dir live_memory --agents-dir agents --probe-existing" in launcher
+    assert "reflector_apply.py" not in launcher
+    assert "--search" not in launcher
+    assert "design=weekly-top50/daily-weights" in launcher
     assert "BINANCE_PROXY_EXTERNAL_MANAGER" in launcher
     assert "systemd-owned Binance proxy did not become ready" in launcher
     assert "PROBE_OK read_only=true" in launcher
@@ -99,7 +102,9 @@ def test_production_call_graph_excludes_the_offline_combined_driver():
     assert "run_desk_cli.py" not in prompt
     assert "run_cycle" not in reconcile
     assert "docs/desk-cycle-runbook.md" in prompt
-    assert "uv run python scripts/desk_reconcile.py" in runbook
+    assert "uv run python scripts/desk_cross_section_reconcile.py" in runbook
+    assert "desk_cross_section_prepare.py" in runbook
+    assert "desk_reconcile.py" not in runbook
 
 
 def test_heartbeat_launcher_has_no_codex_or_agent_path():

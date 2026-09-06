@@ -76,10 +76,8 @@ preflight() {
                 ;;
         esac
         "${UV_BIN}" run python scripts/desk_data_preflight.py
-        "${UV_BIN}" run python scripts/reflector_apply.py \
-            --memory-dir live_memory --agents-dir agents --check-existing
     )
-    echo "READY model=${MODEL} effort=${EFFORT} schedule=00:07Z daily"
+    echo "READY model=${MODEL} effort=${EFFORT} design=weekly-top50/daily-weights schedule=00:07Z"
 }
 
 probe_preflight() {
@@ -103,10 +101,8 @@ probe_preflight() {
         cd "${DESK_ROOT}"
         export PYTHONDONTWRITEBYTECODE=1
         "${VENV_PYTHON}" scripts/ensure_binance_proxy.py --probe-only
-        "${VENV_PYTHON}" scripts/reflector_apply.py \
-            --memory-dir live_memory --agents-dir agents --probe-existing
     )
-    echo "PROBE_OK read_only=true recovery_pending=false model=${MODEL} effort=${EFFORT} schedule=00:07Z daily"
+    echo "PROBE_OK read_only=true model=${MODEL} effort=${EFFORT} design=weekly-top50/daily-weights"
 }
 
 if [[ "${1:-}" == "--check" || "${1:-}" == "--probe-only" ]]; then
@@ -170,7 +166,6 @@ set +e
     "${TIMEOUT_BIN}" --signal=TERM --kill-after=5m "${MAX_RUNTIME}" \
         "${CODEX_BIN}" \
         --enable multi_agent \
-        --search \
         --model "${MODEL}" \
         --sandbox workspace-write \
         --ask-for-approval never \

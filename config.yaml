@@ -28,6 +28,20 @@ execution:
   legging_bps_per_second: 0.25
   allow_partial_fills: true
 
+# Weekly cross-sectional momentum design. Symbols and sides are selected deterministically;
+# GPT agents reason only about weights inside the two fixed sleeves.
+cross_section:
+  universe_size: 50
+  sleeve_size: 10
+  volume_lookback_days: 180
+  performance_lookback_days: 7
+  gross_target_frac: 1.0
+  min_sleeve_weight: 0.02
+  max_sleeve_weight: 0.18
+  max_execution_slippage_bps: 50.0
+  max_decision_age_minutes: 90
+  risk_pair_count: 20
+
 # --- universe quality floors (top-N by 24h volume, crypto-only) ---
 universe:
   symbol_count: 20                 # post-gate universe cap (widened from an effective ~6 on

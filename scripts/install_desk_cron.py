@@ -1,4 +1,4 @@
-"""Install or inspect the managed daily-GPT plus token-free-heartbeat crontab block.
+"""Install or inspect the daily weight-review plus token-free-heartbeat crontab block.
 
 Debian cron uses the daemon's timezone and does not support per-user ``CRON_TZ``. The launchers are
 therefore polled in every local hour and independently claim a bounded UTC slot. No host-timezone
@@ -34,7 +34,7 @@ def managed_block(root: Path) -> str:
     return "\n".join(
         [
             BEGIN,
-            "# Daily full GPT cycle at 00:07 UTC; the launcher gate reads UTC directly.",
+            "# Daily GPT weight review at 00:07 UTC; weekly selection refreshes automatically.",
             "# Ten-minute polling; full slots claim once, failed heartbeats retry "
             "within six hours.",
             f"{TASK_POLL_MINUTES} * * * * /usr/bin/bash {full_launcher} --scheduled "

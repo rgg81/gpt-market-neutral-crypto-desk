@@ -171,6 +171,14 @@ class FuturesExchange:
         rows = self.kline_proxy.fetch_ohlcv(self._raw_id(symbol), timeframe, limit)
         return parse_ohlcv(rows)
 
+    def klines(self, symbol: str, timeframe: str, limit: int) -> list[list]:
+        """Full proxy-only Binance kline rows, including quote-asset volume."""
+        if self.kline_proxy is None:
+            raise CandleProxyError(
+                "mandatory Binance candle proxy is not configured; direct klines are forbidden"
+            )
+        return self.kline_proxy.fetch_klines(self._raw_id(symbol), timeframe, limit)
+
     def require_candle_proxy(self) -> None:
         if self.kline_proxy is None:
             raise CandleProxyError("mandatory Binance candle proxy is not configured")

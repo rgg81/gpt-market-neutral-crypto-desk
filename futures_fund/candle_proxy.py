@@ -177,8 +177,8 @@ class BinanceCandleProxy:
             now = now.replace(tzinfo=UTC)
         return int(now.astimezone(UTC).timestamp() * 1000)
 
-    def fetch_ohlcv(self, symbol_id: str, timeframe: str, limit: int) -> list[list[Any]]:
-        """Fetch a range through the proxy and prove its final row is the current UTC candle.
+    def _fetch_klines(self, symbol_id: str, timeframe: str, limit: int) -> list[list[Any]]:
+        """Fetch full Binance kline rows and prove the final row is current.
 
         A request crossing a candle boundary is retried once against the new boundary.  There is
         deliberately no direct-Binance fallback: proxy unavailability or stale data aborts the
@@ -306,10 +306,38 @@ class BinanceCandleProxy:
                     "range_complete": True,
                 }
             )
-            # parse_ohlcv consumes Binance/ccxt's first six fields only.
-            return [row[:6] for row in rows]
+            return rows
 
         raise StaleCandleData(f"stale proxy candles for {symbol_id} {timeframe}: {last_problem}")
+
+    def fetch_ohlcv(self, symbol_id: str, timeframe: str, limit: int) -> list[list[Any]]:
+        """Return the six OHLCV fields consumed by the existing evidence pipeline."""
+        return [row[:6] for row in self._fetch_klines(symbol_id, timeframe, limit)]
+
+    def fetch_klines(self, symbol_id: str, timeframe: str, limit: int) -> list[list[Any]]:
+        """Return complete Binance kline rows for deterministic quote-volume ranking.
+
+        The weekly cross-sectional selector needs field 7 (quote-asset volume), which is more
+        accurate than approximating turnover as base volume times a closing price.  The same
+        freshness, contiguity, and proxy-only contract as :meth:`fetch_ohlcv` applies.
+        """
+        rows = self._fetch_klines(symbol_id, timeframe, limit)
+        for row in rows:
+            if len(row) < 8:
+                raise CandleProxyError(
+                    f"proxy kline lacks quote volume for {symbol_id} {timeframe}"
+                )
+            try:
+                quote_volume = float(row[7])
+            except (TypeError, ValueError) as exc:
+                raise CandleProxyError(
+                    f"proxy kline has non-numeric quote volume for {symbol_id} {timeframe}"
+                ) from exc
+            if not math.isfinite(quote_volume) or quote_volume < 0.0:
+                raise CandleProxyError(
+                    f"proxy kline has invalid quote volume for {symbol_id} {timeframe}"
+                )
+        return rows
 
     def audit_snapshot(self) -> dict[str, Any]:
         return {
