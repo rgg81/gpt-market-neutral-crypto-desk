@@ -105,6 +105,11 @@ changed name, applies the configured displayed-depth/latency/adverse-selection/l
 and requires one-way slippage at or below 50bp. Market drift since the decision is recorded but is
 not slippage and does not invalidate the weekly rank.
 
+If an aggregate position change exceeds Binance's per-order `MARKET_LOT_SIZE.maxQty`, execution
+splits it deterministically into exchange-valid clips. Every clip must satisfy lot, minQty,
+maxQty, and minimum-notional filters; the full aggregate size is still walked cumulatively through
+the same conservative L2 snapshot, so clipping cannot create depth or reduce modeled slippage.
+
 The simulated achieved book must contain the exact 20 frozen names and sides, remain 85–115%
 gross deployed, have at most 2% dollar residual after lot rounding, and no name above 11% of gross.
 Historical funding is settled before fills. The existing write-ahead transaction publishes the

@@ -1552,7 +1552,7 @@ def test_execution_min_notional_failure_records_zero_fill_without_inventing_size
         _verify_execution_liquidity(target_audit, execution)
 
 
-def test_execution_above_market_max_qty_fails_closed():
+def test_execution_above_market_max_qty_is_split_into_valid_clips():
     symbol = "SOL/USDT:USDT"
 
     class _Book:
@@ -1584,8 +1584,46 @@ def test_execution_above_market_max_qty_fails_closed():
         account, book, {symbol: 100.0}, marks, execution
     )
 
+    assert target_audit[symbol]["max_qty_pass"] is True
+    assert target_audit[symbol]["market_order_clips_qty_signed"] == [0.5, 0.5]
+    targets = _verify_execution_liquidity(target_audit, execution)
+    assert targets[symbol] == 1.0
+    assert target_audit[symbol]["executed_market_order_clip_count"] == 2
+
+
+def test_execution_fails_when_max_qty_is_below_minimum_order_notional():
+    symbol = "SOL/USDT:USDT"
+
+    class _Book:
+        def symbol_spec(self, requested_symbol):
+            return SimpleNamespace(
+                step_size=0.01,
+                tick_size=0.01,
+                min_notional=5.0,
+                max_qty=0.04,
+            )
+
+        def depth(self, requested_symbol):
+            return {"bids": [(99.0, 1_000.0)], "asks": [(101.0, 1_000.0)]}
+
+    marks, _costs, execution, _ = _execution_inputs(
+        _Book(),
+        {symbol},
+        {symbol: 100.0},
+        execution_realism=ExecutionRealism(latency_ms=0.0),
+    )
+    account = PaperAccount(cash=20_000.0)
+    book = Book(
+        legs=[BookLeg(symbol=symbol, side="long", target_notional=100.0, rationale="PM")],
+        stated_deploy_frac=0.005,
+        stated_dollar_residual_frac=1.0,
+        stated_beta_residual=0.005,
+    )
+    target_audit = _execution_target_audit(
+        account, book, {symbol: 100.0}, marks, execution
+    )
     assert target_audit[symbol]["max_qty_pass"] is False
-    with pytest.raises(RuntimeError, match="exceeds exchange market maxQty"):
+    with pytest.raises(RuntimeError, match="cannot be split within market maxQty"):
         _verify_execution_liquidity(target_audit, execution)
 
 

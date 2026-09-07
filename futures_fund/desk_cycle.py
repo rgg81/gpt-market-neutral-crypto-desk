@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from hashlib import sha256
 from types import MappingProxyType
 
@@ -41,6 +42,7 @@ from futures_fund.slippage import ExecutionRealism, estimate_slippage, haircut_d
 
 _SPECIALISTS = ("sentiment", "technical", "futures")
 _OFFLINE_STUB_RUN_IMPLEMENTATION = StubAgentRunner.run
+_MAX_MARKET_ORDER_CLIPS_PER_SYMBOL = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,7 +311,24 @@ def _execution_target_audit(
                 abs(quantized_delta) <= 1e-12
                 or abs(quantized_delta) + 1e-12 >= min_order_qty
             )
-            max_qty_pass = abs(quantized_delta) <= max_order_qty + 1e-12
+            try:
+                order_clips = _market_order_clip_plan(
+                    quantized_delta,
+                    step_size=step_size,
+                    min_order_qty=min_order_qty,
+                    max_order_qty=(
+                        max_order_qty if math.isfinite(max_order_qty) else None
+                    ),
+                    min_notional=min_notional,
+                    execution_mark=execution_mark,
+                )
+            except RuntimeError as exc:
+                order_clips = []
+                max_qty_pass = False
+                order_clip_error = str(exc)
+            else:
+                max_qty_pass = True
+                order_clip_error = None
             side_key = (
                 "effective_depth_qty_ask" if requested_delta > 0.0 else "effective_depth_qty_bid"
             )
@@ -350,6 +369,9 @@ def _execution_target_audit(
                         max_order_qty if math.isfinite(max_order_qty) else None
                     ),
                     "max_qty_pass": max_qty_pass,
+                    "market_order_clip_count": len(order_clips),
+                    "market_order_clips_qty_signed": order_clips,
+                    "market_order_clip_error": order_clip_error,
                     "effective_crossing_depth_qty": available_qty,
                     "allow_partial_fills": allow_partial,
                     "requested_delta_qty_signed": requested_delta,
@@ -432,6 +454,95 @@ def _execution_target_audit(
     return details
 
 
+def _market_order_clip_plan(
+    quantity: float,
+    *,
+    step_size: float,
+    min_order_qty: float,
+    max_order_qty: float | None,
+    min_notional: float,
+    execution_mark: float,
+) -> list[float]:
+    """Split one aggregate change into deterministic exchange-valid market-order clips.
+
+    Binance's ``MARKET_LOT_SIZE.maxQty`` limits each submitted order, not the aggregate position
+    change. The full quantity is still priced cumulatively against one conservative L2 snapshot;
+    clipping cannot manufacture depth or reduce modeled market impact.
+    """
+    values = (quantity, step_size, min_order_qty, min_notional, execution_mark)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise RuntimeError("order clip inputs must be finite")
+    if step_size <= 0.0 or min_order_qty < 0.0 or min_notional < 0.0 or execution_mark <= 0.0:
+        raise RuntimeError("order clip inputs violate exchange filter domains")
+    if abs(quantity) <= 1e-12:
+        return []
+
+    step = Decimal(str(step_size))
+    absolute = Decimal(str(abs(quantity)))
+    units_decimal = absolute / step
+    units = int(units_decimal.to_integral_value(rounding=ROUND_HALF_EVEN))
+    rebuilt_quantity = float(Decimal(units) * step)
+    if units <= 0 or not math.isclose(
+        rebuilt_quantity,
+        abs(quantity),
+        rel_tol=1e-12,
+        abs_tol=max(1e-12, step_size * 1e-9),
+    ):
+        raise RuntimeError("aggregate order quantity is not lot-step aligned")
+
+    if max_order_qty is None:
+        max_units = units
+    else:
+        if not math.isfinite(max_order_qty) or max_order_qty <= 0.0:
+            raise RuntimeError("market maxQty is invalid")
+        max_units = int(
+            (Decimal(str(max_order_qty)) / step).to_integral_value(rounding=ROUND_FLOOR)
+        )
+    if max_units <= 0:
+        raise RuntimeError("market maxQty is below one lot step")
+
+    min_qty_units = int(
+        (Decimal(str(min_order_qty)) / step).to_integral_value(rounding=ROUND_CEILING)
+    )
+    min_notional_units = int(
+        (
+            Decimal(str(min_notional))
+            / (Decimal(str(execution_mark)) * step)
+        ).to_integral_value(rounding=ROUND_CEILING)
+    )
+    min_units = max(1, min_qty_units, min_notional_units)
+    clip_count = (units + max_units - 1) // max_units
+    if clip_count > _MAX_MARKET_ORDER_CLIPS_PER_SYMBOL:
+        raise RuntimeError(
+            f"aggregate change needs {clip_count} market-order clips; "
+            f"limit is {_MAX_MARKET_ORDER_CLIPS_PER_SYMBOL}"
+        )
+    if units < clip_count * min_units:
+        raise RuntimeError("market maxQty cannot be reconciled with minimum order filters")
+
+    base_units, extra = divmod(units, clip_count)
+    sign = 1.0 if quantity > 0.0 else -1.0
+    clips = [
+        sign * float(Decimal(base_units + (index < extra)) * step)
+        for index in range(clip_count)
+    ]
+    if any(
+        abs(clip) + 1e-12 < min_order_qty
+        or abs(clip) > (max_order_qty if max_order_qty is not None else math.inf) + 1e-12
+        or abs(clip) * execution_mark + 1e-12 < min_notional
+        for clip in clips
+    ):
+        raise RuntimeError("constructed market-order clip violates exchange filters")
+    if not math.isclose(
+        math.fsum(clips),
+        quantity,
+        rel_tol=1e-12,
+        abs_tol=max(1e-12, step_size * 1e-9),
+    ):
+        raise RuntimeError("market-order clips do not conserve aggregate quantity")
+    return clips
+
+
 def _verify_execution_liquidity(
     target_audit: dict[str, dict], execution_audit: dict[str, dict]
 ) -> dict[str, float]:
@@ -467,7 +578,10 @@ def _verify_execution_liquidity(
         if not bool(target.get("min_qty_pass", True)):
             raise RuntimeError(f"changed order for {symbol} is below exchange market minQty")
         if not bool(target.get("max_qty_pass", True)):
-            raise RuntimeError(f"changed order for {symbol} exceeds exchange market maxQty")
+            reason = target.get("market_order_clip_error") or "unknown clip failure"
+            raise RuntimeError(
+                f"changed order for {symbol} cannot be split within market maxQty: {reason}"
+            )
         delta_qty = float(
             target.get("quantized_order_delta_qty_signed", target["delta_qty_signed"])
         )
@@ -518,14 +632,20 @@ def _verify_execution_liquidity(
             raise RuntimeError(
                 f"common basket partial fill for {symbol} is below exchange market minQty"
             )
-        max_order_qty_raw = target.get("max_order_qty")
-        if (
-            max_order_qty_raw is not None
-            and abs(executed_delta) > float(max_order_qty_raw) + 1e-12
-        ):
-            raise RuntimeError(
-                f"common basket partial fill for {symbol} exceeds exchange market maxQty"
-            )
+        executed_clips = _market_order_clip_plan(
+            executed_delta,
+            step_size=step_size,
+            min_order_qty=min_order_qty,
+            max_order_qty=(
+                float(target["max_order_qty"])
+                if target.get("max_order_qty") is not None
+                else None
+            ),
+            min_notional=float(target.get("min_notional") or 0.0),
+            execution_mark=float(target["execution_mark"]),
+        )
+        target["executed_market_order_clip_count"] = len(executed_clips)
+        target["executed_market_order_clips_qty_signed"] = executed_clips
         executed_targets[symbol] = float(target["executed_target_qty_signed"])
     return executed_targets
 

@@ -42,6 +42,8 @@ or self-authored forecast-payback gate.
 - Weekly funding uses every event's actual rate and settlement mark.
 - PAPER execution uses fresh two-sided L2, lot/minimum rules, taker fees, depth-aware slippage,
   displayed-depth haircut, adverse-selection reserve, and legging reserve.
+- Aggregate changes above a market's per-order `maxQty` are split into validated clips while the
+  complete quantity is still costed cumulatively against the same L2 snapshot.
 - Decision-to-execution movement is recorded as drift, not charged as slippage.
 - Funding, fills, ledger, account, and all decision artifacts publish through a replayable durable
   transaction with `complete.json` written last.
