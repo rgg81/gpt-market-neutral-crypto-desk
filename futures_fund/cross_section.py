@@ -468,8 +468,9 @@ def validate_allocation(
     actual = [(row.symbol, row.side) for row in allocation.weights]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise ValueError("allocation must cover every fixed symbol/side exactly once")
+    canonical_weights = sorted(allocation.weights, key=lambda row: (row.side, row.symbol))
     by_side = {
-        side: sum(row.weight for row in allocation.weights if row.side == side)
+        side: math.fsum(row.weight for row in canonical_weights if row.side == side)
         for side in ("long", "short")
     }
     if any(not math.isclose(value, 1.0, abs_tol=1e-6) for value in by_side.values()):
@@ -499,7 +500,8 @@ def build_allocation_precheck(
     asset_by_key = {(row.symbol, row.side): row for row in packet.assets}
     targets: list[dict] = []
     target_signed: dict[str, float] = {}
-    for weight in allocation.weights:
+    canonical_weights = sorted(allocation.weights, key=lambda row: (row.side, row.symbol))
+    for weight in canonical_weights:
         target = weight.weight * packet.sleeve_target_usd
         signed = target if weight.side == "long" else -target
         target_signed[weight.symbol] = signed
@@ -516,22 +518,22 @@ def build_allocation_precheck(
     current = {row.symbol: row.current_notional_signed for row in packet.assets}
     for row in packet.held_outside_selection:
         current[str(row["symbol"])] = float(row["current_notional_signed"])
-    turnover = sum(
+    turnover = math.fsum(
         abs(target_signed.get(symbol, 0.0) - current.get(symbol, 0.0))
-        for symbol in set(target_signed) | set(current)
+        for symbol in sorted(set(target_signed) | set(current))
     )
-    long_usd = sum(max(value, 0.0) for value in target_signed.values())
-    short_usd = sum(max(-value, 0.0) for value in target_signed.values())
+    long_usd = math.fsum(max(target_signed[symbol], 0.0) for symbol in sorted(target_signed))
+    short_usd = math.fsum(max(-target_signed[symbol], 0.0) for symbol in sorted(target_signed))
     gross = long_usd + short_usd
     dollar_residual = abs(long_usd - short_usd) / gross if gross else math.inf
-    performance_edge = sum(
+    performance_edge = math.fsum(
         row.weight
         * (
             asset_by_key[(row.symbol, row.side)].weekly_total_return
             if row.side == "long"
             else -asset_by_key[(row.symbol, row.side)].weekly_total_return
         )
-        for row in allocation.weights
+        for row in canonical_weights
     ) / 2.0
     bounds = [
         {"id": "W1", "description": "fixed 10/10 symbol-side coverage", "ok": True},

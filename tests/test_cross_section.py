@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -200,6 +204,48 @@ def test_allocation_validation_forces_all_twenty_and_dollar_neutral_precheck():
     assert precheck["short_target_usd"] == 10_000.0
     assert precheck["dollar_residual_frac"] == 0.0
     assert precheck["turnover_frac_equity"] == 1.0
+
+
+def test_precheck_is_stable_across_python_hash_seeds(tmp_path):
+    packet = _packet()
+    packet.equity = 18_601.919050774355
+    packet.sleeve_target_usd = packet.equity / 2.0
+    allocation = _allocation(packet)
+    sleeve_weights = [0.02, 0.04, 0.06, 0.08, 0.09, 0.10, 0.11, 0.14, 0.18, 0.18]
+    for side in ("long", "short"):
+        side_rows = [row for row in allocation.weights if row.side == side]
+        for row, weight in zip(side_rows, sleeve_weights, strict=True):
+            row.weight = weight
+    packet_path = tmp_path / "packet.json"
+    allocation_path = tmp_path / "allocation.json"
+    packet_path.write_text(packet.model_dump_json())
+    allocation_path.write_text(allocation.model_dump_json())
+    program = (
+        "import json,sys; "
+        "from pathlib import Path; "
+        "from futures_fund.cross_section import AllocationProposal,WeightPacket,"
+        "build_allocation_precheck; "
+        "p=WeightPacket.model_validate_json(Path(sys.argv[1]).read_text()); "
+        "a=AllocationProposal.model_validate_json(Path(sys.argv[2]).read_text()); "
+        "print(json.dumps(build_allocation_precheck(a,p),sort_keys=True))"
+    )
+    outputs = set()
+    for seed in range(1, 9):
+        env = dict(os.environ)
+        env["PYTHONHASHSEED"] = str(seed)
+        outputs.add(
+            subprocess.run(  # noqa: S603
+                [sys.executable, "-c", program, str(packet_path), str(allocation_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout
+        )
+    assert len(outputs) == 1
+    result = json.loads(outputs.pop())
+    assert result["turnover_usd"] == packet.equity
+    assert result["turnover_frac_equity"] == 1.0
 
 
 def test_allocation_cannot_drop_a_symbol_or_break_a_sleeve_sum():
