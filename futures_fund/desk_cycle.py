@@ -1637,6 +1637,8 @@ def _execution_inputs(
         costs[symbol] = cost
         execution_times.append(observed_at)
         spec = specs[symbol]
+        min_qty = getattr(spec, "min_qty", None)
+        max_qty = getattr(spec, "max_qty", None)
         audit[symbol] = {
             "symbol": symbol,
             "execution_sequence": sequence,

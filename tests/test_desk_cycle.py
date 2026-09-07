@@ -1591,6 +1591,46 @@ def test_execution_above_market_max_qty_is_split_into_valid_clips():
     assert target_audit[symbol]["executed_market_order_clip_count"] == 2
 
 
+def test_execution_inputs_bind_distinct_filters_to_each_symbol():
+    symbols = {"AKE/USDT:USDT", "ZEC/USDT:USDT"}
+
+    class _Book:
+        def symbol_spec(self, requested_symbol):
+            if requested_symbol.startswith("AKE"):
+                return SimpleNamespace(
+                    step_size=1.0,
+                    tick_size=0.000001,
+                    min_notional=5.0,
+                    min_qty=1.0,
+                    max_qty=40_000_000.0,
+                )
+            return SimpleNamespace(
+                step_size=0.001,
+                tick_size=0.01,
+                min_notional=5.0,
+                min_qty=0.001,
+                max_qty=2_000.0,
+            )
+
+        def depth(self, requested_symbol):
+            mark = 0.015 if requested_symbol.startswith("AKE") else 1_180.0
+            return {
+                "bids": [(mark * 0.999, 100_000_000.0)],
+                "asks": [(mark * 1.001, 100_000_000.0)],
+            }
+
+    _marks, _costs, execution, _ts = _execution_inputs(
+        _Book(),
+        symbols,
+        {"AKE/USDT:USDT": 0.015, "ZEC/USDT:USDT": 1_180.0},
+        execution_realism=ExecutionRealism(latency_ms=0.0),
+    )
+    assert execution["AKE/USDT:USDT"]["min_order_qty"] == 1.0
+    assert execution["AKE/USDT:USDT"]["max_order_qty"] == 40_000_000.0
+    assert execution["ZEC/USDT:USDT"]["min_order_qty"] == 0.001
+    assert execution["ZEC/USDT:USDT"]["max_order_qty"] == 2_000.0
+
+
 def test_execution_fails_when_max_qty_is_below_minimum_order_notional():
     symbol = "SOL/USDT:USDT"
 
